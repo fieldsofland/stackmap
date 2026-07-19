@@ -1,0 +1,6 @@
+[
+  { "branch": "self", "parent": "self" },
+  { "branch": "cycle-a", "parent": "cycle-b" },
+  { "branch": "cycle-b", "parent": "cycle-a" }
+]
+

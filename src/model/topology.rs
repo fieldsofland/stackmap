@@ -1,0 +1,1006 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use super::{Branch, BranchId, RepositorySnapshot};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrderMode {
+    Recent,
+    Alphabetical,
+    Graphite,
+    // Kept until the input layer migrates its existing `t` binding in U3.
+    Chronological,
+}
+
+impl Default for OrderMode {
+    fn default() -> Self {
+        Self::Recent
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ArchiveMode {
+    #[default]
+    Active,
+    Archive,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Emphasis {
+    #[default]
+    Full,
+    Dim,
+    Hidden,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ProjectionScope {
+    #[default]
+    All,
+    Stack(BranchId),
+    Trunk(BranchId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectionOptions {
+    pub order: OrderMode,
+    pub scope: ProjectionScope,
+    pub separators: bool,
+    pub filter: String,
+    pub archive_mode: ArchiveMode,
+    pub archived: HashSet<BranchId>,
+}
+
+impl Default for ProjectionOptions {
+    fn default() -> Self {
+        Self {
+            order: OrderMode::Recent,
+            scope: ProjectionScope::All,
+            separators: true,
+            filter: String::new(),
+            archive_mode: ArchiveMode::Active,
+            archived: HashSet::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectedSection {
+    pub title: Arc<str>,
+    pub trunk: Option<BranchId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectedRow {
+    pub branch: BranchId,
+    pub depth: usize,
+    pub stack_index: usize,
+    pub stack_id: BranchId,
+    pub lane: usize,
+    pub context_only: bool,
+    pub is_trunk: bool,
+    pub emphasis: Emphasis,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorRow {
+    pub section: Option<BranchId>,
+    pub stack_id: BranchId,
+    pub parent: Option<BranchId>,
+    pub from_lane: usize,
+    pub to_lane: usize,
+    pub emphasis: Emphasis,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlaceholderRow {
+    pub section: Option<BranchId>,
+    pub branch: BranchId,
+    pub parent: Option<BranchId>,
+    pub stack_id: BranchId,
+    pub lane: usize,
+    pub emphasis: Emphasis,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DividerRow {
+    Spacer { section: Option<BranchId> },
+    Connector(ConnectorRow),
+    Placeholder(PlaceholderRow),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProjectionEntry {
+    Section(ProjectedSection),
+    Branch(ProjectedRow),
+    Divider(DividerRow),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SectionRange {
+    pub section: Option<BranchId>,
+    pub start: usize,
+    pub end: usize,
+    pub bottom: usize,
+    pub trunk_row: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StackAnchor {
+    pub branch: BranchId,
+    pub stack_id: BranchId,
+    pub visual_row: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaneSpan {
+    pub stack_id: BranchId,
+    pub lane: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TopologyProjection {
+    pub entries: Vec<ProjectionEntry>,
+    pub selectable: Vec<BranchId>,
+    pub selectable_visual_rows: Vec<usize>,
+    pub branch_to_visual: HashMap<BranchId, usize>,
+    pub branch_to_selectable: HashMap<BranchId, usize>,
+    pub stack_heads: Vec<StackAnchor>,
+    pub lane_spans: Vec<LaneSpan>,
+    lane_spans_by_lane: Vec<Vec<LaneSpan>>,
+    pub lane_count: usize,
+    pub section_ranges: Vec<SectionRange>,
+    pub emphasis_by_branch: HashMap<BranchId, Emphasis>,
+    // Compatibility views for callers that still consume branch-only rows.
+    pub rows: Vec<ProjectedRow>,
+    pub stack_starts: Vec<usize>,
+    visible_stack_sizes: HashMap<BranchId, usize>,
+}
+
+#[derive(Clone, Debug)]
+struct Node {
+    id: BranchId,
+    parent: Option<BranchId>,
+    trunk: Option<BranchId>,
+    committed_at: i64,
+}
+
+#[derive(Clone, Debug)]
+struct StackGroup {
+    id: BranchId,
+    component_id: BranchId,
+    branches: Vec<BranchId>,
+    attach_parent: Option<BranchId>,
+    child_stacks: Vec<BranchId>,
+    activity: i64,
+    default_index: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProjectionGroupState {
+    visible: bool,
+    structural_count: usize,
+    named_count: usize,
+    emphasis: Emphasis,
+}
+
+impl Default for ProjectionGroupState {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            structural_count: 0,
+            named_count: 0,
+            emphasis: Emphasis::Hidden,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TopologyIndex {
+    nodes: HashMap<BranchId, Node>,
+    children: HashMap<BranchId, Vec<BranchId>>,
+    trunks: Vec<BranchId>,
+    root_stacks: HashMap<Option<BranchId>, Vec<BranchId>>,
+    groups: HashMap<BranchId, StackGroup>,
+    stack_by_branch: HashMap<BranchId, BranchId>,
+}
+
+impl TopologyIndex {
+    pub fn build(snapshot: &RepositorySnapshot) -> Self {
+        Self::from_parts(
+            &snapshot.branches,
+            &snapshot.trunks,
+            &snapshot.graphite_children,
+        )
+    }
+
+    fn from_parts(
+        branches: &[Branch],
+        trunks: &[BranchId],
+        graphite_children: &[(BranchId, Arc<[BranchId]>)],
+    ) -> Self {
+        let nodes: HashMap<_, _> = branches
+            .iter()
+            .map(|branch| {
+                (
+                    branch.id.clone(),
+                    Node {
+                        id: branch.id.clone(),
+                        parent: branch.parent.clone(),
+                        trunk: branch.trunk.clone(),
+                        committed_at: branch.committed_at,
+                    },
+                )
+            })
+            .collect();
+        let configured_order: HashMap<_, _> = graphite_children.iter().cloned().collect();
+        let mut children: HashMap<BranchId, Vec<BranchId>> = HashMap::new();
+        for node in nodes.values() {
+            if let Some(parent) = &node.parent
+                && nodes.contains_key(parent)
+            {
+                children
+                    .entry(parent.clone())
+                    .or_default()
+                    .push(node.id.clone());
+            }
+        }
+        for (parent, values) in &mut children {
+            order_children(values, configured_order.get(parent));
+        }
+
+        let trunk_set: HashSet<_> = trunks.iter().cloned().collect();
+        let mut roots: HashMap<Option<BranchId>, Vec<BranchId>> = HashMap::new();
+        for node in nodes.values() {
+            if trunk_set.contains(&node.id) {
+                continue;
+            }
+            if node.parent.is_none()
+                || node
+                    .parent
+                    .as_ref()
+                    .is_some_and(|parent| !nodes.contains_key(parent))
+            {
+                roots
+                    .entry(node.trunk.clone())
+                    .or_default()
+                    .push(node.id.clone());
+            }
+        }
+        for (trunk, values) in &mut roots {
+            if let Some(trunk) = trunk {
+                order_children(values, configured_order.get(trunk));
+            } else {
+                values.sort();
+            }
+        }
+
+        let mut index = Self {
+            nodes,
+            children,
+            trunks: trunks.to_vec(),
+            ..Self::default()
+        };
+        let section_roots: Vec<_> = index
+            .trunks
+            .iter()
+            .cloned()
+            .map(Some)
+            .chain(std::iter::once(None))
+            .collect();
+        let mut next_default_index = 0;
+        for section in section_roots {
+            let section_branch_roots = roots.get(&section).cloned().unwrap_or_default();
+            for root in section_branch_roots {
+                let stack_id = root.clone();
+                index
+                    .root_stacks
+                    .entry(section.clone())
+                    .or_default()
+                    .push(stack_id.clone());
+                index.assign_stack(&root, stack_id, None, &mut next_default_index);
+            }
+        }
+        index
+    }
+
+    fn assign_stack(
+        &mut self,
+        branch: &BranchId,
+        stack_id: BranchId,
+        attach_parent: Option<BranchId>,
+        next_default_index: &mut usize,
+    ) {
+        let mut pending = vec![(branch.clone(), stack_id, attach_parent)];
+        while let Some((branch, stack_id, attach_parent)) = pending.pop() {
+            if self.stack_by_branch.contains_key(&branch) {
+                continue;
+            }
+            if !self.groups.contains_key(&stack_id) {
+                let parent_stack = attach_parent
+                    .as_ref()
+                    .and_then(|parent| self.stack_by_branch.get(parent))
+                    .cloned();
+                let component_id = parent_stack
+                    .as_ref()
+                    .and_then(|parent| self.groups.get(parent))
+                    .map(|parent| parent.component_id.clone())
+                    .unwrap_or_else(|| stack_id.clone());
+                self.groups.insert(
+                    stack_id.clone(),
+                    StackGroup {
+                        id: stack_id.clone(),
+                        component_id,
+                        branches: Vec::new(),
+                        attach_parent,
+                        child_stacks: Vec::new(),
+                        activity: i64::MIN,
+                        default_index: *next_default_index,
+                    },
+                );
+                *next_default_index += 1;
+                if let Some(parent_stack) = parent_stack
+                    && let Some(parent) = self.groups.get_mut(&parent_stack)
+                {
+                    parent.child_stacks.push(stack_id.clone());
+                }
+            }
+            self.stack_by_branch
+                .insert(branch.clone(), stack_id.clone());
+            if let Some(node) = self.nodes.get(&branch)
+                && let Some(group) = self.groups.get_mut(&stack_id)
+            {
+                group.branches.push(branch.clone());
+                group.activity = group.activity.max(node.committed_at);
+            }
+
+            let descendants = self.children.get(&branch).cloned().unwrap_or_default();
+            for child in descendants.iter().skip(1).rev() {
+                pending.push((child.clone(), child.clone(), Some(branch.clone())));
+            }
+            if let Some(primary) = descendants.first() {
+                pending.push((primary.clone(), stack_id, None));
+            }
+        }
+    }
+
+    pub fn stack_for(&self, branch: &BranchId) -> Option<&BranchId> {
+        self.stack_by_branch.get(branch)
+    }
+
+    pub fn trunk_for(&self, branch: &BranchId) -> Option<&BranchId> {
+        self.nodes.get(branch)?.trunk.as_ref()
+    }
+
+    pub fn is_trunk(&self, branch: &BranchId) -> bool {
+        self.trunks.contains(branch)
+    }
+
+    pub fn project(&self, options: &ProjectionOptions) -> TopologyProjection {
+        let emphasis_by_branch = self.emphasis_for_scope(&options.scope);
+        let needle = options.filter.to_lowercase();
+        let filter_active = !needle.is_empty();
+        let all_scope = matches!(options.scope, ProjectionScope::All);
+        let archive_filter_is_empty = options.archived.is_empty();
+        let mut named_visible = HashSet::with_capacity(self.nodes.len());
+        for node in self.nodes.values() {
+            let in_scope = all_scope || emphasis_by_branch.get(&node.id) != Some(&Emphasis::Hidden);
+            let archive_selected = if archive_filter_is_empty {
+                matches!(options.archive_mode, ArchiveMode::Active)
+            } else {
+                match options.archive_mode {
+                    ArchiveMode::Active => !options.archived.contains(&node.id),
+                    ArchiveMode::Archive => options.archived.contains(&node.id),
+                }
+            };
+            if in_scope
+                && archive_selected
+                && (!filter_active || node.id.0.to_lowercase().contains(&needle))
+            {
+                named_visible.insert(node.id.clone());
+            }
+        }
+        let exact_matches = filter_active.then(|| named_visible.clone());
+
+        // Named rows determine selection. Structural rows add only the minimum ancestry needed
+        // to preserve real edges when an archived internal branch is omitted from that policy.
+        let needs_closure = filter_active
+            || !archive_filter_is_empty
+            || matches!(options.archive_mode, ArchiveMode::Archive);
+        let mut structural_storage = needs_closure.then(|| named_visible.clone());
+        if let Some(structural_visible) = structural_storage.as_mut() {
+            let mut frontier = Vec::with_capacity(named_visible.len());
+            frontier.extend(named_visible.iter().cloned());
+            while let Some(branch) = frontier.pop() {
+                let Some(parent) = self
+                    .nodes
+                    .get(&branch)
+                    .and_then(|node| node.parent.as_ref())
+                else {
+                    continue;
+                };
+                if emphasis_by_branch.get(parent) == Some(&Emphasis::Hidden) {
+                    continue;
+                }
+                let parent_selected = match options.archive_mode {
+                    ArchiveMode::Active => !options.archived.contains(parent),
+                    ArchiveMode::Archive => options.archived.contains(parent),
+                };
+                if parent_selected {
+                    named_visible.insert(parent.clone());
+                }
+                if structural_visible.insert(parent.clone()) {
+                    frontier.push(parent.clone());
+                }
+            }
+
+            let trunk_anchors: HashSet<_> = named_visible
+                .iter()
+                .filter_map(|branch| self.nodes.get(branch)?.trunk.as_ref())
+                .filter(|trunk| emphasis_by_branch.get(*trunk) != Some(&Emphasis::Hidden))
+                .cloned()
+                .collect();
+            for trunk in trunk_anchors {
+                structural_visible.insert(trunk.clone());
+                named_visible.insert(trunk);
+            }
+        }
+        let structural_visible = structural_storage.as_ref().unwrap_or(&named_visible);
+        let group_states = self.projection_group_states(
+            structural_visible,
+            &named_visible,
+            &emphasis_by_branch,
+            structural_storage.is_none(),
+            all_scope,
+        );
+
+        let mut projection = TopologyProjection {
+            entries: Vec::with_capacity(
+                structural_visible.len() + self.groups.len() * 2 + self.trunks.len() + 1,
+            ),
+            selectable: Vec::with_capacity(named_visible.len()),
+            selectable_visual_rows: Vec::with_capacity(named_visible.len()),
+            branch_to_visual: HashMap::with_capacity(named_visible.len()),
+            branch_to_selectable: HashMap::with_capacity(named_visible.len()),
+            stack_heads: Vec::with_capacity(self.groups.len()),
+            lane_spans: Vec::with_capacity(self.groups.len() + self.trunks.len()),
+            section_ranges: Vec::with_capacity(self.trunks.len() + 1),
+            rows: Vec::with_capacity(named_visible.len()),
+            stack_starts: Vec::with_capacity(self.groups.len()),
+            visible_stack_sizes: HashMap::with_capacity(self.groups.len()),
+            emphasis_by_branch,
+            ..TopologyProjection::default()
+        };
+        for group in self.groups.values() {
+            let count = group_states[group.default_index].named_count;
+            if count > 0 {
+                projection
+                    .visible_stack_sizes
+                    .insert(group.id.clone(), count);
+            }
+        }
+        for trunk in self
+            .trunks
+            .iter()
+            .cloned()
+            .map(Some)
+            .chain(std::iter::once(None))
+        {
+            let mut roots = self.root_stacks.get(&trunk).cloned().unwrap_or_default();
+            roots.retain(|root| self.group_state(root, &group_states).visible);
+            self.sort_groups(&mut roots, options.order, &group_states);
+            let trunk_visible = trunk
+                .as_ref()
+                .is_some_and(|id| structural_visible.contains(id));
+            if roots.is_empty() && !trunk_visible {
+                continue;
+            }
+            let title: Arc<str> = trunk
+                .as_ref()
+                .map(|id| id.0.clone())
+                .unwrap_or_else(|| Arc::from("Untrunked"));
+            let section_start = projection.entries.len();
+            projection
+                .entries
+                .push(ProjectionEntry::Section(ProjectedSection {
+                    title,
+                    trunk: trunk.clone(),
+                }));
+            let mut first_trunk_join = None;
+            for (root_index, root) in roots.iter().enumerate() {
+                if root_index > 0 && trunk.is_none() && options.separators {
+                    projection
+                        .entries
+                        .push(ProjectionEntry::Divider(DividerRow::Spacer {
+                            section: trunk.clone(),
+                        }));
+                }
+                let Some(span_index) = self.emit_hierarchical_group(
+                    root,
+                    1,
+                    trunk.as_ref(),
+                    options,
+                    structural_visible,
+                    &named_visible,
+                    exact_matches.as_ref(),
+                    &group_states,
+                    &mut projection,
+                ) else {
+                    continue;
+                };
+                if let Some(trunk_id) = &trunk {
+                    if options.separators {
+                        projection
+                            .entries
+                            .push(ProjectionEntry::Divider(DividerRow::Spacer {
+                                section: trunk.clone(),
+                            }));
+                    }
+                    let connector_row = projection.entries.len();
+                    projection
+                        .entries
+                        .push(ProjectionEntry::Divider(DividerRow::Connector(
+                            ConnectorRow {
+                                section: trunk.clone(),
+                                stack_id: root.clone(),
+                                parent: Some(trunk_id.clone()),
+                                from_lane: 1,
+                                to_lane: 0,
+                                emphasis: self.group_state(root, &group_states).emphasis,
+                            },
+                        )));
+                    projection.lane_count = projection.lane_count.max(2);
+                    projection.lane_spans[span_index].end = connector_row;
+                    first_trunk_join.get_or_insert(connector_row);
+                }
+            }
+            let mut trunk_row = None;
+            if let Some(trunk_id) = trunk.as_ref().filter(|id| named_visible.contains(*id)) {
+                let stack_index = projection.stack_heads.len();
+                trunk_row = Some(projection.entries.len());
+                let emphasis = if all_scope {
+                    Emphasis::Full
+                } else {
+                    projection
+                        .emphasis_by_branch
+                        .get(trunk_id)
+                        .copied()
+                        .unwrap_or_default()
+                };
+                push_branch(
+                    &mut projection,
+                    ProjectedRow {
+                        branch: trunk_id.clone(),
+                        depth: 0,
+                        stack_index,
+                        stack_id: trunk_id.clone(),
+                        lane: 0,
+                        context_only: exact_matches
+                            .as_ref()
+                            .is_some_and(|matches| !matches.contains(trunk_id)),
+                        is_trunk: true,
+                        emphasis,
+                    },
+                );
+            }
+            if let Some(trunk_row) = trunk_row {
+                let start = first_trunk_join.unwrap_or(trunk_row);
+                projection.lane_spans.push(LaneSpan {
+                    stack_id: trunk.as_ref().expect("trunk row has trunk").clone(),
+                    lane: 0,
+                    start,
+                    end: trunk_row,
+                });
+            }
+            let section_end = projection.entries.len().saturating_sub(1);
+            let bottom = trunk_row
+                .or_else(|| {
+                    projection.selectable_visual_rows[projection
+                        .selectable_visual_rows
+                        .partition_point(|row| *row < section_start)..]
+                        .iter()
+                        .copied()
+                        .take_while(|row| *row <= section_end)
+                        .last()
+                })
+                .unwrap_or(section_end);
+            projection.section_ranges.push(SectionRange {
+                section: trunk.clone(),
+                start: section_start,
+                end: section_end,
+                bottom,
+                trunk_row,
+            });
+        }
+        projection
+            .stack_heads
+            .sort_by_key(|anchor| anchor.visual_row);
+        projection.stack_starts = projection
+            .stack_heads
+            .iter()
+            .filter_map(|head| projection.branch_to_selectable.get(&head.branch).copied())
+            .collect();
+        projection
+            .lane_spans
+            .sort_by_key(|span| (span.lane, span.start));
+        for span in projection.lane_spans.iter().cloned() {
+            if projection.lane_spans_by_lane.len() <= span.lane {
+                projection
+                    .lane_spans_by_lane
+                    .resize_with(span.lane + 1, Vec::new);
+            }
+            projection.lane_spans_by_lane[span.lane].push(span);
+        }
+        projection
+    }
+
+    fn emphasis_for_scope(&self, scope: &ProjectionScope) -> HashMap<BranchId, Emphasis> {
+        match scope {
+            ProjectionScope::All => self
+                .nodes
+                .keys()
+                .cloned()
+                .map(|branch| (branch, Emphasis::Full))
+                .collect(),
+            ProjectionScope::Trunk(trunk) => self
+                .nodes
+                .values()
+                .map(|node| {
+                    let emphasis = if node.trunk.as_ref() == Some(trunk) || &node.id == trunk {
+                        Emphasis::Full
+                    } else {
+                        Emphasis::Hidden
+                    };
+                    (node.id.clone(), emphasis)
+                })
+                .collect(),
+            ProjectionScope::Stack(anchor) => {
+                let Some(stack) = self.stack_by_branch.get(anchor) else {
+                    return self.emphasis_for_scope(&ProjectionScope::All);
+                };
+                let Some(group) = self.groups.get(stack) else {
+                    return self.emphasis_for_scope(&ProjectionScope::All);
+                };
+                let mut full = HashSet::new();
+                full.extend(group.branches.iter().cloned());
+                let mut cursor = group.attach_parent.as_ref();
+                while let Some(branch) = cursor {
+                    if !full.insert(branch.clone()) {
+                        break;
+                    }
+                    cursor = self.nodes.get(branch).and_then(|node| node.parent.as_ref());
+                }
+                let section = self.nodes.get(anchor).and_then(|node| node.trunk.clone());
+                let component = group.component_id.clone();
+                if let Some(trunk) = &section {
+                    full.insert(trunk.clone());
+                }
+                self.nodes
+                    .values()
+                    .map(|node| {
+                        let emphasis = if full.contains(&node.id) {
+                            Emphasis::Full
+                        } else if section
+                            .as_ref()
+                            .is_some_and(|section| node.trunk.as_ref() == Some(section))
+                            || section.is_none()
+                                && node.trunk.is_none()
+                                && self
+                                    .stack_by_branch
+                                    .get(&node.id)
+                                    .and_then(|stack| self.groups.get(stack))
+                                    .is_some_and(|group| group.component_id == component)
+                        {
+                            Emphasis::Dim
+                        } else {
+                            Emphasis::Hidden
+                        };
+                        (node.id.clone(), emphasis)
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    fn projection_group_states(
+        &self,
+        structural_visible: &HashSet<BranchId>,
+        named_visible: &HashSet<BranchId>,
+        emphasis_by_branch: &HashMap<BranchId, Emphasis>,
+        structural_is_named: bool,
+        uniform_full_emphasis: bool,
+    ) -> Vec<ProjectionGroupState> {
+        let mut states = vec![ProjectionGroupState::default(); self.groups.len()];
+        for group in self.groups.values() {
+            let state = &mut states[group.default_index];
+            for branch in &group.branches {
+                let named = named_visible.contains(branch);
+                let structural = if structural_is_named {
+                    named
+                } else {
+                    structural_visible.contains(branch)
+                };
+                state.visible |= structural;
+                state.structural_count += usize::from(structural);
+                state.named_count += usize::from(named);
+                let emphasis = if uniform_full_emphasis {
+                    Emphasis::Full
+                } else {
+                    emphasis_by_branch
+                        .get(branch)
+                        .copied()
+                        .unwrap_or(Emphasis::Hidden)
+                };
+                if emphasis_rank(emphasis) < emphasis_rank(state.emphasis) {
+                    state.emphasis = emphasis;
+                }
+            }
+        }
+        states
+    }
+
+    fn group_state(
+        &self,
+        stack: &BranchId,
+        states: &[ProjectionGroupState],
+    ) -> ProjectionGroupState {
+        self.groups
+            .get(stack)
+            .and_then(|group| states.get(group.default_index))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn sort_groups(
+        &self,
+        groups: &mut [BranchId],
+        order: OrderMode,
+        states: &[ProjectionGroupState],
+    ) {
+        groups.sort_by(|left, right| {
+            let left = &self.groups[left];
+            let right = &self.groups[right];
+            let left_complete = states[left.default_index].named_count >= 2;
+            let right_complete = states[right.default_index].named_count >= 2;
+            left_complete
+                .cmp(&right_complete)
+                .then_with(|| match order {
+                    OrderMode::Recent => left
+                        .activity
+                        .cmp(&right.activity)
+                        .then_with(|| left.default_index.cmp(&right.default_index)),
+                    OrderMode::Chronological => left
+                        .activity
+                        .cmp(&right.activity)
+                        .then_with(|| left.default_index.cmp(&right.default_index)),
+                    OrderMode::Alphabetical => left.id.cmp(&right.id),
+                    OrderMode::Graphite => left.default_index.cmp(&right.default_index),
+                })
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_hierarchical_group(
+        &self,
+        stack: &BranchId,
+        lane: usize,
+        section: Option<&BranchId>,
+        options: &ProjectionOptions,
+        structural_visible: &HashSet<BranchId>,
+        named_visible: &HashSet<BranchId>,
+        exact_matches: Option<&HashSet<BranchId>>,
+        group_states: &[ProjectionGroupState],
+        projection: &mut TopologyProjection,
+    ) -> Option<usize> {
+        let group = self.groups.get(stack)?;
+        if !group_states[group.default_index].visible {
+            return None;
+        }
+        let mut first_row = None;
+        let mut last_row = None;
+        let mut head = None;
+        let group_state = group_states[group.default_index];
+        let all_structural = group_state.structural_count == group.branches.len();
+        let all_named = group_state.named_count == group.branches.len();
+        for branch in group.branches.iter().rev() {
+            let mut children: Vec<_> = group
+                .child_stacks
+                .iter()
+                .filter(|child| self.groups[*child].attach_parent.as_ref() == Some(branch))
+                .filter(|child| self.group_state(child, group_states).visible)
+                .cloned()
+                .collect();
+            self.sort_groups(&mut children, options.order, group_states);
+            for child in children {
+                let Some(child_span) = self.emit_hierarchical_group(
+                    &child,
+                    lane + 1,
+                    section,
+                    options,
+                    structural_visible,
+                    named_visible,
+                    exact_matches,
+                    group_states,
+                    projection,
+                ) else {
+                    continue;
+                };
+                if options.separators {
+                    projection
+                        .entries
+                        .push(ProjectionEntry::Divider(DividerRow::Spacer {
+                            section: section.cloned(),
+                        }));
+                }
+                let connector_row = projection.entries.len();
+                projection
+                    .entries
+                    .push(ProjectionEntry::Divider(DividerRow::Connector(
+                        ConnectorRow {
+                            section: section.cloned(),
+                            stack_id: child.clone(),
+                            parent: Some(branch.clone()),
+                            from_lane: lane + 1,
+                            to_lane: lane,
+                            emphasis: self.group_state(&child, group_states).emphasis,
+                        },
+                    )));
+                projection.lane_count = projection.lane_count.max(lane + 2);
+                projection.lane_spans[child_span].end = connector_row;
+                first_row.get_or_insert(connector_row);
+                last_row = Some(connector_row);
+            }
+            if !all_structural && !structural_visible.contains(branch) {
+                continue;
+            }
+            let visual_row = projection.entries.len();
+            first_row.get_or_insert(visual_row);
+            last_row = Some(visual_row);
+            let emphasis = if matches!(options.scope, ProjectionScope::All) {
+                Emphasis::Full
+            } else {
+                projection
+                    .emphasis_by_branch
+                    .get(branch)
+                    .copied()
+                    .unwrap_or_default()
+            };
+            if all_named || named_visible.contains(branch) {
+                head.get_or_insert_with(|| (branch.clone(), visual_row));
+                push_branch(
+                    projection,
+                    ProjectedRow {
+                        branch: branch.clone(),
+                        depth: lane,
+                        stack_index: group.default_index,
+                        stack_id: group.id.clone(),
+                        lane,
+                        context_only: exact_matches
+                            .is_some_and(|matches| !matches.contains(branch)),
+                        is_trunk: false,
+                        emphasis,
+                    },
+                );
+            } else {
+                projection
+                    .entries
+                    .push(ProjectionEntry::Divider(DividerRow::Placeholder(
+                        PlaceholderRow {
+                            section: section.cloned(),
+                            branch: branch.clone(),
+                            parent: self.nodes.get(branch).and_then(|node| node.parent.clone()),
+                            stack_id: group.id.clone(),
+                            lane,
+                            emphasis,
+                        },
+                    )));
+                projection.lane_count = projection.lane_count.max(lane + 1);
+            }
+        }
+        let (start, end) = first_row.zip(last_row)?;
+        let span_index = projection.lane_spans.len();
+        projection.lane_spans.push(LaneSpan {
+            stack_id: group.id.clone(),
+            lane,
+            start,
+            end,
+        });
+        projection.lane_count = projection.lane_count.max(lane + 1);
+        if let Some((branch, visual_row)) = head {
+            projection.stack_heads.push(StackAnchor {
+                branch,
+                stack_id: group.id.clone(),
+                visual_row,
+            });
+        }
+        Some(span_index)
+    }
+}
+
+impl TopologyProjection {
+    pub fn build(branches: &[Branch], filter: &str) -> Self {
+        TopologyIndex::from_parts(branches, &[], &[]).project(&ProjectionOptions {
+            filter: filter.to_owned(),
+            separators: false,
+            ..ProjectionOptions::default()
+        })
+    }
+
+    pub fn row_for(&self, branch: &BranchId) -> Option<&ProjectedRow> {
+        let visual = self.branch_to_visual.get(branch)?;
+        match self.entries.get(*visual)? {
+            ProjectionEntry::Branch(row) => Some(row),
+            _ => None,
+        }
+    }
+
+    pub fn emphasis_for(&self, branch: &BranchId) -> Emphasis {
+        self.emphasis_by_branch
+            .get(branch)
+            .copied()
+            .unwrap_or(Emphasis::Hidden)
+    }
+
+    pub fn is_true_stack(&self, branch: &BranchId) -> bool {
+        self.row_for(branch)
+            .and_then(|row| self.visible_stack_sizes.get(&row.stack_id))
+            .is_some_and(|count| *count >= 2)
+    }
+
+    pub fn active_lane_span(&self, lane: usize, visual_row: usize) -> Option<&LaneSpan> {
+        let spans = self.lane_spans_by_lane.get(lane)?;
+        let position = spans.partition_point(|span| span.start <= visual_row);
+        position
+            .checked_sub(1)
+            .and_then(|index| spans.get(index))
+            .filter(|span| span.end >= visual_row)
+    }
+}
+
+fn push_branch(projection: &mut TopologyProjection, row: ProjectedRow) {
+    let visual = projection.entries.len();
+    let selectable = projection.selectable.len();
+    projection
+        .branch_to_visual
+        .insert(row.branch.clone(), visual);
+    projection
+        .branch_to_selectable
+        .insert(row.branch.clone(), selectable);
+    projection.selectable.push(row.branch.clone());
+    projection.selectable_visual_rows.push(visual);
+    projection.lane_count = projection.lane_count.max(row.lane + 1);
+    projection.rows.push(row.clone());
+    projection.entries.push(ProjectionEntry::Branch(row));
+}
+
+fn emphasis_rank(emphasis: Emphasis) -> u8 {
+    match emphasis {
+        Emphasis::Full => 0,
+        Emphasis::Dim => 1,
+        Emphasis::Hidden => 2,
+    }
+}
+
+fn order_children(values: &mut [BranchId], configured: Option<&Arc<[BranchId]>>) {
+    let configured_position: HashMap<_, _> = configured
+        .into_iter()
+        .flat_map(|values| values.iter().enumerate())
+        .map(|(index, branch)| (branch.clone(), index))
+        .collect();
+    values.sort_by(|left, right| {
+        configured_position
+            .get(left)
+            .copied()
+            .unwrap_or(usize::MAX)
+            .cmp(
+                &configured_position
+                    .get(right)
+                    .copied()
+                    .unwrap_or(usize::MAX),
+            )
+            .then_with(|| left.cmp(right))
+    });
+}

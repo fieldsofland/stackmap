@@ -1,0 +1,4 @@
+/target
+/.context
+*.swp
+.DS_Store

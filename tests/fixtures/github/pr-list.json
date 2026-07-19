@@ -1,0 +1,17 @@
+[
+  {
+    "number": 42,
+    "title": "Add the stack map",
+    "url": "https://github.com/example/repo/pull/42",
+    "headRefName": "feature/stack-map",
+    "headRefOid": "oid-feature/stack-map"
+  },
+  {
+    "number": 7,
+    "title": "Missing OID is ignored",
+    "url": "https://github.com/example/repo/pull/7",
+    "headRefName": "ambiguous",
+    "headRefOid": null
+  }
+]
+
