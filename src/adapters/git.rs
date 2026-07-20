@@ -8,13 +8,14 @@ use anyhow::{Context, Result, anyhow, bail};
 
 #[cfg(test)]
 use super::command::CommandError;
-use super::command::{CommandOutput, run_bounded};
+use super::command::{CommandOutput, run_bounded, run_bounded_read_only_git};
 #[cfg(test)]
 use super::graphite::raw_branch_metadata_presence;
 use super::graphite::{raw_branch_metadata_has_child, read_topology};
 use crate::model::{BranchId, ConfiguredUpstream, DiffStat, GraphiteProvenance, RepositoryState};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(3);
+const GIT_MUTATION_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_GIT_TIMEOUT: Duration = Duration::from_millis(250);
 const OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 const UPSTREAM_OUTPUT_LIMIT: usize = 256 * 1024;
@@ -166,8 +167,7 @@ impl GitAdapter {
 
     pub fn containing_remote_ref(&self, oid: &str) -> Result<Option<Arc<str>>> {
         let contains = format!("--contains={oid}");
-        let output = run_bounded(
-            OsStr::new("git"),
+        let output = run_bounded_read_only_git(
             [
                 OsStr::new("for-each-ref"),
                 OsStr::new("--sort=refname"),
@@ -270,7 +270,7 @@ impl GitAdapter {
         {
             bail!("branch {branch} is checked out at {}", path.display());
         }
-        let output = self.git_os(
+        let output = self.git_mutation(
             &[
                 OsStr::new("switch"),
                 OsStr::new("--"),
@@ -394,7 +394,7 @@ impl GitAdapter {
             );
         }
         let reference = format!("refs/heads/{}", request.branch);
-        let output = self.git_os(
+        let output = self.git_mutation(
             &[
                 OsStr::new("update-ref"),
                 OsStr::new("-d"),
@@ -560,8 +560,7 @@ impl GitAdapter {
     }
 
     fn git_upstream(&self, args: &[&str]) -> Result<CommandOutput> {
-        run_bounded(
-            OsStr::new("git"),
+        run_bounded_read_only_git(
             args.iter().map(OsStr::new),
             &self.start_dir,
             UPSTREAM_GIT_TIMEOUT,
@@ -571,8 +570,19 @@ impl GitAdapter {
     }
 
     fn git_os(&self, args: &[&OsStr], limit: usize) -> Result<CommandOutput> {
-        run_bounded(OsStr::new("git"), args, &self.start_dir, GIT_TIMEOUT, limit)
+        run_bounded_read_only_git(args, &self.start_dir, GIT_TIMEOUT, limit)
             .map_err(|error| anyhow!(error))
+    }
+
+    fn git_mutation(&self, args: &[&OsStr], limit: usize) -> Result<CommandOutput> {
+        run_bounded(
+            OsStr::new("git"),
+            args,
+            &self.start_dir,
+            GIT_MUTATION_TIMEOUT,
+            limit,
+        )
+        .map_err(|error| anyhow!(error))
     }
 }
 
@@ -589,7 +599,7 @@ fn ensure_success(output: &CommandOutput, action: &str) -> Result<()> {
 
 fn discover_paths(start_dir: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let run = |args: &[&str], action| -> Result<CommandOutput> {
-        let output = run_bounded(OsStr::new("git"), args, start_dir, GIT_TIMEOUT, 64 * 1024)
+        let output = run_bounded_read_only_git(args, start_dir, GIT_TIMEOUT, 64 * 1024)
             .map_err(|error| anyhow!(error))?;
         ensure_success(&output, action)?;
         Ok(output)

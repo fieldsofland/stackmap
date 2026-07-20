@@ -200,9 +200,9 @@ impl Drop for UpstreamCoordinator {
         }
         self.revision.fetch_add(1, Ordering::AcqRel);
         wake.notify_all();
-        // A bounded Git command may still be finishing. Detach instead of
-        // delaying terminal restoration.
-        self.worker.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
