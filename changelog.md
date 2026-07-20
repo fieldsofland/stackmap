@@ -10,6 +10,7 @@
 - Split topology, Git adapter, App, and tree-rendering responsibilities into private focused modules without changing the CLI, rendering, performance, or Git safety contracts.
 - Documented Graphite 1.8.6 compatibility stewardship, safe fallback behavior, package invariants, release procedures, and the complete user-facing feature set.
 - Fixed two environment-sensitive CI assertions by verifying selected trunk foreground/background behavior with and without `NO_COLOR`, and by testing deadline-bounded work directly instead of relying on runner wall-clock timing.
+- Made dependency policy run on every pull request so the required `cargo-deny` branch-protection check cannot be skipped by path filtering.
 
 ## 2026-07-19
 

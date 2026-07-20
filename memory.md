@@ -30,6 +30,7 @@
 - The open-source alpha identity is `0.1.0-alpha.1`. Cargo publication is disabled; GitHub source and two-architecture macOS prerelease assets are the intended distribution paths.
 - The executable exposes a narrow documented runtime facade. White-box integration coverage is crate-internal and benchmarks use a feature-gated benchmark facade rather than public application internals.
 - Release policy includes pinned macOS 15 ARM64/Intel CI, a stable-Rust compatibility lane, cargo-deny policy, Dependabot, fail-closed release aggregation, checksums, and artifact attestations.
+- Dependency policy runs on every pull request because `cargo-deny` is a required `main` check; path filtering would leave unrelated pull requests permanently unmergeable.
 - Core responsibilities are split behind private modules: topology projection/index/emission, Git inventory/mutation, App state/overlays/archive/mutation, and tree details/connectors.
 - Recoverable production paths return typed or degraded outcomes. Remaining topology `expect` calls represent documented iterative-emission programmer invariants.
 - Render tests cover both ordinary color output and `NO_COLOR`; selected colored rows use the identity accent as their background with a black identity glyph. Deadline tests assert bounded work counts instead of scheduler-sensitive wall-clock thresholds.
