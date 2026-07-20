@@ -1,10 +1,10 @@
-mod common;
+use super::common;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use stackmap::model::BranchId;
-use stackmap::model::topology::{
+use crate::model::BranchId;
+use crate::model::topology::{
     ArchiveMode, DividerRow, Emphasis, OrderMode, ProjectionEntry, ProjectionOptions,
     ProjectionScope, TopologyIndex,
 };
@@ -15,15 +15,15 @@ fn tracked(
     root: &str,
     trunk: &str,
     committed_at: i64,
-) -> stackmap::model::Branch {
+) -> crate::model::Branch {
     let mut branch = common::branch(name, parent, root, false);
     branch.trunk = Some(BranchId::new(trunk));
-    branch.graphite = stackmap::model::GraphiteProvenance::Tracked;
+    branch.graphite = crate::model::GraphiteProvenance::Tracked;
     branch.committed_at = committed_at;
     branch
 }
 
-fn branch_names(projection: &stackmap::model::topology::TopologyProjection) -> Vec<&str> {
+fn branch_names(projection: &crate::model::topology::TopologyProjection) -> Vec<&str> {
     projection
         .entries
         .iter()
@@ -34,7 +34,7 @@ fn branch_names(projection: &stackmap::model::topology::TopologyProjection) -> V
         .collect()
 }
 
-fn fork_snapshot() -> Arc<stackmap::model::RepositorySnapshot> {
+fn fork_snapshot() -> Arc<crate::model::RepositorySnapshot> {
     let mut snapshot = (*common::snapshot(vec![
         tracked("staging", None, "staging", "staging", 1),
         tracked("1", None, "1", "staging", 2),
@@ -196,7 +196,7 @@ fn non_overlapping_sibling_stacks_reuse_hierarchical_lane() {
     let mut snapshot = (*fork_snapshot()).clone();
     let mut branches = snapshot.branches.to_vec();
     branches.push(tracked("2b", Some("2"), "1", "staging", 8));
-    snapshot.branch_index = stackmap::model::RepositorySnapshot::index_branches(&branches);
+    snapshot.branch_index = crate::model::RepositorySnapshot::index_branches(&branches);
     snapshot.branches = Arc::from(branches);
     snapshot.graphite_children = Arc::from([
         (

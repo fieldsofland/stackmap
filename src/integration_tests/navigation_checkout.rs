@@ -1,18 +1,18 @@
-mod common;
+use super::common;
 
 use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use stackmap::adapters::git::GitAdapter;
-use stackmap::app::{
+use crate::adapters::git::GitAdapter;
+use crate::app::{
     Action, App, LanePitch, MutationState, Overlay, ReconciliationOperation, ViewScope,
 };
-use stackmap::config::{ArchiveMutation, Config, ConfigMutation, config_path};
-use stackmap::events::{Input, Key};
-use stackmap::model::BranchId;
-use stackmap::model::topology::{OrderMode, ProjectionEntry};
+use crate::config::{ArchiveMutation, Config, ConfigMutation, config_path};
+use crate::events::{Input, Key};
+use crate::model::BranchId;
+use crate::model::topology::{OrderMode, ProjectionEntry};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 fn tracked(
     name: &str,
@@ -21,15 +21,15 @@ fn tracked(
     trunk: &str,
     current: bool,
     committed_at: i64,
-) -> stackmap::model::Branch {
+) -> crate::model::Branch {
     let mut branch = common::branch(name, parent, root, current);
     branch.trunk = Some(BranchId::new(trunk));
-    branch.graphite = stackmap::model::GraphiteProvenance::Tracked;
+    branch.graphite = crate::model::GraphiteProvenance::Tracked;
     branch.committed_at = committed_at;
     branch
 }
 
-fn view_snapshot() -> Arc<stackmap::model::RepositorySnapshot> {
+fn view_snapshot() -> Arc<crate::model::RepositorySnapshot> {
     let mut snapshot = (*common::snapshot(vec![
         tracked("main", None, "main", "main", true, 1),
         tracked("alpha", None, "alpha", "main", false, 100),
@@ -417,15 +417,15 @@ fn trunk_focus_accepts_untrunked_and_stack_focus_keeps_dim_context() {
     app.handle_key(Key::Character('h'));
     assert_eq!(
         app.projection.emphasis_for(&BranchId::new("alpha")),
-        stackmap::model::topology::Emphasis::Full
+        crate::model::topology::Emphasis::Full
     );
     assert_eq!(
         app.projection.emphasis_for(&BranchId::new("beta")),
-        stackmap::model::topology::Emphasis::Dim
+        crate::model::topology::Emphasis::Dim
     );
     assert_eq!(
         app.projection.emphasis_for(&BranchId::new("loose")),
-        stackmap::model::topology::Emphasis::Hidden
+        crate::model::topology::Emphasis::Hidden
     );
 
     app.handle_key(Key::Character('h'));
@@ -497,7 +497,7 @@ fn current_startup_maps_branches_trunks_and_missing_current_safely() {
 
     let mut detached_app = App::default();
     let mut detached = (*view_snapshot()).clone();
-    detached.state = stackmap::model::RepositoryState::Detached;
+    detached.state = crate::model::RepositoryState::Detached;
     detached_app.request_current_startup();
     detached_app.apply_snapshot(Arc::new(detached));
     assert!(matches!(detached_app.scope, ViewScope::All));
@@ -690,15 +690,15 @@ fn uppercase_delete_preserves_current_trunk_worktree_degraded_and_nonleaf_refusa
     let current = common::branch("current", None, "current", true);
     let mut trunk = common::branch("main", None, "main", false);
     trunk.trunk = Some(BranchId::new("main"));
-    trunk.graphite = stackmap::model::GraphiteProvenance::Tracked;
+    trunk.graphite = crate::model::GraphiteProvenance::Tracked;
     let mut linked = common::branch("linked", None, "linked", false);
     linked.worktree = Some("/tmp/linked".into());
     let mut degraded = common::branch("degraded", None, "degraded", false);
-    degraded.graphite = stackmap::model::GraphiteProvenance::Degraded;
+    degraded.graphite = crate::model::GraphiteProvenance::Degraded;
     let mut parent = common::branch("parent", None, "parent", false);
-    parent.graphite = stackmap::model::GraphiteProvenance::Tracked;
+    parent.graphite = crate::model::GraphiteProvenance::Tracked;
     let mut child = common::branch("child", Some("parent"), "parent", false);
-    child.graphite = stackmap::model::GraphiteProvenance::Tracked;
+    child.graphite = crate::model::GraphiteProvenance::Tracked;
     let mut app = App::default();
     app.apply_snapshot(common::snapshot(vec![
         current, trunk, linked, degraded, parent, child,
@@ -729,9 +729,9 @@ fn uppercase_delete_preserves_current_trunk_worktree_degraded_and_nonleaf_refusa
 }
 
 fn with_generation(
-    snapshot: &Arc<stackmap::model::RepositorySnapshot>,
+    snapshot: &Arc<crate::model::RepositorySnapshot>,
     generation: u64,
-) -> Arc<stackmap::model::RepositorySnapshot> {
+) -> Arc<crate::model::RepositorySnapshot> {
     let mut snapshot = (**snapshot).clone();
     snapshot.generation = generation;
     Arc::new(snapshot)
@@ -740,7 +740,7 @@ fn with_generation(
 fn deletion_cleanup_fixture() -> (
     tempfile::TempDir,
     App,
-    Arc<stackmap::model::RepositorySnapshot>,
+    Arc<crate::model::RepositorySnapshot>,
     Option<BranchId>,
 ) {
     let directory = tempfile::tempdir().unwrap();
@@ -789,10 +789,10 @@ fn deletion_cleanup_fixture() -> (
 }
 
 fn deletion_snapshot_without(
-    snapshot: &Arc<stackmap::model::RepositorySnapshot>,
+    snapshot: &Arc<crate::model::RepositorySnapshot>,
     target: &BranchId,
     generation: u64,
-) -> Arc<stackmap::model::RepositorySnapshot> {
+) -> Arc<crate::model::RepositorySnapshot> {
     let mut changed = (**snapshot).clone();
     changed.generation = generation;
     let branches = changed
@@ -801,7 +801,7 @@ fn deletion_snapshot_without(
         .filter(|branch| &branch.id != target)
         .cloned()
         .collect::<Vec<_>>();
-    changed.branch_index = stackmap::model::RepositorySnapshot::index_branches(&branches);
+    changed.branch_index = crate::model::RepositorySnapshot::index_branches(&branches);
     changed.branches = Arc::from(branches);
     Arc::new(changed)
 }
@@ -909,7 +909,7 @@ fn deletion_reconciliation_ignores_a_pre_mutation_refresh_that_arrives_late() {
         app.handle_key(Key::Character('y')),
         Action::Delete(_)
     ));
-    app.finish_deletion(Ok(stackmap::adapters::git::DeleteOutcome::Unchanged), 18);
+    app.finish_deletion(Ok(crate::adapters::git::DeleteOutcome::Unchanged), 18);
     app.apply_structural_snapshot(with_generation(&snapshot, 9), 17);
     assert!(matches!(
         app.mutation,
@@ -927,7 +927,7 @@ fn deletion_reconciliation_ignores_a_pre_mutation_refresh_that_arrives_late() {
 fn successful_deletion_cleans_exact_config_identity_only_after_authoritative_absence() {
     let (directory, mut app, snapshot, nearby) = deletion_cleanup_fixture();
     let target = BranchId::new("delete-me");
-    app.finish_deletion(Ok(stackmap::adapters::git::DeleteOutcome::Deleted), 50);
+    app.finish_deletion(Ok(crate::adapters::git::DeleteOutcome::Deleted), 50);
 
     app.apply_structural_snapshot(deletion_snapshot_without(&snapshot, &target, 21), 49);
     assert!(app.config.is_archived(&target));
@@ -964,7 +964,7 @@ fn deletion_does_not_clean_config_on_unchanged_error_or_same_name_new_oid() {
     let target = BranchId::new("delete-me");
 
     let (_directory, mut unchanged, snapshot, _) = deletion_cleanup_fixture();
-    unchanged.finish_deletion(Ok(stackmap::adapters::git::DeleteOutcome::Unchanged), 60);
+    unchanged.finish_deletion(Ok(crate::adapters::git::DeleteOutcome::Unchanged), 60);
     unchanged.apply_structural_snapshot(deletion_snapshot_without(&snapshot, &target, 21), 60);
     assert!(unchanged.config.is_archived(&target));
     assert_eq!(unchanged.config.color(&target), Some("#7aa2f7"));
@@ -978,7 +978,7 @@ fn deletion_does_not_clean_config_on_unchanged_error_or_same_name_new_oid() {
     assert!(failed.take_config_write_request().is_none());
 
     let (_directory, mut replaced, snapshot, _) = deletion_cleanup_fixture();
-    replaced.finish_deletion(Ok(stackmap::adapters::git::DeleteOutcome::Deleted), 80);
+    replaced.finish_deletion(Ok(crate::adapters::git::DeleteOutcome::Deleted), 80);
     let mut replacement = (*snapshot).clone();
     replacement.generation = 21;
     let branches = Arc::make_mut(&mut replacement.branches);
@@ -1017,7 +1017,7 @@ fn deletion_reconciliation_preserves_user_navigation_away_from_the_target() {
     }
     assert_eq!(app.selected, Some(user_choice.clone()));
 
-    app.finish_deletion(Ok(stackmap::adapters::git::DeleteOutcome::Deleted), 90);
+    app.finish_deletion(Ok(crate::adapters::git::DeleteOutcome::Deleted), 90);
     app.apply_structural_snapshot(deletion_snapshot_without(&snapshot, &target, 21), 90);
 
     assert_eq!(app.selected, Some(user_choice));
@@ -1027,7 +1027,7 @@ fn deletion_reconciliation_preserves_user_navigation_away_from_the_target() {
 #[test]
 fn inconsistent_provider_deletion_blocks_further_mutation() {
     let mut app = App::default();
-    app.finish_deletion(Ok(stackmap::adapters::git::DeleteOutcome::Inconsistent), 18);
+    app.finish_deletion(Ok(crate::adapters::git::DeleteOutcome::Inconsistent), 18);
     assert!(matches!(app.mutation, MutationState::DeletionBlocked(_)));
     assert!(app.message.as_deref().unwrap().contains("inconsistent"));
     assert!(!app.tick(Instant::now() + Duration::from_secs(60)));
@@ -1149,7 +1149,7 @@ fn trunk_scope_survives_when_a_selected_branch_leaves_the_still_valid_section() 
         .find(|branch| branch.id == BranchId::new("alpha"))
         .unwrap();
     alpha.trunk = None;
-    alpha.graphite = stackmap::model::GraphiteProvenance::DefinitelyUntracked;
+    alpha.graphite = crate::model::GraphiteProvenance::DefinitelyUntracked;
     app.apply_snapshot(Arc::new(changed));
     assert!(matches!(app.scope, ViewScope::Trunk { .. }));
 }

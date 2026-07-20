@@ -1,12 +1,12 @@
-mod common;
+use super::common;
 
 use std::sync::Arc;
 
-use stackmap::app::{Action, App, Overlay};
-use stackmap::config::ArchiveMutation;
-use stackmap::events::Key;
-use stackmap::model::topology::{ArchiveMode, ProjectionEntry};
-use stackmap::model::{BranchId, GraphiteProvenance};
+use crate::app::{Action, App, Overlay};
+use crate::config::ArchiveMutation;
+use crate::events::Key;
+use crate::model::topology::{ArchiveMode, ProjectionEntry};
+use crate::model::{BranchId, GraphiteProvenance};
 
 fn tracked(
     name: &str,
@@ -15,7 +15,7 @@ fn tracked(
     trunk: &str,
     current: bool,
     committed_at: i64,
-) -> stackmap::model::Branch {
+) -> crate::model::Branch {
     let mut branch = common::branch(name, parent, root, current);
     branch.trunk = Some(BranchId::new(trunk));
     branch.graphite = GraphiteProvenance::Tracked;
@@ -23,7 +23,7 @@ fn tracked(
     branch
 }
 
-fn snapshot() -> Arc<stackmap::model::RepositorySnapshot> {
+fn snapshot() -> Arc<crate::model::RepositorySnapshot> {
     let mut snapshot = (*common::snapshot(vec![
         tracked("main", None, "main", "main", true, 1),
         tracked("alpha", None, "alpha", "main", false, 10),
@@ -109,7 +109,7 @@ fn archive_projection_keeps_unarchived_stack_ancestry_as_nonselectable_context()
     assert!(app.projection.entries.iter().any(|entry| {
         matches!(
             entry,
-            ProjectionEntry::Divider(stackmap::model::topology::DividerRow::Placeholder(row))
+            ProjectionEntry::Divider(crate::model::topology::DividerRow::Placeholder(row))
                 if row.branch == BranchId::new("alpha")
         )
     }));
@@ -123,7 +123,7 @@ fn archive_refuses_current_and_trunk_rows() {
     app.selected = Some(BranchId::new("main"));
     assert_eq!(app.handle_key(Key::Character('x')), Action::None);
     assert!(app.message.as_deref().unwrap().contains("current"));
-    assert!(matches!(app.mutation, stackmap::app::MutationState::Idle));
+    assert!(matches!(app.mutation, crate::app::MutationState::Idle));
     assert!(!matches!(
         app.handle_key(Key::Character('y')),
         Action::Delete(_)
@@ -183,11 +183,11 @@ fn structural_refresh_cancels_range_and_pending_archives_overlay_reloaded_config
 #[test]
 fn authoritative_snapshot_prunes_absent_archived_names_through_config_outbox() {
     let directory = tempfile::tempdir().unwrap();
-    let config = stackmap::config::Config::default();
-    let mut seed = stackmap::config::ConfigMutation::default();
+    let config = crate::config::Config::default();
+    let mut seed = crate::config::ConfigMutation::default();
     seed.set_archived(BranchId::new("gone"), true);
     seed.set_archived(BranchId::new("alpha"), true);
-    stackmap::config::Config::persist_mutation(directory.path(), &seed, &config).unwrap();
+    crate::config::Config::persist_mutation(directory.path(), &seed, &config).unwrap();
     let mut input = (*snapshot()).clone();
     input.common_dir = directory.path().to_owned();
 
@@ -206,13 +206,13 @@ fn authoritative_snapshot_prunes_absent_archived_names_through_config_outbox() {
 #[test]
 fn structural_snapshot_unarchives_a_branch_that_became_current() {
     let directory = tempfile::tempdir().unwrap();
-    let mut seed = stackmap::config::ConfigMutation::default();
+    let mut seed = crate::config::ConfigMutation::default();
     seed.set_archived(BranchId::new("alpha"), true);
     seed.set_archived(BranchId::new("beta"), true);
-    stackmap::config::Config::persist_mutation(
+    crate::config::Config::persist_mutation(
         directory.path(),
         &seed,
-        &stackmap::config::Config::default(),
+        &crate::config::Config::default(),
     )
     .unwrap();
     let mut input = (*snapshot()).clone();
@@ -242,13 +242,13 @@ fn structural_snapshot_unarchives_a_branch_that_became_current() {
 #[test]
 fn structural_snapshot_unarchives_a_branch_promoted_to_configured_trunk() {
     let directory = tempfile::tempdir().unwrap();
-    let mut seed = stackmap::config::ConfigMutation::default();
+    let mut seed = crate::config::ConfigMutation::default();
     seed.set_archived(BranchId::new("loose"), true);
     seed.set_archived(BranchId::new("beta"), true);
-    stackmap::config::Config::persist_mutation(
+    crate::config::Config::persist_mutation(
         directory.path(),
         &seed,
-        &stackmap::config::Config::default(),
+        &crate::config::Config::default(),
     )
     .unwrap();
     let mut input = (*snapshot()).clone();
@@ -359,7 +359,7 @@ fn large_section_range_extends_and_shrinks_without_rebuilding_selection_rows() {
             false,
         ));
     }
-    input.branch_index = stackmap::model::RepositorySnapshot::index_branches(&branches);
+    input.branch_index = crate::model::RepositorySnapshot::index_branches(&branches);
     input.branches = branches.into();
     let mut app = App::default();
     app.apply_snapshot(Arc::new(input));
@@ -433,7 +433,7 @@ fn persisted_archives_survive_restart_and_pending_restore_beats_stale_completion
     let Action::PersistConfig(archive) = first.handle_key(Key::Character('x')) else {
         panic!("archive request");
     };
-    stackmap::config::Config::persist_mutation(
+    crate::config::Config::persist_mutation(
         &archive.common_dir,
         &archive.mutation,
         &archive.fallback,

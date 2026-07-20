@@ -60,8 +60,6 @@ pub struct ConfigWriteRequest {
     pub fallback: Config,
 }
 
-pub type ColorWriteRequest = ConfigWriteRequest;
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum GitHubState {
     #[default]

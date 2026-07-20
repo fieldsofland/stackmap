@@ -22,6 +22,9 @@ include = [
 ]
 autobenches = false
 
+[features]
+benchmarking = []
+
 [dependencies]
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -40,6 +43,7 @@ tempfile = "3.23"
 [[bench]]
 name = "responsiveness"
 harness = false
+required-features = ["benchmarking"]
 
 [profile.release]
 lto = "thin"

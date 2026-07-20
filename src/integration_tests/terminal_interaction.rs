@@ -1,9 +1,9 @@
-mod common;
+use super::common;
 
+use crate::app::{Action, App, MutationState, Overlay};
+use crate::events::{Input, Key, KeyPhase};
+use crate::model::BranchId;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use stackmap::app::{Action, App, MutationState, Overlay};
-use stackmap::events::{Input, Key, KeyPhase};
-use stackmap::model::BranchId;
 
 fn event(code: KeyCode, modifiers: KeyModifiers, kind: KeyEventKind) -> KeyEvent {
     KeyEvent::new_with_kind(code, modifiers, kind)

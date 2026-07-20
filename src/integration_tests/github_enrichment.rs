@@ -1,14 +1,14 @@
-mod common;
+use super::common;
 
 use std::sync::Arc;
 
-use stackmap::adapters::github::{GitHubError, PrMatch, parse_json};
-use stackmap::app::App;
-use stackmap::model::{BranchId, PullRequest};
+use crate::adapters::github::{GitHubError, PrMatch, parse_json};
+use crate::app::App;
+use crate::model::{BranchId, PullRequest};
 
 #[test]
 fn parses_batched_pr_json_and_ignores_unverifiable_entries() {
-    let matches = parse_json(include_bytes!("fixtures/github/pr-list.json")).unwrap();
+    let matches = parse_json(include_bytes!("../../tests/fixtures/github/pr-list.json")).unwrap();
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].branch, BranchId::new("feature/stack-map"));
     assert_eq!(matches[0].pull_request.number, 42);

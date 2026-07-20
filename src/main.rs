@@ -20,12 +20,11 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use stackmap::adapters::{git::DeleteRequest, git::GitAdapter, github, platform};
-use stackmap::app::{Action, App, ConfigWriteRequest};
-use stackmap::config::Config;
-use stackmap::events::{Input, Key};
-use stackmap::model::topology::ArchiveMode;
-use stackmap::refresh::{RefreshEvent, RefreshHandle};
+use stackmap::runtime::git::{DeleteOutcome, DeleteRequest, GitAdapter};
+use stackmap::runtime::{
+    Action, App, ArchiveMode, BranchId, Config, ConfigWriteRequest, Input, Key, RefreshEvent,
+    RefreshHandle, github, platform, render,
+};
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const GITHUB_TTL: Duration = Duration::from_secs(30);
@@ -298,7 +297,7 @@ fn run() -> Result<()> {
             last_clock_tick = Instant::now();
         }
         if redraw {
-            terminal.draw(|frame| stackmap::ui::render(frame, &mut app, SystemTime::now()))?;
+            terminal.draw(|frame| render(frame, &mut app, SystemTime::now()))?;
             redraw = false;
         }
         if last_reconcile.elapsed() >= RECONCILE_INTERVAL {
@@ -471,7 +470,7 @@ fn spawn_platform_action(
 
 fn spawn_checkout(
     adapter: GitAdapter,
-    branch: stackmap::model::BranchId,
+    branch: BranchId,
     sender: std::sync::mpsc::SyncSender<Result<()>>,
 ) -> io::Result<()> {
     thread::Builder::new()
@@ -485,7 +484,7 @@ fn spawn_checkout(
 fn spawn_delete(
     adapter: GitAdapter,
     request: DeleteRequest,
-    sender: std::sync::mpsc::SyncSender<Result<stackmap::adapters::git::DeleteOutcome>>,
+    sender: std::sync::mpsc::SyncSender<Result<DeleteOutcome>>,
 ) -> io::Result<()> {
     thread::Builder::new()
         .name("stackmap-delete".into())
@@ -551,7 +550,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use stackmap::model::{
+    use stackmap::runtime::{
         Branch, BranchId, ConfiguredUpstream, DiffState, GraphiteProvenance, RemoteRefEvidence,
         RepositorySnapshot, RepositoryState,
     };
@@ -559,7 +558,7 @@ mod tests {
     use super::*;
 
     fn request(sequence: u64) -> ConfigWriteRequest {
-        let mut mutation = stackmap::config::ConfigMutation::default();
+        let mut mutation = stackmap::runtime::ConfigMutation::default();
         mutation.set_color(BranchId::new("stack"), None);
         ConfigWriteRequest {
             sequence,

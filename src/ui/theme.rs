@@ -5,6 +5,7 @@ use ratatui::style::Color;
 use crate::config::Config;
 use crate::model::BranchId;
 
+#[cfg(test)]
 pub const TRUNK_COLOR_HEX: &str = "#e0af68";
 const TRUNK_RGB: (u8, u8, u8) = (224, 175, 104);
 

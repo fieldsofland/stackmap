@@ -1,0 +1,9 @@
+mod archive_workflow;
+mod common;
+mod github_enrichment;
+mod navigation_checkout;
+mod refresh_pipeline;
+mod repository_snapshot;
+mod terminal_interaction;
+mod topology_layout;
+mod tui_rendering;

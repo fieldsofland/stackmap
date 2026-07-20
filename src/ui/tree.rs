@@ -14,7 +14,7 @@ use crate::model::topology::{
 };
 use crate::model::{Branch, BranchId, ConfiguredUpstream, DiffState, RemoteRefEvidence};
 
-use super::layout::{ColumnRange, RenderGeometry, WidthMode, width_mode};
+use super::layout::{ColumnRange, RenderGeometry, WidthMode};
 use super::theme::{current_background, selected_background, stack_color, trunk_color};
 
 const UP: u8 = 1;
@@ -35,10 +35,6 @@ impl Default for RenderCell {
             style: Style::default(),
         }
     }
-}
-
-pub fn render(frame: &mut Frame<'_>, area: Rect, app: &App, now: SystemTime) {
-    render_with_mode(frame, area, app, now, width_mode(area.width));
 }
 
 pub fn render_with_mode(

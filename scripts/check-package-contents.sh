@@ -23,7 +23,6 @@ require src/lib.rs
 require tests/fixtures/graphite/supported-schema.sql
 require tests/fixtures/github/pr-list.json
 require benches/responsiveness.rs
-require benches/fixture_builder.rs
 
 if grep -Eq '(^|/)(PLAN\.md|memory\.md|changelog\.md|docs/plans/|\.context/|target/)' "$manifest"; then
   echo "package contains an internal or generated path" >&2

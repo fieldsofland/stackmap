@@ -1,19 +1,19 @@
-mod common;
+use super::common;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::app::{App, LanePitch};
+use crate::events::Key;
+use crate::model::{BranchId, ConfiguredUpstream, DiffStat, DiffState, RemoteRefEvidence};
+use crate::ui::layout::{RenderGeometry, areas};
+use crate::ui::theme::{
+    TRUNK_COLOR_HEX, current_background, selected_background, stack_color, trunk_color,
+};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::{Color, Modifier};
-use stackmap::app::{App, LanePitch};
-use stackmap::events::Key;
-use stackmap::model::{BranchId, ConfiguredUpstream, DiffStat, DiffState, RemoteRefEvidence};
-use stackmap::ui::layout::{RenderGeometry, areas};
-use stackmap::ui::theme::{
-    TRUNK_COLOR_HEX, current_background, selected_background, stack_color, trunk_color,
-};
 
 fn rendered_lines(terminal: &Terminal<TestBackend>) -> Vec<String> {
     let area = terminal.backend().buffer().area;
@@ -49,7 +49,7 @@ fn narrow_renderer_contains_every_fixed_semantic_field() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| {
-            stackmap::ui::render(
+            crate::ui::render(
                 frame,
                 &mut app,
                 UNIX_EPOCH + Duration::from_secs(1_700_003_600),
@@ -82,7 +82,7 @@ fn additions_and_deletions_use_independent_semantic_colors() {
     let backend = TestBackend::new(80, 8);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let buffer = terminal.backend().buffer();
     let addition = buffer
@@ -101,12 +101,7 @@ fn additions_and_deletions_use_independent_semantic_colors() {
 
 #[test]
 fn render_geometry_is_left_anchored_and_selection_independent() {
-    let narrow = RenderGeometry::new(
-        80,
-        stackmap::ui::layout::WidthMode::Narrow,
-        LanePitch::Auto,
-        4,
-    );
+    let narrow = RenderGeometry::new(80, crate::ui::layout::WidthMode::Narrow, LanePitch::Auto, 4);
     assert_eq!(narrow.effective_pitch, 2);
     assert_eq!(narrow.lane_x(0), 0);
     assert_eq!(narrow.lane_x(1), 3);
@@ -116,22 +111,17 @@ fn render_geometry_is_left_anchored_and_selection_independent() {
 
     let medium = RenderGeometry::new(
         100,
-        stackmap::ui::layout::WidthMode::Medium,
+        crate::ui::layout::WidthMode::Medium,
         LanePitch::Auto,
         4,
     );
-    let wide = RenderGeometry::new(
-        130,
-        stackmap::ui::layout::WidthMode::Wide,
-        LanePitch::Auto,
-        4,
-    );
+    let wide = RenderGeometry::new(130, crate::ui::layout::WidthMode::Wide, LanePitch::Auto, 4);
     assert_eq!(medium.effective_pitch, 3);
     assert_eq!(wide.effective_pitch, 4);
 
     let clamped = RenderGeometry::new(
         40,
-        stackmap::ui::layout::WidthMode::Narrow,
+        crate::ui::layout::WidthMode::Narrow,
         LanePitch::Fixed(6),
         30,
     );
@@ -148,7 +138,7 @@ fn current_nontrunk_has_status_and_topology_circles_in_fixed_columns() {
     )]));
     let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let lines = rendered_lines(&terminal);
     let (y, line) = line_with(&lines, "current");
@@ -171,7 +161,7 @@ fn current_nontrunk_has_status_and_topology_circles_in_fixed_columns() {
 fn trunk_uses_reserved_bold_hue_and_checked_out_marker() {
     let mut trunk = common::branch("main", None, "main", true);
     trunk.trunk = Some(BranchId::new("main"));
-    trunk.graphite = stackmap::model::GraphiteProvenance::Tracked;
+    trunk.graphite = crate::model::GraphiteProvenance::Tracked;
     let mut snapshot = (*common::snapshot(vec![trunk])).clone();
     snapshot.configured_trunks = Arc::from([BranchId::new("main")]);
     snapshot.trunks = snapshot.configured_trunks.clone();
@@ -179,7 +169,7 @@ fn trunk_uses_reserved_bold_hue_and_checked_out_marker() {
     app.apply_snapshot(Arc::new(snapshot));
     let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let lines = rendered_lines(&terminal);
     let (y, line) = lines
@@ -198,7 +188,7 @@ fn trunk_uses_reserved_bold_hue_and_checked_out_marker() {
         .set_color_in_memory(&BranchId::new("conflict"), Some(TRUNK_COLOR_HEX))
         .unwrap();
     assert!(
-        stackmap::app::COLOR_OPTIONS
+        crate::app::COLOR_OPTIONS
             .iter()
             .all(|(_, value)| *value != Some(TRUNK_COLOR_HEX))
     );
@@ -225,7 +215,7 @@ fn selected_and_current_backgrounds_fill_rows_without_destroying_diff_colors() {
     app.selected = Some(BranchId::new("selected"));
     let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let lines = rendered_lines(&terminal);
     let (current_y, _) = line_with(&lines, "current");
@@ -276,7 +266,7 @@ fn named_stack_renders_a_white_nonselectable_label_above_its_head() {
 
     let mut terminal = Terminal::new(TestBackend::new(90, 10)).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let lines = rendered_lines(&terminal);
     let (label_y, label_line) = line_with(&lines, "Release train");
@@ -302,7 +292,7 @@ fn archive_view_renders_unarchived_ancestry_dimmed_and_nonselectable() {
 
     let mut terminal = Terminal::new(TestBackend::new(90, 10)).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let lines = rendered_lines(&terminal);
     let (parent_y, parent_line) = lines
@@ -328,7 +318,7 @@ fn footer_labels_a_as_view_archive() {
     )]));
     let mut terminal = Terminal::new(TestBackend::new(120, 8)).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     assert!(
         rendered_lines(&terminal)
@@ -348,7 +338,7 @@ fn worktree_indicator_is_fixed_and_wide_detail_shows_path() {
     let backend = TestBackend::new(140, 12);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let lines = rendered_lines(&terminal);
     let branch_lines: Vec<_> = lines
@@ -367,9 +357,9 @@ fn worktree_indicator_is_fixed_and_wide_detail_shows_path() {
     assert_eq!(wt_columns[0], wt_columns[1]);
     assert!(lines.iter().any(|line| line.contains("⎇ linked-worktree")));
 
-    app.selected = Some(stackmap::model::BranchId::new("linked"));
+    app.selected = Some(crate::model::BranchId::new("linked"));
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let rendered: String = terminal
         .backend()
@@ -382,7 +372,7 @@ fn worktree_indicator_is_fixed_and_wide_detail_shows_path() {
 
     let mut narrow = Terminal::new(TestBackend::new(40, 10)).unwrap();
     narrow
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let narrow_lines = rendered_lines(&narrow);
     let (_, linked_line) = line_with(&narrow_lines, "linked");
@@ -402,9 +392,9 @@ fn stack_local_name_columns_are_stable_across_selection_and_child_lanes() {
         let backend = TestBackend::new(width, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+            .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
             .unwrap();
-        let body_width = stackmap::ui::layout::areas(ratatui::layout::Rect::new(0, 0, width, 12))
+        let body_width = crate::ui::layout::areas(ratatui::layout::Rect::new(0, 0, width, 12))
             .body
             .width;
         let lines: Vec<String> = (0..12)
@@ -434,7 +424,7 @@ fn stack_local_name_columns_are_stable_across_selection_and_child_lanes() {
 
         app.selected = Some(BranchId::new("side"));
         terminal
-            .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+            .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
             .unwrap();
         let selected_lines: Vec<String> = (0..12)
             .map(|y| {
@@ -454,16 +444,16 @@ fn stack_local_name_columns_are_stable_across_selection_and_child_lanes() {
 fn connectors_draw_exact_lane_endpoints_and_root_contact() {
     let mut main = common::branch("main", None, "main", false);
     main.trunk = Some(BranchId::new("main"));
-    main.graphite = stackmap::model::GraphiteProvenance::Tracked;
+    main.graphite = crate::model::GraphiteProvenance::Tracked;
     let mut root = common::branch("root", None, "root", true);
     root.trunk = Some(BranchId::new("main"));
-    root.graphite = stackmap::model::GraphiteProvenance::Tracked;
+    root.graphite = crate::model::GraphiteProvenance::Tracked;
     let mut primary = common::branch("primary", Some("root"), "root", false);
     primary.trunk = Some(BranchId::new("main"));
-    primary.graphite = stackmap::model::GraphiteProvenance::Tracked;
+    primary.graphite = crate::model::GraphiteProvenance::Tracked;
     let mut side = common::branch("side", Some("root"), "root", false);
     side.trunk = Some(BranchId::new("main"));
-    side.graphite = stackmap::model::GraphiteProvenance::Tracked;
+    side.graphite = crate::model::GraphiteProvenance::Tracked;
     let mut snapshot = (*common::snapshot(vec![main, root, primary, side])).clone();
     snapshot.configured_trunks = Arc::from([BranchId::new("main")]);
     snapshot.trunks = snapshot.configured_trunks.clone();
@@ -490,8 +480,8 @@ fn connectors_draw_exact_lane_endpoints_and_root_contact() {
         .iter()
         .enumerate()
         .filter_map(|(row, entry)| match entry {
-            stackmap::model::topology::ProjectionEntry::Divider(
-                stackmap::model::topology::DividerRow::Connector(connector),
+            crate::model::topology::ProjectionEntry::Divider(
+                crate::model::topology::DividerRow::Connector(connector),
             ) => Some((row, connector.clone())),
             _ => None,
         })
@@ -504,8 +494,8 @@ fn connectors_draw_exact_lane_endpoints_and_root_contact() {
         .filter_map(|(row, entry)| {
             matches!(
                 entry,
-                stackmap::model::topology::ProjectionEntry::Divider(
-                    stackmap::model::topology::DividerRow::Spacer { .. }
+                crate::model::topology::ProjectionEntry::Divider(
+                    crate::model::topology::DividerRow::Spacer { .. }
                 )
             )
             .then_some(row)
@@ -533,7 +523,7 @@ fn connectors_draw_exact_lane_endpoints_and_root_contact() {
     let child_color = stack_color(repository_id, &side_connector.stack_id, &app.config);
     let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let buffer = terminal.backend().buffer();
     for (visual_row, connector) in connectors {
@@ -569,7 +559,7 @@ fn focused_sibling_rows_keep_geometry_and_use_dim_modifier() {
     let tracked = |name: &str, parent: Option<&str>, root: &str, current: bool| {
         let mut branch = common::branch(name, parent, root, current);
         branch.trunk = Some(BranchId::new("main"));
-        branch.graphite = stackmap::model::GraphiteProvenance::Tracked;
+        branch.graphite = crate::model::GraphiteProvenance::Tracked;
         branch
     };
     let mut snapshot = (*common::snapshot(vec![
@@ -584,10 +574,10 @@ fn focused_sibling_rows_keep_geometry_and_use_dim_modifier() {
     let mut app = App::default();
     app.apply_snapshot(Arc::new(snapshot));
     app.selected = Some(BranchId::new("alpha"));
-    app.handle_key(stackmap::events::Key::Character('h'));
+    app.handle_key(crate::events::Key::Character('h'));
     let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let lines = rendered_lines(&terminal);
     let (alpha_y, alpha_line) = line_with(&lines, "alpha-tip");
@@ -622,7 +612,7 @@ fn plus_minus_and_zero_change_global_geometry_without_selection_recentering() {
         app.projection.lane_count,
     );
     assert_eq!(automatic.effective_pitch, 2);
-    app.handle_key(stackmap::events::Key::Character('+'));
+    app.handle_key(crate::events::Key::Character('+'));
     let expanded = RenderGeometry::new(
         area.body.width,
         area.mode,
@@ -638,9 +628,9 @@ fn plus_minus_and_zero_change_global_geometry_without_selection_recentering() {
         app.projection.lane_count,
     );
     assert_eq!(selected, expanded);
-    app.handle_key(stackmap::events::Key::Character('-'));
+    app.handle_key(crate::events::Key::Character('-'));
     assert_eq!(app.lane_pitch, LanePitch::Fixed(3));
-    app.handle_key(stackmap::events::Key::Character('0'));
+    app.handle_key(crate::events::Key::Character('0'));
     assert_eq!(app.lane_pitch, LanePitch::Auto);
 }
 
@@ -652,15 +642,15 @@ fn deletion_confirmation_keeps_choices_visible_at_minimum_width() {
         common::branch("main", None, "main", true),
         common::branch(target, None, target, false),
     ]));
-    app.selected = Some(stackmap::model::BranchId::new(target));
+    app.selected = Some(crate::model::BranchId::new(target));
     let backend = TestBackend::new(40, 20);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     app.begin_delete_confirmation();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let rendered: String = terminal
         .backend()
@@ -684,7 +674,7 @@ fn too_narrow_terminal_has_explicit_state() {
     let backend = TestBackend::new(39, 6);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let rendered: String = terminal
         .backend()
@@ -702,11 +692,11 @@ fn archive_mode_is_unmistakably_framed_and_empty_state_explains_return() {
     app.apply_snapshot(common::snapshot(vec![common::branch(
         "main", None, "main", true,
     )]));
-    app.handle_key(stackmap::events::Key::Character('a'));
+    app.handle_key(crate::events::Key::Character('a'));
     app.message = Some(Arc::from("configuration saved"));
     let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let rendered = rendered_lines(&terminal).join("\n");
     assert!(rendered.contains("ARCHIVE · local refs only · no fetch"));
@@ -722,10 +712,10 @@ fn archive_badge_stays_visible_at_minimum_width_with_a_long_repository_path() {
     snapshot.root = "/a/very/long/repository/path/that/must/not/cover/archive".into();
     let mut app = App::default();
     app.apply_snapshot(Arc::new(snapshot));
-    app.handle_key(stackmap::events::Key::Character('a'));
+    app.handle_key(crate::events::Key::Character('a'));
     let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let header = rendered_lines(&terminal)[0].clone();
     assert!(header.contains("ARCHIVE · local refs only · no fetch"));
@@ -739,10 +729,10 @@ fn archive_range_uses_a_non_color_marker_and_exposes_action_count_and_endpoints(
         common::branch("feature", None, "feature", false),
     ]));
     app.selected = Some(BranchId::new("feature"));
-    app.handle_key(stackmap::events::Key::Character('v'));
+    app.handle_key(crate::events::Key::Character('v'));
     let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let rendered = rendered_lines(&terminal).join("\n");
     assert!(rendered.contains("■"));
@@ -760,7 +750,7 @@ fn forty_column_terminal_renders_branches() {
     let backend = TestBackend::new(40, 6);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let rendered: String = terminal
         .backend()
@@ -776,7 +766,7 @@ fn forty_column_terminal_renders_branches() {
     assert_eq!(branch_line.chars().count(), 40);
     let geometry = RenderGeometry::new(
         40,
-        stackmap::ui::layout::WidthMode::Narrow,
+        crate::ui::layout::WidthMode::Narrow,
         LanePitch::Auto,
         app.projection.lane_count,
     );
@@ -787,11 +777,11 @@ fn forty_column_terminal_renders_branches() {
 #[test]
 fn relative_time_boundaries_are_deterministic() {
     let now = UNIX_EPOCH + Duration::from_secs(200_000);
-    assert_eq!(stackmap::ui::tree::relative_time(199_950, now), "now");
-    assert_eq!(stackmap::ui::tree::relative_time(199_940, now), "1m");
-    assert_eq!(stackmap::ui::tree::relative_time(196_400, now), "1h");
-    assert_eq!(stackmap::ui::tree::relative_time(27_200, now), "2d");
-    assert_eq!(stackmap::ui::tree::relative_time(200_061, now), "clock?");
+    assert_eq!(crate::ui::tree::relative_time(199_950, now), "now");
+    assert_eq!(crate::ui::tree::relative_time(199_940, now), "1m");
+    assert_eq!(crate::ui::tree::relative_time(196_400, now), "1h");
+    assert_eq!(crate::ui::tree::relative_time(27_200, now), "2d");
+    assert_eq!(crate::ui::tree::relative_time(200_061, now), "clock?");
 }
 
 #[test]
@@ -807,7 +797,7 @@ fn wide_renderer_includes_selected_branch_detail() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| {
-            stackmap::ui::render(
+            crate::ui::render(
                 frame,
                 &mut app,
                 UNIX_EPOCH + Duration::from_secs(1_700_003_600),
@@ -836,7 +826,7 @@ fn stale_health_remains_visible_alongside_messages() {
     let backend = TestBackend::new(80, 8);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let rendered: String = terminal
         .backend()
@@ -862,14 +852,14 @@ fn footer_keeps_controls_progress_notices_and_stale_health_independent() {
     app.message = Some(Arc::from("ordinary message"));
     app.mark_stale(Arc::from("refresh failed"));
     assert!(matches!(
-        app.handle_key(stackmap::events::Key::Enter),
-        stackmap::app::Action::Checkout(_)
+        app.handle_key(crate::events::Key::Enter),
+        crate::app::Action::Checkout(_)
     ));
     app.finish_checkout_at(Ok(()), 42, now);
 
     let mut terminal = Terminal::new(TestBackend::new(180, 8)).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let progress = terminal
         .backend()
@@ -892,7 +882,7 @@ fn footer_keeps_controls_progress_notices_and_stale_health_independent() {
     app.apply_structural_snapshot_at(Arc::new(matching), 42, now);
     app.mark_stale(Arc::from("later refresh failed"));
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let reconciled = terminal
         .backend()
@@ -919,14 +909,14 @@ fn verified_deletion_returns_to_controls_without_stuck_progress() {
     app.apply_snapshot(initial);
     app.selected = Some(BranchId::new("merged"));
     assert_eq!(
-        app.handle_key(stackmap::events::Key::Character('X')),
-        stackmap::app::Action::None
+        app.handle_key(crate::events::Key::Character('X')),
+        crate::app::Action::None
     );
     assert!(matches!(
-        app.handle_key(stackmap::events::Key::Character('y')),
-        stackmap::app::Action::Delete(_)
+        app.handle_key(crate::events::Key::Character('y')),
+        crate::app::Action::Delete(_)
     ));
-    app.finish_deletion_at(Ok(stackmap::adapters::git::DeleteOutcome::Deleted), 51, now);
+    app.finish_deletion_at(Ok(crate::adapters::git::DeleteOutcome::Deleted), 51, now);
     let mut matching =
         (*common::snapshot(vec![common::branch("main", None, "main", true)])).clone();
     matching.generation = 2;
@@ -934,7 +924,7 @@ fn verified_deletion_returns_to_controls_without_stuck_progress() {
 
     let mut terminal = Terminal::new(TestBackend::new(120, 8)).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let rendered = rendered_lines(&terminal).join("\n");
     assert!(rendered.contains("X delete"));
@@ -954,14 +944,14 @@ fn forty_columns_keeps_deep_stack_rows_on_one_line() {
     let mut app = App::default();
     let mut snapshot = (*common::snapshot(branches)).clone();
     snapshot.graphite_children = Arc::from([(
-        stackmap::model::BranchId::new("main"),
-        Arc::from([stackmap::model::BranchId::new("branch-00")]),
+        crate::model::BranchId::new("main"),
+        Arc::from([crate::model::BranchId::new("branch-00")]),
     )]);
     app.apply_snapshot(Arc::new(snapshot));
     let backend = TestBackend::new(40, 10);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let rendered: String = terminal
         .backend()
@@ -999,7 +989,7 @@ fn nested_side_stacks_clamp_to_visible_graph_edge_with_stable_overflow_cue() {
     let logical_lane = app.projection.row_for(&deepest).unwrap().lane;
     let geometry = RenderGeometry::new(
         40,
-        stackmap::ui::layout::WidthMode::Narrow,
+        crate::ui::layout::WidthMode::Narrow,
         app.lane_pitch,
         app.projection.lane_count,
     );
@@ -1008,21 +998,21 @@ fn nested_side_stacks_clamp_to_visible_graph_edge_with_stable_overflow_cue() {
     assert!(geometry.name_width(logical_lane) >= 8);
 
     for _ in 0..3 {
-        app.handle_key(stackmap::events::Key::Character('+'));
+        app.handle_key(crate::events::Key::Character('+'));
     }
     let expanded = RenderGeometry::new(
         40,
-        stackmap::ui::layout::WidthMode::Narrow,
+        crate::ui::layout::WidthMode::Narrow,
         app.lane_pitch,
         app.projection.lane_count,
     );
     assert_eq!(expanded.effective_pitch, 6);
     assert!(expanded.name_width(logical_lane) >= 8);
-    app.handle_key(stackmap::events::Key::Character('0'));
+    app.handle_key(crate::events::Key::Character('0'));
 
     let mut terminal = Terminal::new(TestBackend::new(40, 100)).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let initial_lines = rendered_lines(&terminal);
     let (_, initial) = line_with(&initial_lines, "side-12");
@@ -1036,7 +1026,7 @@ fn nested_side_stacks_clamp_to_visible_graph_edge_with_stable_overflow_cue() {
 
     app.selected = Some(deepest);
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let selected_lines = rendered_lines(&terminal);
     let (_, selected) = line_with(&selected_lines, "side-12");
@@ -1068,11 +1058,11 @@ fn forty_column_archive_row_composes_worktree_divergence_and_containment() {
     ]));
     app.config
         .set_archived_in_memory(&BranchId::new("useful-hidden-name"), true);
-    app.handle_key(stackmap::events::Key::Character('a'));
+    app.handle_key(crate::events::Key::Character('a'));
 
     let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let rendered = rendered_lines(&terminal).join("\n");
     assert!(rendered.contains("useful-hidden"));
@@ -1083,7 +1073,7 @@ fn forty_column_archive_row_composes_worktree_divergence_and_containment() {
     assert!(rendered.contains("000000000000002c"));
 
     let mut wide = Terminal::new(TestBackend::new(140, 10)).unwrap();
-    wide.draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+    wide.draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let lines = rendered_lines(&wide);
     let (_, branch_line) = line_with(&lines, "useful-hidden-name");
@@ -1111,11 +1101,11 @@ fn wide_archive_detail_reports_canonical_upstream_source_token_time_and_no_fetch
     ]));
     app.config
         .set_archived_in_memory(&BranchId::new("hidden"), true);
-    app.handle_key(stackmap::events::Key::Character('a'));
+    app.handle_key(crate::events::Key::Character('a'));
 
     let mut terminal = Terminal::new(TestBackend::new(180, 12)).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let rendered = rendered_lines(&terminal).join("\n");
     assert!(rendered.contains("refs/remotes/origin/main"));
@@ -1140,11 +1130,11 @@ fn unavailable_archive_evidence_never_renders_as_local_only() {
     ]));
     app.config
         .set_archived_in_memory(&BranchId::new("uncertain"), true);
-    app.handle_key(stackmap::events::Key::Character('a'));
+    app.handle_key(crate::events::Key::Character('a'));
 
     let mut terminal = Terminal::new(TestBackend::new(140, 10)).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let rendered = rendered_lines(&terminal).join("\n");
     assert!(rendered.contains("remote ?"));
@@ -1158,11 +1148,11 @@ fn help_documents_archive_range_and_picker_keys() {
     app.apply_snapshot(common::snapshot(vec![common::branch(
         "main", None, "main", true,
     )]));
-    app.overlay = stackmap::app::Overlay::Help;
+    app.overlay = crate::app::Overlay::Help;
     let backend = TestBackend::new(90, 28);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let rendered: String = terminal
         .backend()
@@ -1192,11 +1182,11 @@ fn picker_modals_render_textual_choices_and_commit_hints() {
         common::branch("main", None, "main", true),
         common::branch("feature", None, "feature", false),
     ]));
-    app.handle_key(stackmap::events::Key::Character('T'));
+    app.handle_key(crate::events::Key::Character('T'));
     let backend = TestBackend::new(90, 28);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let order = terminal
         .backend()
@@ -1210,11 +1200,11 @@ fn picker_modals_render_textual_choices_and_commit_hints() {
     assert!(order.contains("Graphite"));
     assert!(order.contains("Enter apply"));
 
-    app.handle_key(stackmap::events::Key::Escape);
-    app.selected = Some(stackmap::model::BranchId::new("feature"));
-    app.handle_key(stackmap::events::Key::Character('C'));
+    app.handle_key(crate::events::Key::Escape);
+    app.selected = Some(crate::model::BranchId::new("feature"));
+    app.handle_key(crate::events::Key::Character('C'));
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let color = terminal
         .backend()
@@ -1232,8 +1222,8 @@ fn picker_modals_render_textual_choices_and_commit_hints() {
 fn focused_section_reserves_one_sticky_bottom_row_with_continuation_cue() {
     let mut branches = Vec::new();
     let mut trunk = common::branch("main", None, "main", true);
-    trunk.trunk = Some(stackmap::model::BranchId::new("main"));
-    trunk.graphite = stackmap::model::GraphiteProvenance::Tracked;
+    trunk.trunk = Some(crate::model::BranchId::new("main"));
+    trunk.graphite = crate::model::GraphiteProvenance::Tracked;
     branches.push(trunk);
     for index in 0..14 {
         let name = format!("branch-{index:02}");
@@ -1248,19 +1238,19 @@ fn focused_section_reserves_one_sticky_bottom_row_with_continuation_cue() {
             "branch-00",
             false,
         );
-        branch.trunk = Some(stackmap::model::BranchId::new("main"));
-        branch.graphite = stackmap::model::GraphiteProvenance::Tracked;
+        branch.trunk = Some(crate::model::BranchId::new("main"));
+        branch.graphite = crate::model::GraphiteProvenance::Tracked;
         branches.push(branch);
     }
     let mut app = App::default();
     app.apply_snapshot(common::snapshot(branches));
-    app.selected = Some(stackmap::model::BranchId::new("branch-00"));
-    app.handle_key(stackmap::events::Key::Character('H'));
+    app.selected = Some(crate::model::BranchId::new("branch-00"));
+    app.handle_key(crate::events::Key::Character('H'));
 
     let backend = TestBackend::new(80, 10);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let buffer = terminal.backend().buffer();
     let body_last = (0..80).map(|x| buffer[(x, 7)].symbol()).collect::<String>();
@@ -1277,12 +1267,12 @@ fn focused_section_reserves_one_sticky_bottom_row_with_continuation_cue() {
         assert!(!row.contains("main"), "sticky branch duplicated at row {y}");
     }
 
-    app.handle_key(stackmap::events::Key::Character('t'));
-    app.handle_key(stackmap::events::Key::Character('s'));
+    app.handle_key(crate::events::Key::Character('t'));
+    app.handle_key(crate::events::Key::Character('s'));
     let backend = TestBackend::new(80, 8);
     let mut resized = Terminal::new(backend).unwrap();
     resized
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let rendered = resized
         .backend()
@@ -1309,9 +1299,9 @@ fn footer_describes_contextual_stack_or_ten_row_navigation() {
     let backend = TestBackend::new(90, 10);
     let mut terminal = Terminal::new(backend).unwrap();
 
-    app.selected = Some(stackmap::model::BranchId::new("one-off"));
+    app.selected = Some(crate::model::BranchId::new("one-off"));
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let one_off = terminal
         .backend()
@@ -1322,9 +1312,9 @@ fn footer_describes_contextual_stack_or_ten_row_navigation() {
         .collect::<String>();
     assert!(one_off.contains("J/K ±10"));
 
-    app.selected = Some(stackmap::model::BranchId::new("stack-tip"));
+    app.selected = Some(crate::model::BranchId::new("stack-tip"));
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let stack = terminal
         .backend()
@@ -1351,7 +1341,7 @@ fn five_thousand_stack_projection_renders_only_the_visible_window() {
     let backend = TestBackend::new(40, 8);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
-        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     assert_eq!(terminal.backend().buffer().area.width, 40);
 }

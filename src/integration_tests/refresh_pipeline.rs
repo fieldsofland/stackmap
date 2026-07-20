@@ -1,15 +1,15 @@
-mod common;
+use super::common;
 
 use std::sync::Arc;
 use std::{fs, path::PathBuf};
 
-use stackmap::adapters::git::GitAdapter;
-use stackmap::app::App;
-use stackmap::config::config_path;
-use stackmap::model::BranchId;
-use stackmap::model::RemoteRefEvidence;
-use stackmap::refresh::builder::SnapshotBuilder;
-use stackmap::refresh::upstream::{UpstreamBatch, UpstreamCommand, UpstreamResult};
+use crate::adapters::git::GitAdapter;
+use crate::app::App;
+use crate::config::config_path;
+use crate::model::BranchId;
+use crate::model::RemoteRefEvidence;
+use crate::refresh::builder::SnapshotBuilder;
+use crate::refresh::upstream::{UpstreamBatch, UpstreamCommand, UpstreamResult};
 
 #[test]
 fn builder_publishes_complete_generations_after_ref_changes() {
@@ -82,7 +82,7 @@ fn older_enriched_snapshot_cannot_replace_newer_structure() {
         app.snapshot
             .as_ref()
             .unwrap()
-            .branch(&stackmap::model::BranchId::new("new"))
+            .branch(&crate::model::BranchId::new("new"))
             .is_some()
     );
 }
@@ -141,7 +141,7 @@ fn active_view_never_requests_upstream_and_archive_targets_only_hidden_rows() {
     app.config
         .set_archived_in_memory(&BranchId::new("hidden"), true);
 
-    app.handle_key(stackmap::events::Key::Character('a'));
+    app.handle_key(crate::events::Key::Character('a'));
     let Some(UpstreamCommand::Request(request)) = app.take_upstream_command() else {
         panic!("entering Archive should request visible hidden evidence");
     };
@@ -158,7 +158,7 @@ fn active_view_never_requests_upstream_and_archive_targets_only_hidden_rows() {
     ));
     assert!(app.take_upstream_command().is_none());
 
-    app.handle_key(stackmap::events::Key::Character('a'));
+    app.handle_key(crate::events::Key::Character('a'));
     assert_eq!(app.take_upstream_command(), Some(UpstreamCommand::Cancel));
     assert!(app.take_upstream_command().is_none());
 }
@@ -174,7 +174,7 @@ fn upstream_reducer_rejects_generation_oid_and_token_races() {
     app.apply_snapshot(Arc::new(value));
     app.config
         .set_archived_in_memory(&BranchId::new("hidden"), true);
-    app.handle_key(stackmap::events::Key::Character('a'));
+    app.handle_key(crate::events::Key::Character('a'));
     let Some(UpstreamCommand::Request(request)) = app.take_upstream_command() else {
         panic!("expected request");
     };

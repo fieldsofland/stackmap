@@ -1,16 +1,16 @@
-mod common;
+use super::common;
 
 use std::collections::HashSet;
 use std::fs;
 use std::sync::Arc;
 
+use crate::adapters::git::{DeleteOutcome, DeleteRequest, GitAdapter};
+use crate::adapters::graphite::read_topology;
+use crate::app::App;
+use crate::model::topology::{DividerRow, ProjectionEntry};
+use crate::model::{BranchId, ConfiguredUpstream, ValidationError};
+use crate::refresh::builder::SnapshotBuilder;
 use rusqlite::Connection;
-use stackmap::adapters::git::{DeleteOutcome, DeleteRequest, GitAdapter};
-use stackmap::adapters::graphite::read_topology;
-use stackmap::app::App;
-use stackmap::model::topology::{DividerRow, ProjectionEntry};
-use stackmap::model::{BranchId, ConfiguredUpstream, ValidationError};
-use stackmap::refresh::builder::SnapshotBuilder;
 
 #[test]
 fn git_inventory_tracks_every_local_branch_and_dirty_state() {
@@ -239,7 +239,9 @@ fn graphite_fixture_loads_exact_parents_read_only() {
     fs::write(git_dir.join(".graphite_repo_config"), r#"{"trunk":"main"}"#).unwrap();
     let connection = Connection::open(git_dir.join(".graphite_metadata.db")).unwrap();
     connection
-        .execute_batch(include_str!("fixtures/graphite/supported-schema.sql"))
+        .execute_batch(include_str!(
+            "../../tests/fixtures/graphite/supported-schema.sql"
+        ))
         .unwrap();
     connection
         .execute(
@@ -388,7 +390,9 @@ fn graphite_loads_all_ordered_local_trunks_and_classifies_each_chain() {
     .unwrap();
     let connection = Connection::open(git_dir.join(".graphite_metadata.db")).unwrap();
     connection
-        .execute_batch(include_str!("fixtures/graphite/supported-schema.sql"))
+        .execute_batch(include_str!(
+            "../../tests/fixtures/graphite/supported-schema.sql"
+        ))
         .unwrap();
     for (branch, parent) in [
         ("main", None),
@@ -445,7 +449,9 @@ fn missing_configured_trunk_degrades_its_branches_without_hiding_other_topology(
     .unwrap();
     let connection = Connection::open(git_dir.join(".graphite_metadata.db")).unwrap();
     connection
-        .execute_batch(include_str!("fixtures/graphite/supported-schema.sql"))
+        .execute_batch(include_str!(
+            "../../tests/fixtures/graphite/supported-schema.sql"
+        ))
         .unwrap();
     connection
         .execute(
@@ -512,7 +518,9 @@ fn graphite_quarantines_descendants_of_a_missing_parent() {
     fs::write(git_dir.join(".graphite_repo_config"), r#"{"trunk":"main"}"#).unwrap();
     let connection = Connection::open(git_dir.join(".graphite_metadata.db")).unwrap();
     connection
-        .execute_batch(include_str!("fixtures/graphite/supported-schema.sql"))
+        .execute_batch(include_str!(
+            "../../tests/fixtures/graphite/supported-schema.sql"
+        ))
         .unwrap();
     connection
         .execute(
@@ -550,7 +558,7 @@ fn definitely_untracked_deletion_is_merged_and_expected_oid_atomic() {
     let request = DeleteRequest {
         branch: branch.id.clone(),
         expected_oid: branch.oid.clone(),
-        expected_provenance: stackmap::model::GraphiteProvenance::DefinitelyUntracked,
+        expected_provenance: crate::model::GraphiteProvenance::DefinitelyUntracked,
     };
     assert_eq!(
         adapter.delete_branch(&request).unwrap(),
@@ -579,7 +587,7 @@ fn unmerged_or_stale_untracked_deletion_preserves_the_ref() {
     let request = DeleteRequest {
         branch: BranchId::new("unmerged"),
         expected_oid: Arc::from(oid),
-        expected_provenance: stackmap::model::GraphiteProvenance::DefinitelyUntracked,
+        expected_provenance: crate::model::GraphiteProvenance::DefinitelyUntracked,
     };
     assert!(adapter.delete_branch(&request).is_err());
     assert!(
