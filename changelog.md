@@ -2,6 +2,8 @@
 
 ## 2026-07-20
 
+- Published the hardened source repository at `https://github.com/fieldsofland/stackmap`, protected `main` with required ARM64/Intel/stable/policy checks, protected prerelease tags, enabled security reporting and dependency updates, and configured the maintainer-approved prerelease environment.
+- Installed `stackmap 0.1.0-alpha.1` from verified public `main` at `/Users/matt/.cargo/bin/stackmap`; version/help output and disposable-repository startup/quit smoke tests pass.
 - Prepared Stackmap `0.1.0-alpha.1` for public open-source development with an MIT license, contribution and conduct policies, private vulnerability reporting guidance, issue forms, pull-request guidance, and feature/support/release documentation.
 - Defined an explicit Cargo package allowlist, disabled crates.io publication, unified CLI and manifest version reporting, and documented source and GitHub-release installation.
 - Added pinned macOS 15 ARM64/Intel CI, stable-Rust compatibility testing, cargo-deny policy, Dependabot, and a fail-closed two-architecture prerelease workflow with checksums and artifact attestations.
