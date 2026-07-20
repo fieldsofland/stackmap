@@ -38,6 +38,10 @@
 - Release benchmarks measured about 0.108 ms per 500-branch projection, 1.10 ms per 5,000-branch projection, and 0.94 ms per projection of one 5,000-branch deep stack. A 5,000-level/10,000-branch deep comb emits iteratively without call-stack recursion; broad attach-parent lookup is indexed.
 - Public development lives at `https://github.com/fieldsofland/stackmap` on protected `main`. Native macOS ARM64/Intel CI, current-stable compatibility, and dependency policy pass at commit `0f01e4346448c700c0474061734005f08e767405`.
 - `stackmap 0.1.0-alpha.1` is installed at `/Users/matt/.cargo/bin/stackmap`, resolves on `PATH`, and passes startup/quit smoke testing in a disposable Git repository.
+- Passive Git monitoring runs with optional locks disabled, so inventory/status/diff commands cannot refresh or lock the index. Explicit checkout and deletion retain normal Git locking and use a separate 30-second mutation deadline.
+- Repository notifications are path-filtered and quiet-period debounced; transient locks, object-store writes, logs, and temporary files do not trigger structural refreshes. Five-minute reconciliation is a dropped-event safety net rather than the primary monitor.
+- Normal quit, terminal-close signals, and recoverable error exits stop the watcher, terminate registered subprocess groups, and join refresh/upstream workers. Timed-out children receive TERM before KILL.
+- A release-build smoke test against the FactMachine monorepo settled at 0.0% CPU, created no `index.lock`, and left no Stackmap or Git child after `q`.
 
 ## Next steps
 

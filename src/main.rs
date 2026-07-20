@@ -26,7 +26,7 @@ use stackmap::runtime::{
     RefreshHandle, github, platform, render,
 };
 
-const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 const GITHUB_TTL: Duration = Duration::from_secs(30);
 const CONFIG_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -205,7 +205,13 @@ fn run() -> Result<()> {
     let mut redraw = true;
 
     loop {
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
         while let Some(event) = refresh.try_event() {
+            if shutdown.load(Ordering::Acquire) {
+                break;
+            }
             redraw = true;
             match event {
                 RefreshEvent::Structural {
@@ -303,9 +309,6 @@ fn run() -> Result<()> {
         if last_reconcile.elapsed() >= RECONCILE_INTERVAL {
             refresh.request();
             last_reconcile = Instant::now();
-        }
-        if shutdown.load(Ordering::Acquire) {
-            break;
         }
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {

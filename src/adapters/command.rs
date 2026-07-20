@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -44,7 +45,28 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run_bounded_inner(program, args, cwd, timeout, output_limit, None)
+    run_bounded_inner(program, args, cwd, timeout, output_limit, None, false)
+}
+
+pub fn run_bounded_read_only_git<I, S>(
+    args: I,
+    cwd: &Path,
+    timeout: Duration,
+    output_limit: usize,
+) -> Result<CommandOutput, CommandError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_bounded_inner(
+        OsStr::new("git"),
+        args,
+        cwd,
+        timeout,
+        output_limit,
+        None,
+        true,
+    )
 }
 
 pub fn run_bounded_with_stdin<I, S>(
@@ -62,7 +84,15 @@ where
     if stdin.len() > 64 * 1024 {
         return Err(CommandError::InputTooLarge(stdin.len()));
     }
-    run_bounded_inner(program, args, cwd, timeout, output_limit, Some(stdin))
+    run_bounded_inner(
+        program,
+        args,
+        cwd,
+        timeout,
+        output_limit,
+        Some(stdin),
+        false,
+    )
 }
 
 fn run_bounded_inner<I, S>(
@@ -72,6 +102,7 @@ fn run_bounded_inner<I, S>(
     timeout: Duration,
     output_limit: usize,
     stdin: Option<&[u8]>,
+    disable_optional_locks: bool,
 ) -> Result<CommandOutput, CommandError>
 where
     I: IntoIterator<Item = S>,
@@ -89,12 +120,16 @@ where
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if disable_optional_locks {
+        command.env("GIT_OPTIONAL_LOCKS", "0");
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
     let mut child = command.spawn().map_err(CommandError::Spawn)?;
+    let active_child = ActiveChild::register(child.id());
 
     let stdin_result = if let Some(input) = stdin {
         let mut stream = child
@@ -144,6 +179,7 @@ where
             None => thread::sleep(Duration::from_millis(10)),
         }
     };
+    drop(active_child);
 
     let mut stdout = (Vec::new(), false);
     let mut stderr = (Vec::new(), false);
@@ -205,16 +241,70 @@ fn terminate(child: &mut std::process::Child) {
         // Each subprocess owns its process group, so a timeout also stops hooks
         // or helpers that inherited its pipes instead of leaving reader threads
         // waiting for descendants after the direct child exits.
-        let group = format!("-{}", child.id());
-        let _ = Command::new("/bin/kill")
-            .args(["-KILL", &group])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        signal_process_group(child.id(), "-TERM");
+        let grace_started = Instant::now();
+        while grace_started.elapsed() < Duration::from_millis(250) {
+            if child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        signal_process_group(child.id(), "-KILL");
     }
     let _ = child.kill();
 }
+
+fn active_children() -> &'static Mutex<std::collections::HashSet<u32>> {
+    static ACTIVE: OnceLock<Mutex<std::collections::HashSet<u32>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+struct ActiveChild(u32);
+
+impl ActiveChild {
+    fn register(pid: u32) -> Self {
+        if let Ok(mut active) = active_children().lock() {
+            active.insert(pid);
+        }
+        Self(pid)
+    }
+}
+
+impl Drop for ActiveChild {
+    fn drop(&mut self) {
+        if let Ok(mut active) = active_children().lock() {
+            active.remove(&self.0);
+        }
+    }
+}
+
+pub fn terminate_active_commands() {
+    let pids = active_children()
+        .lock()
+        .map(|active| active.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for &pid in &pids {
+        signal_process_group(pid, "-TERM");
+    }
+    thread::sleep(Duration::from_millis(100));
+    for pid in pids {
+        signal_process_group(pid, "-KILL");
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(pid: u32, signal: &str) {
+    let group = format!("-{pid}");
+    let _ = Command::new("/bin/kill")
+        .args([signal, &group])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(unix))]
+fn signal_process_group(_pid: u32, _signal: &str) {}
 
 fn read_limited(
     mut stream: Box<dyn Read + Send>,

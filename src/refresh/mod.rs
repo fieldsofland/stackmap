@@ -41,7 +41,7 @@ pub struct RefreshHandle {
     diff_state: Arc<(Mutex<DiffCoordinator>, Condvar)>,
     upstream: UpstreamCoordinator,
     shutdown: Arc<AtomicBool>,
-    _watcher: Option<notify::RecommendedWatcher>,
+    watcher: Option<watcher::RepositoryWatcher>,
 }
 
 #[derive(Clone)]
@@ -200,7 +200,7 @@ impl RefreshHandle {
             diff_state,
             upstream,
             shutdown,
-            _watcher: watcher,
+            watcher,
         };
         handle.request();
         Ok(handle)
@@ -235,6 +235,7 @@ fn push_event(events: &Mutex<VecDeque<RefreshEvent>>, event: RefreshEvent) {
 
 impl Drop for RefreshHandle {
     fn drop(&mut self) {
+        self.watcher.take();
         self.shutdown.store(true, Ordering::Release);
         let (state, wake) = &*self.diff_state;
         if let Ok(mut state) = state.lock() {
@@ -242,9 +243,10 @@ impl Drop for RefreshHandle {
         }
         wake.notify_all();
         let _ = self.requester.requests.try_send(Request::Shutdown);
-        // A running bounded Git command may still be finishing. Dropping its
-        // JoinHandle detaches it so terminal restoration is never delayed.
-        self.workers.clear();
+        crate::adapters::command::terminate_active_commands();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
     }
 }
 

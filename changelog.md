@@ -2,6 +2,10 @@
 
 ## 2026-07-20
 
+- Made monitoring non-interfering and event-driven: passive Git commands disable optional locks, relevant filesystem events debounce after a quiet period, noisy `.git` paths are ignored, and periodic reconciliation moved from 30 seconds to five minutes.
+- Separated passive and mutating Git execution so checkout and atomic deletion retain normal locks with a safer 30-second deadline, while timed-out commands receive a graceful TERM window before forced termination.
+- Hardened shutdown by stopping and joining watcher/refresh/upstream workers and terminating every registered subprocess group instead of detaching active repository work.
+- Verified formatting, strict offline Clippy, 176 all-target/all-feature tests, release build, and a live FactMachine-monorepo smoke test with 0.0% settled CPU, no index lock, and no process left after quit.
 - Published the hardened source repository at `https://github.com/fieldsofland/stackmap`, protected `main` with required ARM64/Intel/stable/policy checks, protected prerelease tags, enabled security reporting and dependency updates, and configured the maintainer-approved prerelease environment.
 - Installed `stackmap 0.1.0-alpha.1` from verified public `main` at `/Users/matt/.cargo/bin/stackmap`; version/help output and disposable-repository startup/quit smoke tests pass.
 - Prepared Stackmap `0.1.0-alpha.1` for public open-source development with an MIT license, contribution and conduct policies, private vulnerability reporting guidance, issue forms, pull-request guidance, and feature/support/release documentation.
