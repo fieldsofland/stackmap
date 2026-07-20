@@ -22,6 +22,7 @@ pub enum CommandError {
     Read(std::io::Error),
     Write(std::io::Error),
     InputTooLarge(usize),
+    MissingPipe(&'static str),
 }
 
 impl std::fmt::Display for CommandError {
@@ -95,19 +96,30 @@ where
     }
     let mut child = command.spawn().map_err(CommandError::Spawn)?;
 
-    let stdin_result = stdin.map(|input| {
-        let mut stream = child.stdin.take().expect("stdin requested");
+    let stdin_result = if let Some(input) = stdin {
+        let mut stream = child
+            .stdin
+            .take()
+            .ok_or(CommandError::MissingPipe("stdin"))?;
         let input = input.to_vec();
         let (send, receive) = mpsc::sync_channel(1);
         thread::spawn(move || {
             let result = stream.write_all(&input);
             let _ = send.send(result);
         });
-        receive
-    });
+        Some(receive)
+    } else {
+        None
+    };
 
-    let stdout = child.stdout.take().expect("stdout requested");
-    let stderr = child.stderr.take().expect("stderr requested");
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or(CommandError::MissingPipe("stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or(CommandError::MissingPipe("stderr"))?;
     let (send, receive) = mpsc::sync_channel(2);
     for (is_stdout, stream) in [
         (true, Box::new(stdout) as Box<dyn Read + Send>),

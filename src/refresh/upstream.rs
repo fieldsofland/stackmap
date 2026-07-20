@@ -118,12 +118,18 @@ impl UpstreamCoordinator {
                 let results = results.clone();
                 move || {
                     let mut cache = EvidenceCache::new(CACHE_CAPACITY);
-                    loop {
+                    'worker: loop {
                         let (request, request_revision) = {
                             let (state, wake) = &*state;
-                            let mut state = state.lock().expect("upstream coordinator poisoned");
+                            let mut state = match state.lock() {
+                                Ok(state) => state,
+                                Err(_) => break 'worker,
+                            };
                             while !state.updated && !state.shutdown {
-                                state = wake.wait(state).expect("upstream coordinator poisoned");
+                                state = match wake.wait(state) {
+                                    Ok(state) => state,
+                                    Err(_) => break 'worker,
+                                };
                             }
                             if state.shutdown {
                                 break;
@@ -144,7 +150,9 @@ impl UpstreamCoordinator {
                         ) else {
                             continue;
                         };
-                        let mut results = results.lock().expect("upstream result queue poisoned");
+                        let Ok(mut results) = results.lock() else {
+                            break;
+                        };
                         if results.len() == RESULT_CAPACITY {
                             results.pop_front();
                         }
@@ -163,7 +171,9 @@ impl UpstreamCoordinator {
     pub fn submit(&self, command: UpstreamCommand) {
         self.revision.fetch_add(1, Ordering::AcqRel);
         let (state, wake) = &*self.state;
-        let mut state = state.lock().expect("upstream coordinator poisoned");
+        let Ok(mut state) = state.lock() else {
+            return;
+        };
         state.latest = match command {
             UpstreamCommand::Request(mut request) => {
                 if request.targets.len() > MAX_TARGETS {
@@ -185,10 +195,9 @@ impl UpstreamCoordinator {
 impl Drop for UpstreamCoordinator {
     fn drop(&mut self) {
         let (state, wake) = &*self.state;
-        state
-            .lock()
-            .expect("upstream coordinator poisoned")
-            .shutdown = true;
+        if let Ok(mut state) = state.lock() {
+            state.shutdown = true;
+        }
         self.revision.fetch_add(1, Ordering::AcqRel);
         wake.notify_all();
         // A bounded Git command may still be finishing. Detach instead of

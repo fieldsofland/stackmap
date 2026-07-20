@@ -407,9 +407,11 @@ impl App {
             match Config::load(&snapshot.common_dir) {
                 Ok(mut config) => {
                     for (root, (_, color)) in &self.pending_colors {
-                        config
-                            .set_color_in_memory(root, color.as_deref())
-                            .expect("pending colors were already validated");
+                        if let Err(error) = config.set_color_in_memory(root, color.as_deref()) {
+                            self.message = Some(Arc::from(format!(
+                                "pending color ignored after validation changed: {error}"
+                            )));
+                        }
                     }
                     for (branch, (_, archived)) in &self.pending_archives {
                         match archived {
@@ -420,9 +422,12 @@ impl App {
                         }
                     }
                     for (stack, (_, name)) in &self.pending_stack_names {
-                        config
-                            .set_stack_name_in_memory(stack, name.as_deref())
-                            .expect("pending stack names were already validated");
+                        if let Err(error) = config.set_stack_name_in_memory(stack, name.as_deref())
+                        {
+                            self.message = Some(Arc::from(format!(
+                                "pending stack name ignored after validation changed: {error}"
+                            )));
+                        }
                     }
                     self.config = config;
                 }
@@ -934,9 +939,10 @@ impl App {
                 .and_then(|index| COLOR_OPTIONS.get(index + 1))
                 .and_then(|(_, value)| *value),
         };
-        self.config
-            .set_color_in_memory(&root, next)
-            .expect("palette colors are valid");
+        if let Err(error) = self.config.set_color_in_memory(&root, next) {
+            self.message = Some(Arc::from(format!("stack color was not changed: {error}")));
+            return Action::None;
+        }
         self.persist_color(root, next.map(Arc::from), common_dir)
     }
 
@@ -1031,9 +1037,16 @@ impl App {
                     (picker.choice_index + 1).min(COLOR_OPTIONS.len() - 1)
                 };
                 picker.pending = COLOR_OPTIONS[picker.choice_index].1.map(Arc::from);
-                self.config
+                if let Err(error) = self
+                    .config
                     .set_color_in_memory(&picker.target, picker.pending.as_deref())
-                    .expect("picker colors are valid");
+                {
+                    self.overlay = Overlay::None;
+                    self.message = Some(Arc::from(format!(
+                        "color picker closed after validation failed: {error}"
+                    )));
+                    return Action::None;
+                }
                 self.overlay = Overlay::ColorPicker(picker);
                 Action::None
             }
@@ -1042,19 +1055,26 @@ impl App {
                     self.close_invalid_color_picker(&picker);
                     return Action::None;
                 }
-                let common_dir = self
+                let Some(common_dir) = self
                     .snapshot
                     .as_ref()
-                    .expect("a valid picker target has a snapshot")
-                    .common_dir
-                    .clone();
+                    .map(|snapshot| snapshot.common_dir.clone())
+                else {
+                    self.close_invalid_color_picker(&picker);
+                    return Action::None;
+                };
                 self.overlay = Overlay::None;
                 self.persist_color(picker.target, picker.pending, common_dir)
             }
             Key::Escape => {
-                self.config
+                if let Err(error) = self
+                    .config
                     .set_color_in_memory(&picker.target, picker.original.as_deref())
-                    .expect("original config color was valid");
+                {
+                    self.message = Some(Arc::from(format!(
+                        "color preview could not be restored: {error}"
+                    )));
+                }
                 self.overlay = Overlay::None;
                 Action::None
             }
@@ -1113,15 +1133,22 @@ impl App {
                     "" => None,
                     value => Some(Arc::<str>::from(value)),
                 };
-                let common_dir = self
+                let Some(common_dir) = self
                     .snapshot
                     .as_ref()
-                    .expect("a valid name target has a snapshot")
-                    .common_dir
-                    .clone();
-                self.config
+                    .map(|snapshot| snapshot.common_dir.clone())
+                else {
+                    self.close_invalid_stack_name_editor();
+                    return Action::None;
+                };
+                if let Err(error) = self
+                    .config
                     .set_stack_name_in_memory(&editor.target, value.as_deref())
-                    .expect("editor stack names are validated while typing");
+                {
+                    self.overlay = Overlay::None;
+                    self.message = Some(Arc::from(format!("stack name was not changed: {error}")));
+                    return Action::None;
+                }
                 let mut mutation = ConfigMutation::default();
                 mutation.set_stack_name(editor.target.clone(), value.clone());
                 self.overlay = Overlay::None;
@@ -1140,9 +1167,15 @@ impl App {
         match self.overlay.clone() {
             Overlay::ColorPicker(picker) => {
                 if self.stack_target_is_valid(&picker.target) {
-                    self.config
+                    if let Err(error) = self
+                        .config
                         .set_color_in_memory(&picker.target, picker.pending.as_deref())
-                        .expect("picker colors are valid");
+                    {
+                        self.overlay = Overlay::None;
+                        self.message = Some(Arc::from(format!(
+                            "color picker closed after validation failed: {error}"
+                        )));
+                    }
                 } else {
                     self.close_invalid_color_picker(&picker);
                 }
@@ -1170,9 +1203,14 @@ impl App {
     }
 
     fn close_invalid_color_picker(&mut self, picker: &ColorPicker) {
-        self.config
+        if let Err(error) = self
+            .config
             .set_color_in_memory(&picker.target, picker.original.as_deref())
-            .expect("original config color was valid");
+        {
+            self.message = Some(Arc::from(format!(
+                "color preview could not be restored: {error}"
+            )));
+        }
         self.overlay = Overlay::None;
         self.message = Some(Arc::from(
             "color picker closed because its stack is no longer available",
@@ -1334,12 +1372,14 @@ impl App {
             .and_then(|index| self.projection.selectable.get(index))
             .or_else(|| self.projection.selectable.get(selected_index + 1))
             .cloned();
-        let common_dir = self
+        let Some(common_dir) = self
             .snapshot
             .as_ref()
-            .expect("an archive candidate has a snapshot")
-            .common_dir
-            .clone();
+            .map(|snapshot| snapshot.common_dir.clone())
+        else {
+            self.message = Some(Arc::from("repository changed; branch was not archived"));
+            return Action::None;
+        };
         self.config.set_archived_in_memory(&branch_id, archived);
         let mut mutation = ConfigMutation::default();
         mutation.set_archived(branch_id.clone(), archived);
@@ -1459,12 +1499,16 @@ impl App {
             return Action::None;
         }
         let archived = matches!(self.archive_mode, ArchiveMode::Active);
-        let common_dir = self
+        let Some(common_dir) = self
             .snapshot
             .as_ref()
-            .expect("a valid range has a snapshot")
-            .common_dir
-            .clone();
+            .map(|snapshot| snapshot.common_dir.clone())
+        else {
+            self.message = Some(Arc::from(
+                "repository changed; archive range was not modified",
+            ));
+            return Action::None;
+        };
         let mut mutation = ConfigMutation::default();
         for branch in range.branches() {
             self.config.set_archived_in_memory(branch, archived);
@@ -1552,9 +1596,12 @@ impl App {
         if mutation.is_empty() {
             return;
         }
-        self.config
-            .apply_mutation_in_memory(&mutation)
-            .expect("deletion cleanup only removes config identity");
+        if let Err(error) = self.config.apply_mutation_in_memory(&mutation) {
+            self.message = Some(Arc::from(format!(
+                "deleted branch configuration could not be cleaned: {error}"
+            )));
+            return;
+        }
         self.queued_config_write =
             Some(self.register_config_mutation(mutation, snapshot.common_dir.clone()));
     }
@@ -1599,9 +1646,12 @@ impl App {
         let common_dir = snapshot.common_dir.clone();
         let mut mutation = ConfigMutation::default();
         mutation.prune_archived(invalid);
-        self.config
-            .apply_mutation_in_memory(&mutation)
-            .expect("archive pruning is always valid");
+        if let Err(error) = self.config.apply_mutation_in_memory(&mutation) {
+            self.message = Some(Arc::from(format!(
+                "invalid archive entries could not be pruned: {error}"
+            )));
+            return;
+        }
         self.queued_config_write = Some(self.register_config_mutation(mutation, common_dir));
     }
 
@@ -1862,33 +1912,30 @@ impl App {
     fn reproject(&mut self) {
         if self.snapshot.is_some() && self.topology.is_some() {
             self.validate_scope();
+            let Some(topology) = self.topology.as_ref() else {
+                return;
+            };
             let scope = self.resolved_scope();
-            self.projection =
-                self.topology
-                    .as_ref()
-                    .expect("topology exists")
-                    .project(&ProjectionOptions {
-                        order: self.order_mode,
-                        scope,
-                        separators: self.separators,
-                        filter: self.filter.clone(),
-                        archive_mode: self.archive_mode,
-                        archived: self
-                            .config
-                            .archived
-                            .iter()
-                            .cloned()
-                            .map(BranchId::new)
-                            .collect(),
-                        stack_names: self
-                            .config
-                            .stack_names
-                            .iter()
-                            .map(|(stack, name)| {
-                                (BranchId::new(stack.clone()), Arc::from(name.as_str()))
-                            })
-                            .collect(),
-                    });
+            self.projection = topology.project(&ProjectionOptions {
+                order: self.order_mode,
+                scope,
+                separators: self.separators,
+                filter: self.filter.clone(),
+                archive_mode: self.archive_mode,
+                archived: self
+                    .config
+                    .archived
+                    .iter()
+                    .cloned()
+                    .map(BranchId::new)
+                    .collect(),
+                stack_names: self
+                    .config
+                    .stack_names
+                    .iter()
+                    .map(|(stack, name)| (BranchId::new(stack.clone()), Arc::from(name.as_str())))
+                    .collect(),
+            });
             if matches!(self.scope, ViewScope::Untrunked) {
                 self.restrict_projection_to_untrunked();
             }

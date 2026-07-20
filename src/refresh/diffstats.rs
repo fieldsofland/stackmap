@@ -96,34 +96,40 @@ pub(super) fn enrich(
     let workers = worker_limit.clamp(1, 4).min(tasks.len());
     let (send, receive) = mpsc::sync_channel(workers * 2);
     let mut handles = Vec::with_capacity(workers);
+    let mut spawn_error = None;
     for number in 0..workers {
         let tasks = tasks.clone();
         let cursor = cursor.clone();
         let send = send.clone();
         let git = git.clone();
         let latest_generation = latest_generation.clone();
-        handles.push(
-            thread::Builder::new()
-                .name(format!("stackmap-diff-{number}"))
-                .spawn(move || {
-                    loop {
-                        if is_obsolete(generation, &latest_generation) {
-                            break;
-                        }
-                        let index = cursor.fetch_add(1, Ordering::Relaxed);
-                        let Some(task) = tasks.get(index) else {
-                            break;
-                        };
-                        let value = git
-                            .diffstat(&task.key.0, &task.key.1)
-                            .map_err(|error| error.to_string());
-                        if send.send((task.clone(), value)).is_err() {
-                            break;
-                        }
+        match thread::Builder::new()
+            .name(format!("stackmap-diff-{number}"))
+            .spawn(move || {
+                loop {
+                    if is_obsolete(generation, &latest_generation) {
+                        break;
                     }
-                })
-                .expect("spawn bounded diff worker"),
-        );
+                    let index = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some(task) = tasks.get(index) else {
+                        break;
+                    };
+                    let value = git
+                        .diffstat(&task.key.0, &task.key.1)
+                        .map_err(|error| error.to_string());
+                    if send.send((task.clone(), value)).is_err() {
+                        break;
+                    }
+                }
+            }) {
+            Ok(handle) => handles.push(handle),
+            Err(error) => {
+                spawn_error = Some(Arc::<str>::from(format!(
+                    "could not start bounded diff worker: {error}"
+                )));
+                break;
+            }
+        }
     }
     drop(send);
     while let Ok((task, result)) = receive.recv() {
@@ -144,6 +150,12 @@ pub(super) fn enrich(
     }
     for handle in handles {
         let _ = handle.join();
+    }
+    let unavailable = spawn_error.unwrap_or_else(|| Arc::from("diff worker stopped unexpectedly"));
+    for branch in &mut branches {
+        if matches!(branch.diff, DiffState::Loading) {
+            branch.diff = DiffState::Unavailable(unavailable.clone());
+        }
     }
     if is_obsolete(generation, latest_generation) {
         return None;

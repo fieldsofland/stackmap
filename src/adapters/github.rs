@@ -61,6 +61,9 @@ impl From<CommandError> for GitHubError {
             CommandError::InputTooLarge(size) => {
                 Self::Io(Arc::from(format!("input exceeded limit ({size} bytes)")))
             }
+            CommandError::MissingPipe(pipe) => {
+                Self::Io(Arc::from(format!("gh {pipe} pipe was unavailable")))
+            }
         }
     }
 }

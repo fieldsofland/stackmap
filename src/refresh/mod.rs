@@ -113,9 +113,18 @@ impl RefreshHandle {
                                     },
                                 );
                                 let (state, wake) = &*diff_state;
-                                state.lock().expect("diff coordinator poisoned").latest =
-                                    Some(structural);
-                                wake.notify_one();
+                                match state.lock() {
+                                    Ok(mut state) => {
+                                        state.latest = Some(structural);
+                                        wake.notify_one();
+                                    }
+                                    Err(_) => push_event(
+                                        &events,
+                                        RefreshEvent::Failed(Arc::from(
+                                            "diff coordinator stopped after internal state failure",
+                                        )),
+                                    ),
+                                }
                             }
                             Err(error) => {
                                 push_event(
@@ -136,17 +145,42 @@ impl RefreshHandle {
                 let latest_generation = latest_generation.clone();
                 move || {
                     let mut cache = DiffCache::new(2048);
-                    loop {
+                    'worker: loop {
                         let snapshot = {
                             let (state, wake) = &*diff_state;
-                            let mut state = state.lock().expect("diff coordinator poisoned");
+                            let mut state = match state.lock() {
+                                Ok(state) => state,
+                                Err(_) => {
+                                    push_event(
+                                        &events,
+                                        RefreshEvent::Failed(Arc::from(
+                                            "diff coordinator stopped after internal state failure",
+                                        )),
+                                    );
+                                    break 'worker;
+                                }
+                            };
                             while state.latest.is_none() && !state.shutdown {
-                                state = wake.wait(state).expect("diff coordinator poisoned");
+                                state = match wake.wait(state) {
+                                    Ok(state) => state,
+                                    Err(_) => {
+                                        push_event(
+                                            &events,
+                                            RefreshEvent::Failed(Arc::from(
+                                                "diff coordinator stopped after internal state failure",
+                                            )),
+                                        );
+                                        break 'worker;
+                                    }
+                                };
                             }
                             if state.shutdown {
-                                break;
+                                break 'worker;
                             }
-                            state.latest.take().expect("latest snapshot available")
+                            let Some(snapshot) = state.latest.take() else {
+                                continue;
+                            };
+                            snapshot
                         };
                         if let Some(enriched) =
                             diffstats::enrich(snapshot, &adapter, &mut cache, 4, &latest_generation)
@@ -190,7 +224,9 @@ impl RefreshHandle {
 }
 
 fn push_event(events: &Mutex<VecDeque<RefreshEvent>>, event: RefreshEvent) {
-    let mut events = events.lock().expect("refresh event queue poisoned");
+    let Ok(mut events) = events.lock() else {
+        return;
+    };
     if events.len() == 8 {
         events.pop_front();
     }
@@ -201,7 +237,9 @@ impl Drop for RefreshHandle {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         let (state, wake) = &*self.diff_state;
-        state.lock().expect("diff coordinator poisoned").shutdown = true;
+        if let Ok(mut state) = state.lock() {
+            state.shutdown = true;
+        }
         wake.notify_all();
         let _ = self.requester.requests.try_send(Request::Shutdown);
         // A running bounded Git command may still be finishing. Dropping its

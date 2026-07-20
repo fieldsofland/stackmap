@@ -381,7 +381,7 @@ fn flush_config_persistence(
         final_retry_used = true;
         let start = queue
             .submit(retry)
-            .expect("an idle persistence queue starts its shutdown retry");
+            .context("configuration shutdown retry could not enter the idle queue")?;
         spawn_config_persistence(start, sender.clone())?;
     }
     let deadline = Instant::now() + CONFIG_SHUTDOWN_TIMEOUT;
