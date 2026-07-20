@@ -32,6 +32,7 @@
 - Release policy includes pinned macOS 15 ARM64/Intel CI, a stable-Rust compatibility lane, cargo-deny policy, Dependabot, fail-closed release aggregation, checksums, and artifact attestations.
 - Core responsibilities are split behind private modules: topology projection/index/emission, Git inventory/mutation, App state/overlays/archive/mutation, and tree details/connectors.
 - Recoverable production paths return typed or degraded outcomes. Remaining topology `expect` calls represent documented iterative-emission programmer invariants.
+- Render tests cover both ordinary color output and `NO_COLOR`; selected colored rows use the identity accent as their background with a black identity glyph. Deadline tests assert bounded work counts instead of scheduler-sensitive wall-clock thresholds.
 - The installed release binary is 3,713,072 bytes. In a synthetic 2,001-branch repository the preceding release measured about 15.4 MB RSS after startup, warmed to about 19.3 MB with Archive evidence, and plateaued at 19.856-19.888 MB after 100 refresh requests and repeated view/order/layout/navigation toggles.
 - Release benchmarks measured about 0.108 ms per 500-branch projection, 1.10 ms per 5,000-branch projection, and 0.94 ms per projection of one 5,000-branch deep stack. A 5,000-level/10,000-branch deep comb emits iteratively without call-stack recursion; broad attach-parent lookup is indexed.
 - `stackmap 0.0.0` is installed at `/Users/matt/.cargo/bin/stackmap` and resolves on `PATH`.
