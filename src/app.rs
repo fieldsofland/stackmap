@@ -1,15 +1,20 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::adapters::git::{DeleteOutcome, DeleteRequest};
 use crate::adapters::github::{GitHubError, PrMatch};
-use crate::config::Config;
+use crate::config::{ArchiveMutation, Config, ConfigMutation, MAX_STACK_NAME_CHARS};
 use crate::events::{Input, Key, KeyPhase};
 use crate::model::topology::{
-    Emphasis, OrderMode, ProjectionOptions, ProjectionScope, TopologyIndex, TopologyProjection,
+    ArchiveMode, Emphasis, OrderMode, ProjectionOptions, ProjectionScope, TopologyIndex,
+    TopologyProjection,
 };
 use crate::model::{Branch, BranchId, RepositorySnapshot};
+use crate::refresh::upstream::{
+    MAX_TARGETS, UpstreamBatch, UpstreamCommand, UpstreamRequest, UpstreamTarget,
+};
 
 pub const COLOR_OPTIONS: &[(&str, Option<&str>)] = &[
     ("Auto", None),
@@ -26,11 +31,14 @@ pub const COLOR_OPTIONS: &[(&str, Option<&str>)] = &[
 const AUTO_LANE_PITCH: u16 = 3;
 const MIN_LANE_PITCH: u16 = 2;
 const MAX_LANE_PITCH: u16 = 6;
+const DEFAULT_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_NOTICE_DURATION: Duration = Duration::from_secs(5);
 const ORDER_OPTIONS: &[OrderMode] = &[
     OrderMode::Recent,
     OrderMode::Alphabetical,
     OrderMode::Graphite,
 ];
+type UpstreamWorkingSet = (u64, Vec<(BranchId, Arc<str>)>);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
@@ -41,16 +49,18 @@ pub enum Action {
     Delete(DeleteRequest),
     OpenUrl(Arc<str>),
     CopyUrl(Arc<str>),
-    PersistColor(ColorWriteRequest),
+    PersistConfig(ConfigWriteRequest),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ColorWriteRequest {
+pub struct ConfigWriteRequest {
     pub sequence: u64,
     pub common_dir: PathBuf,
-    pub updates: BTreeMap<BranchId, Option<Arc<str>>>,
+    pub mutation: ConfigMutation,
     pub fallback: Config,
 }
+
+pub type ColorWriteRequest = ConfigWriteRequest;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum GitHubState {
@@ -81,10 +91,43 @@ struct AllViewState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchiveRange {
+    pub mode: ArchiveMode,
+    pub section: Option<BranchId>,
+    pub anchor: BranchId,
+    pub endpoint: BranchId,
+    eligible: Arc<[BranchId]>,
+    eligible_index: Arc<HashMap<BranchId, usize>>,
+    anchor_index: usize,
+    endpoint_index: usize,
+}
+
+impl ArchiveRange {
+    pub fn branches(&self) -> &[BranchId] {
+        &self.eligible[self.index_range()]
+    }
+
+    pub fn branch_count(&self) -> usize {
+        self.anchor_index.abs_diff(self.endpoint_index) + 1
+    }
+
+    fn contains(&self, branch: &BranchId) -> bool {
+        self.eligible_index
+            .get(branch)
+            .is_some_and(|index| self.index_range().contains(index))
+    }
+
+    fn index_range(&self) -> std::ops::RangeInclusive<usize> {
+        self.anchor_index.min(self.endpoint_index)..=self.anchor_index.max(self.endpoint_index)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeleteConfirmation {
     pub repository_id: Arc<str>,
     pub request: DeleteRequest,
     pub pr_number: Option<u64>,
+    pub selection_after: Option<BranchId>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -95,9 +138,36 @@ pub enum MutationState {
     ConfirmingDeletion(DeleteConfirmation),
     Deleting(DeleteConfirmation),
     Reconciling {
+        operation: ReconciliationOperation,
         request_epoch: u64,
+        deadline: Instant,
     },
     DeletionBlocked(Arc<str>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReconciliationOperation {
+    Checkout {
+        target: BranchId,
+        command_error: Option<Arc<str>>,
+    },
+    Deletion {
+        request: DeleteRequest,
+        result: DeletionResult,
+        selection_after: Option<BranchId>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeletionResult {
+    Outcome(DeleteOutcome),
+    Error(Arc<str>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TransientNotice {
+    text: Arc<str>,
+    expires_at: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -135,6 +205,12 @@ pub struct ColorPicker {
     pub choice_index: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StackNameEditor {
+    pub target: BranchId,
+    pub draft: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum Overlay {
     #[default]
@@ -143,6 +219,8 @@ pub enum Overlay {
     Help,
     OrderPicker(OrderPicker),
     ColorPicker(ColorPicker),
+    StackNameEditor(StackNameEditor),
+    ArchiveRange(ArchiveRange),
 }
 
 pub struct App {
@@ -165,14 +243,26 @@ pub struct App {
     pub lane_pitch: LanePitch,
     pub scope: ViewScope,
     pub separators: bool,
+    pub archive_mode: ArchiveMode,
     restore_selection: Option<BranchId>,
     all_view_state: Option<AllViewState>,
     restore_all_after_reproject: bool,
     focus_needs_bottom_alignment: bool,
     startup_current_pending: bool,
-    next_color_sequence: u64,
-    latest_color_sequence: u64,
+    next_config_sequence: u64,
+    latest_config_sequence: u64,
     pending_colors: HashMap<BranchId, (u64, Option<Arc<str>>)>,
+    pending_archives: HashMap<BranchId, (u64, ArchiveMutation)>,
+    pending_stack_names: HashMap<BranchId, (u64, Option<Arc<str>>)>,
+    queued_config_write: Option<ConfigWriteRequest>,
+    active_view_state: Option<AllViewState>,
+    notice: Option<TransientNotice>,
+    reconciliation_timeout: Duration,
+    notice_duration: Duration,
+    upstream_request_pending: bool,
+    upstream_cancel_pending: bool,
+    last_upstream_working_set: Option<UpstreamWorkingSet>,
+    accepted_upstream_token: Option<(u64, u64)>,
 }
 
 impl Default for App {
@@ -197,21 +287,44 @@ impl Default for App {
             lane_pitch: LanePitch::Auto,
             scope: ViewScope::All,
             separators: true,
+            archive_mode: ArchiveMode::Active,
             restore_selection: None,
             all_view_state: None,
             restore_all_after_reproject: false,
             focus_needs_bottom_alignment: false,
             startup_current_pending: false,
-            next_color_sequence: 0,
-            latest_color_sequence: 0,
+            next_config_sequence: 0,
+            latest_config_sequence: 0,
             pending_colors: HashMap::new(),
+            pending_archives: HashMap::new(),
+            pending_stack_names: HashMap::new(),
+            queued_config_write: None,
+            active_view_state: None,
+            notice: None,
+            reconciliation_timeout: DEFAULT_RECONCILIATION_TIMEOUT,
+            notice_duration: DEFAULT_NOTICE_DURATION,
+            upstream_request_pending: false,
+            upstream_cancel_pending: false,
+            last_upstream_working_set: None,
+            accepted_upstream_token: None,
         }
     }
 }
 
 impl App {
+    pub fn with_mutation_timing(
+        reconciliation_timeout: Duration,
+        notice_duration: Duration,
+    ) -> Self {
+        Self {
+            reconciliation_timeout,
+            notice_duration,
+            ..Self::default()
+        }
+    }
+
     pub fn apply_snapshot(&mut self, snapshot: Arc<RepositorySnapshot>) {
-        self.apply_snapshot_kind(snapshot, true, None);
+        self.apply_snapshot_kind(snapshot, true, None, Instant::now());
     }
 
     pub fn apply_structural_snapshot(
@@ -219,11 +332,20 @@ impl App {
         snapshot: Arc<RepositorySnapshot>,
         request_epoch: u64,
     ) {
-        self.apply_snapshot_kind(snapshot, true, Some(request_epoch));
+        self.apply_structural_snapshot_at(snapshot, request_epoch, Instant::now());
+    }
+
+    pub fn apply_structural_snapshot_at(
+        &mut self,
+        snapshot: Arc<RepositorySnapshot>,
+        request_epoch: u64,
+        now: Instant,
+    ) {
+        self.apply_snapshot_kind(snapshot, true, Some(request_epoch), now);
     }
 
     pub fn apply_enriched_snapshot(&mut self, snapshot: Arc<RepositorySnapshot>) {
-        self.apply_snapshot_kind(snapshot, false, None);
+        self.apply_snapshot_kind(snapshot, false, None, Instant::now());
     }
 
     fn apply_snapshot_kind(
@@ -231,6 +353,7 @@ impl App {
         mut snapshot: Arc<RepositorySnapshot>,
         structural: bool,
         structural_epoch: Option<u64>,
+        now: Instant,
     ) {
         if self
             .snapshot
@@ -261,6 +384,26 @@ impl App {
                     }
                 }
             }
+            if !structural && current.generation == snapshot.generation {
+                let current_evidence: HashMap<_, _> = current
+                    .branches
+                    .iter()
+                    .map(|branch| {
+                        (
+                            (branch.id.clone(), branch.oid.clone()),
+                            branch.remote_ref.clone(),
+                        )
+                    })
+                    .collect();
+                let snapshot = Arc::make_mut(&mut snapshot);
+                for branch in Arc::make_mut(&mut snapshot.branches) {
+                    if let Some(evidence) =
+                        current_evidence.get(&(branch.id.clone(), branch.oid.clone()))
+                    {
+                        branch.remote_ref = evidence.clone();
+                    }
+                }
+            }
         }
         if structural {
             match Config::load(&snapshot.common_dir) {
@@ -269,6 +412,19 @@ impl App {
                         config
                             .set_color_in_memory(root, color.as_deref())
                             .expect("pending colors were already validated");
+                    }
+                    for (branch, (_, archived)) in &self.pending_archives {
+                        match archived {
+                            ArchiveMutation::Set(value) => {
+                                config.set_archived_in_memory(branch, *value)
+                            }
+                            ArchiveMutation::Prune => config.set_archived_in_memory(branch, false),
+                        }
+                    }
+                    for (stack, (_, name)) in &self.pending_stack_names {
+                        config
+                            .set_stack_name_in_memory(stack, name.as_deref())
+                            .expect("pending stack names were already validated");
                     }
                     self.config = config;
                 }
@@ -283,20 +439,52 @@ impl App {
         if projection_changed {
             self.topology = Some(TopologyIndex::build(&snapshot));
         }
+        let protected_deletion_target = structural
+            .then(|| self.deletion_target_in_flight())
+            .flatten();
+        let mut deletion_selection_after = None;
         if structural {
-            match &self.mutation {
+            if matches!(self.overlay, Overlay::ArchiveRange(_)) {
+                self.overlay = Overlay::None;
+                self.message = Some(Arc::from(
+                    "repository changed; archive range preview cancelled",
+                ));
+            }
+            match self.mutation.clone() {
                 MutationState::ConfirmingDeletion(confirmation)
-                    if !confirmation_is_valid(&snapshot, confirmation) =>
+                    if !confirmation_is_valid(&snapshot, &confirmation) =>
                 {
                     self.mutation = MutationState::Idle;
                     self.message = Some(Arc::from(
                         "repository changed; deletion confirmation cancelled",
                     ));
                 }
-                MutationState::Reconciling { request_epoch }
-                    if structural_epoch.is_some_and(|epoch| epoch >= *request_epoch) =>
-                {
+                MutationState::Reconciling {
+                    operation,
+                    request_epoch,
+                    ..
+                } if structural_epoch.is_some_and(|epoch| epoch >= request_epoch) => {
+                    let notice = reconciliation_notice(&snapshot, &operation);
+                    if let ReconciliationOperation::Deletion {
+                        request,
+                        result: DeletionResult::Outcome(DeleteOutcome::Deleted),
+                        selection_after,
+                    } = &operation
+                        && snapshot.branch(&request.branch).is_none()
+                    {
+                        let selection_needs_recovery = self.selected.as_ref()
+                            == Some(&request.branch)
+                            || self
+                                .selected
+                                .as_ref()
+                                .is_none_or(|selected| snapshot.branch(selected).is_none());
+                        self.cleanup_deleted_config_identity(&snapshot, &request.branch);
+                        if selection_needs_recovery {
+                            deletion_selection_after = Some(selection_after.clone());
+                        }
+                    }
                     self.mutation = MutationState::Idle;
+                    self.set_notice(notice, now);
                 }
                 _ => {}
             }
@@ -305,9 +493,17 @@ impl App {
         self.loading = false;
         if structural {
             self.refresh_error = None;
+            self.accepted_upstream_token = None;
+        }
+        if structural {
+            self.prune_invalid_archives(protected_deletion_target.as_ref());
         }
         if projection_changed {
             self.reproject();
+        }
+        if let Some(selection_after) = deletion_selection_after {
+            self.selected = selection_after
+                .filter(|branch| self.projection.branch_to_selectable.contains_key(branch));
         }
         self.reconcile_selection();
         self.revalidate_overlay();
@@ -315,6 +511,121 @@ impl App {
             self.startup_current_pending = false;
             self.apply_current_startup();
         }
+        if structural && matches!(self.archive_mode, ArchiveMode::Archive) {
+            self.upstream_request_pending = true;
+        }
+    }
+
+    pub fn apply_upstream_batch(&mut self, batch: UpstreamBatch) {
+        if !matches!(self.archive_mode, ArchiveMode::Archive) {
+            return;
+        }
+        let Some(snapshot) = self.snapshot.as_mut() else {
+            return;
+        };
+        if snapshot.generation != batch.generation {
+            return;
+        }
+        let snapshot = Arc::make_mut(snapshot);
+        let branches = Arc::make_mut(&mut snapshot.branches);
+        let applicable: Vec<_> = batch
+            .results
+            .iter()
+            .filter_map(|result| {
+                let index = snapshot.branch_index.get(&result.branch).copied()?;
+                (branches.get(index)?.oid == result.oid).then_some((index, result))
+            })
+            .collect();
+        if applicable.is_empty() {
+            return;
+        }
+        if let Some(token) = batch.remote_ref_token
+            && self.accepted_upstream_token != Some((batch.generation, token))
+        {
+            for branch in branches.iter_mut() {
+                branch.remote_ref = crate::model::RemoteRefEvidence::NotRequested;
+            }
+            self.accepted_upstream_token = Some((batch.generation, token));
+        }
+        for (index, result) in applicable {
+            branches[index].remote_ref = result.evidence.clone();
+        }
+    }
+
+    pub fn take_upstream_command(&mut self) -> Option<UpstreamCommand> {
+        if self.upstream_cancel_pending {
+            self.upstream_cancel_pending = false;
+            self.upstream_request_pending = false;
+            return Some(UpstreamCommand::Cancel);
+        }
+        if !self.upstream_request_pending || !matches!(self.archive_mode, ArchiveMode::Archive) {
+            return None;
+        }
+        self.upstream_request_pending = false;
+        let snapshot = self.snapshot.as_ref()?;
+        let start = self.scroll.saturating_sub(4);
+        let end = self
+            .scroll
+            .saturating_add(self.viewport_height)
+            .saturating_add(8)
+            .min(self.projection.entries.len());
+        let mut seen = HashSet::new();
+        let mut targets = Vec::new();
+        for entry in &self.projection.entries[start..end] {
+            let crate::model::topology::ProjectionEntry::Branch(row) = entry else {
+                continue;
+            };
+            if !seen.insert(row.branch.clone()) {
+                continue;
+            }
+            let Some(index) = snapshot.branch_index.get(&row.branch).copied() else {
+                continue;
+            };
+            let Some(branch) = snapshot.branches.get(index) else {
+                continue;
+            };
+            if !self.config.is_archived(&branch.id) {
+                continue;
+            }
+            targets.push(UpstreamTarget {
+                branch: branch.id.clone(),
+                oid: branch.oid.clone(),
+            });
+            if targets.len() == MAX_TARGETS {
+                break;
+            }
+        }
+        let working_set = (
+            snapshot.generation,
+            targets
+                .iter()
+                .map(|target| (target.branch.clone(), target.oid.clone()))
+                .collect(),
+        );
+        if self.last_upstream_working_set.as_ref() == Some(&working_set) {
+            return None;
+        }
+        self.last_upstream_working_set = Some(working_set);
+        if targets.is_empty() {
+            return None;
+        }
+        let snapshot = Arc::make_mut(self.snapshot.as_mut()?);
+        for target in &targets {
+            if let Some(index) = snapshot.branch_index.get(&target.branch).copied()
+                && let Some(branch) = Arc::make_mut(&mut snapshot.branches).get_mut(index)
+                && matches!(
+                    branch.remote_ref,
+                    crate::model::RemoteRefEvidence::NotRequested
+                        | crate::model::RemoteRefEvidence::Unavailable { .. }
+                )
+            {
+                branch.remote_ref = crate::model::RemoteRefEvidence::Checking;
+            }
+        }
+        Some(UpstreamCommand::Request(UpstreamRequest {
+            generation: snapshot.generation,
+            targets: Arc::from(targets),
+        }))
     }
 
     pub fn mark_stale(&mut self, error: Arc<str>) {
@@ -354,6 +665,7 @@ impl App {
     }
 
     pub fn set_viewport_height(&mut self, height: usize) {
+        let previous = self.viewport_height;
         self.viewport_height = if self.is_focused() && height >= 2 {
             height - 1
         } else {
@@ -364,6 +676,9 @@ impl App {
             self.focus_needs_bottom_alignment = false;
         } else {
             self.keep_selected_visible();
+        }
+        if previous != self.viewport_height && matches!(self.archive_mode, ArchiveMode::Archive) {
+            self.upstream_request_pending = true;
         }
     }
 
@@ -425,7 +740,7 @@ impl App {
         if input.phase == KeyPhase::Repeat
             && matches!(
                 &self.overlay,
-                Overlay::OrderPicker(_) | Overlay::ColorPicker(_)
+                Overlay::OrderPicker(_) | Overlay::ColorPicker(_) | Overlay::StackNameEditor(_)
             )
         {
             return Action::None;
@@ -450,6 +765,8 @@ impl App {
             }
             Overlay::OrderPicker(_) => return self.handle_order_picker_key(key),
             Overlay::ColorPicker(_) => return self.handle_color_picker_key(key),
+            Overlay::StackNameEditor(_) => return self.handle_stack_name_editor_key(key),
+            Overlay::ArchiveRange(_) => return self.handle_archive_range_key(key),
             Overlay::None => {}
         }
         self.handle_normal_key(key)
@@ -541,7 +858,16 @@ impl App {
                 self.reproject();
                 Action::None
             }
-            Key::Character('x') => {
+            Key::Character('a') => {
+                self.toggle_archive_mode();
+                Action::None
+            }
+            Key::Character('v') => {
+                self.begin_archive_range();
+                Action::None
+            }
+            Key::Character('x') => self.toggle_selected_archive(),
+            Key::Character('X') => {
                 self.begin_delete_confirmation();
                 Action::None
             }
@@ -552,6 +878,10 @@ impl App {
             Key::Character('c') => self.cycle_color(),
             Key::Character('C') => {
                 self.open_color_picker();
+                Action::None
+            }
+            Key::Character('n') => {
+                self.open_stack_name_editor();
                 Action::None
             }
             Key::Character('o') => self
@@ -575,6 +905,7 @@ impl App {
             }
             Key::Escape => {
                 self.message = None;
+                self.notice = None;
                 Action::None
             }
             _ => Action::None,
@@ -621,20 +952,9 @@ impl App {
             Some(color) => format!("stack color set to {color}; saving"),
             None => "stack color reset to automatic; saving".to_owned(),
         }));
-        self.next_color_sequence = self.next_color_sequence.wrapping_add(1).max(1);
-        self.latest_color_sequence = self.next_color_sequence;
-        self.pending_colors
-            .insert(root.clone(), (self.next_color_sequence, value));
-        Action::PersistColor(ColorWriteRequest {
-            sequence: self.next_color_sequence,
-            common_dir,
-            updates: self
-                .pending_colors
-                .iter()
-                .map(|(root, (_, color))| (root.clone(), color.clone()))
-                .collect(),
-            fallback: self.config.clone(),
-        })
+        let mut mutation = ConfigMutation::default();
+        mutation.set_color(root, value);
+        Action::PersistConfig(self.register_config_mutation(mutation, common_dir))
     }
 
     fn adjust_lane_pitch(&mut self, delta: i16) {
@@ -720,7 +1040,7 @@ impl App {
                 Action::None
             }
             Key::Enter => {
-                if !self.color_picker_target_is_valid(&picker.target) {
+                if !self.stack_target_is_valid(&picker.target) {
                     self.close_invalid_color_picker(&picker);
                     return Action::None;
                 }
@@ -744,20 +1064,105 @@ impl App {
         }
     }
 
-    fn revalidate_overlay(&mut self) {
-        let Overlay::ColorPicker(picker) = self.overlay.clone() else {
+    fn open_stack_name_editor(&mut self) {
+        let Some(selected) = self.selected.as_ref() else {
             return;
         };
-        if self.color_picker_target_is_valid(&picker.target) {
-            self.config
-                .set_color_in_memory(&picker.target, picker.pending.as_deref())
-                .expect("picker colors are valid");
-        } else {
-            self.close_invalid_color_picker(&picker);
+        let Some(row) = self.projection.row_for(selected) else {
+            return;
+        };
+        if row.is_trunk {
+            self.message = Some(Arc::from("trunk rows cannot be named as stacks"));
+            return;
+        }
+        let target = row.stack_id.clone();
+        let draft = self
+            .config
+            .stack_name(&target)
+            .unwrap_or_default()
+            .to_owned();
+        self.overlay = Overlay::StackNameEditor(StackNameEditor { target, draft });
+    }
+
+    fn handle_stack_name_editor_key(&mut self, key: Key) -> Action {
+        let Overlay::StackNameEditor(mut editor) = self.overlay.clone() else {
+            return Action::None;
+        };
+        match key {
+            Key::Escape => {
+                self.overlay = Overlay::None;
+                Action::None
+            }
+            Key::Backspace => {
+                editor.draft.pop();
+                self.overlay = Overlay::StackNameEditor(editor);
+                Action::None
+            }
+            Key::Character(character)
+                if !character.is_control()
+                    && editor.draft.chars().count() < MAX_STACK_NAME_CHARS =>
+            {
+                editor.draft.push(character);
+                self.overlay = Overlay::StackNameEditor(editor);
+                Action::None
+            }
+            Key::Enter => {
+                if !self.stack_target_is_valid(&editor.target) {
+                    self.close_invalid_stack_name_editor();
+                    return Action::None;
+                }
+                let value = match editor.draft.trim() {
+                    "" => None,
+                    value => Some(Arc::<str>::from(value)),
+                };
+                let common_dir = self
+                    .snapshot
+                    .as_ref()
+                    .expect("a valid name target has a snapshot")
+                    .common_dir
+                    .clone();
+                self.config
+                    .set_stack_name_in_memory(&editor.target, value.as_deref())
+                    .expect("editor stack names are validated while typing");
+                let mut mutation = ConfigMutation::default();
+                mutation.set_stack_name(editor.target.clone(), value.clone());
+                self.overlay = Overlay::None;
+                self.message = Some(Arc::from(match value {
+                    Some(name) => format!("stack named {name}; saving"),
+                    None => "stack name cleared; saving".to_owned(),
+                }));
+                self.reproject();
+                Action::PersistConfig(self.register_config_mutation(mutation, common_dir))
+            }
+            _ => Action::None,
         }
     }
 
-    fn color_picker_target_is_valid(&self, target: &BranchId) -> bool {
+    fn revalidate_overlay(&mut self) {
+        match self.overlay.clone() {
+            Overlay::ColorPicker(picker) => {
+                if self.stack_target_is_valid(&picker.target) {
+                    self.config
+                        .set_color_in_memory(&picker.target, picker.pending.as_deref())
+                        .expect("picker colors are valid");
+                } else {
+                    self.close_invalid_color_picker(&picker);
+                }
+            }
+            Overlay::StackNameEditor(editor) => {
+                if !self.stack_target_is_valid(&editor.target) {
+                    self.close_invalid_stack_name_editor();
+                }
+            }
+            Overlay::None
+            | Overlay::Search
+            | Overlay::Help
+            | Overlay::OrderPicker(_)
+            | Overlay::ArchiveRange(_) => {}
+        }
+    }
+
+    fn stack_target_is_valid(&self, target: &BranchId) -> bool {
         self.snapshot
             .as_ref()
             .is_some_and(|snapshot| snapshot.branch(target).is_some())
@@ -776,34 +1181,446 @@ impl App {
         ));
     }
 
-    pub fn finish_color_persistence(&mut self, sequence: u64, result: anyhow::Result<()>) {
+    fn close_invalid_stack_name_editor(&mut self) {
+        self.overlay = Overlay::None;
+        self.message = Some(Arc::from(
+            "name editor closed because its stack is no longer available",
+        ));
+    }
+
+    pub fn finish_config_persistence(&mut self, sequence: u64, result: anyhow::Result<()>) {
         if result.is_ok() {
             self.pending_colors
                 .retain(|_, (pending_sequence, _)| *pending_sequence > sequence);
+            self.pending_archives
+                .retain(|_, (pending_sequence, _)| *pending_sequence > sequence);
+            self.pending_stack_names
+                .retain(|_, (pending_sequence, _)| *pending_sequence > sequence);
         }
-        if sequence != self.latest_color_sequence {
+        if sequence != self.latest_config_sequence {
             return;
         }
         self.message = Some(Arc::from(match result {
-            Ok(()) => "stack color saved".to_owned(),
-            Err(error) => format!("color save failed; in-memory choice retained: {error}"),
+            Ok(()) => "configuration saved".to_owned(),
+            Err(error) => format!("config save failed; in-memory choice retained: {error}"),
         }));
     }
 
-    pub fn prepare_pending_color_persistence(
+    pub fn prepare_pending_config_persistence(
         &self,
-        mut request: ColorWriteRequest,
-    ) -> Option<ColorWriteRequest> {
-        request.updates = self
-            .pending_colors
-            .iter()
-            .map(|(root, (_, color))| (root.clone(), color.clone()))
-            .collect();
-        if request.updates.is_empty() {
+        mut request: ConfigWriteRequest,
+    ) -> Option<ConfigWriteRequest> {
+        request.mutation = self.pending_config_mutation();
+        if request.mutation.is_empty() {
             return None;
         }
         request.fallback = self.config.clone();
         Some(request)
+    }
+
+    pub fn finish_color_persistence(&mut self, sequence: u64, result: anyhow::Result<()>) {
+        self.finish_config_persistence(sequence, result);
+    }
+
+    pub fn prepare_pending_color_persistence(
+        &self,
+        request: ConfigWriteRequest,
+    ) -> Option<ConfigWriteRequest> {
+        self.prepare_pending_config_persistence(request)
+    }
+
+    pub fn take_config_write_request(&mut self) -> Option<ConfigWriteRequest> {
+        self.queued_config_write.take()
+    }
+
+    fn register_config_mutation(
+        &mut self,
+        mutation: ConfigMutation,
+        common_dir: PathBuf,
+    ) -> ConfigWriteRequest {
+        self.next_config_sequence = self.next_config_sequence.wrapping_add(1).max(1);
+        let sequence = self.next_config_sequence;
+        self.latest_config_sequence = sequence;
+        for (branch, color) in mutation.color_updates {
+            self.pending_colors.insert(branch, (sequence, color));
+        }
+        for (branch, update) in mutation.archive_updates {
+            self.pending_archives.insert(branch, (sequence, update));
+        }
+        for (stack, name) in mutation.stack_name_updates {
+            self.pending_stack_names.insert(stack, (sequence, name));
+        }
+        ConfigWriteRequest {
+            sequence,
+            common_dir,
+            mutation: self.pending_config_mutation(),
+            fallback: self.config.clone(),
+        }
+    }
+
+    fn pending_config_mutation(&self) -> ConfigMutation {
+        ConfigMutation {
+            color_updates: self
+                .pending_colors
+                .iter()
+                .map(|(branch, (_, color))| (branch.clone(), color.clone()))
+                .collect(),
+            archive_updates: self
+                .pending_archives
+                .iter()
+                .map(|(branch, (_, update))| (branch.clone(), *update))
+                .collect(),
+            stack_name_updates: self
+                .pending_stack_names
+                .iter()
+                .map(|(stack, (_, name))| (stack.clone(), name.clone()))
+                .collect(),
+        }
+    }
+
+    fn toggle_archive_mode(&mut self) {
+        self.overlay = Overlay::None;
+        match self.archive_mode {
+            ArchiveMode::Active => {
+                self.active_view_state = Some(AllViewState {
+                    selected: self.selected.clone(),
+                    scroll: self.scroll,
+                });
+                self.archive_mode = ArchiveMode::Archive;
+                self.selected = None;
+                self.scroll = 0;
+                self.reproject();
+                self.upstream_request_pending = true;
+                self.upstream_cancel_pending = false;
+                self.last_upstream_working_set = None;
+            }
+            ArchiveMode::Archive => {
+                self.archive_mode = ArchiveMode::Active;
+                self.upstream_cancel_pending = true;
+                self.last_upstream_working_set = None;
+                self.reproject();
+                if let Some(state) = self.active_view_state.take() {
+                    self.selected = state
+                        .selected
+                        .filter(|branch| self.projection.branch_to_visual.contains_key(branch))
+                        .or_else(|| self.projection.selectable.first().cloned());
+                    self.scroll = state.scroll.min(
+                        self.projection
+                            .entries
+                            .len()
+                            .saturating_sub(self.viewport_height),
+                    );
+                    self.keep_selected_visible();
+                }
+            }
+        }
+    }
+
+    fn toggle_selected_archive(&mut self) -> Action {
+        let Some(branch_id) = self.selected.clone() else {
+            return Action::None;
+        };
+        if let Some(reason) = self.archive_refusal(&branch_id) {
+            self.message = Some(Arc::from(reason));
+            return Action::None;
+        }
+        let archived = matches!(self.archive_mode, ArchiveMode::Active);
+        let selected_index = self
+            .projection
+            .branch_to_selectable
+            .get(&branch_id)
+            .copied()
+            .unwrap_or(0);
+        let selection_after = selected_index
+            .checked_sub(1)
+            .and_then(|index| self.projection.selectable.get(index))
+            .or_else(|| self.projection.selectable.get(selected_index + 1))
+            .cloned();
+        let common_dir = self
+            .snapshot
+            .as_ref()
+            .expect("an archive candidate has a snapshot")
+            .common_dir
+            .clone();
+        self.config.set_archived_in_memory(&branch_id, archived);
+        let mut mutation = ConfigMutation::default();
+        mutation.set_archived(branch_id.clone(), archived);
+        self.message = Some(Arc::from(if archived {
+            format!("archived {branch_id} locally; saving")
+        } else {
+            format!("restored {branch_id}; saving")
+        }));
+        self.selected = selection_after;
+        self.reproject();
+        if matches!(self.archive_mode, ArchiveMode::Archive) {
+            self.upstream_request_pending = true;
+        }
+        Action::PersistConfig(self.register_config_mutation(mutation, common_dir))
+    }
+
+    fn archive_refusal(&self, branch: &BranchId) -> Option<String> {
+        let snapshot = self.snapshot.as_ref()?;
+        let branch_state = snapshot.branch(branch)?;
+        if branch_state.current {
+            return Some(format!(
+                "{} is current and cannot be archived",
+                branch_state.id
+            ));
+        }
+        if self
+            .topology
+            .as_ref()
+            .is_some_and(|topology| topology.is_trunk(branch))
+        {
+            return Some(format!("{branch} is a trunk and cannot be archived"));
+        }
+        None
+    }
+
+    fn begin_archive_range(&mut self) {
+        let Some(anchor) = self.selected.clone() else {
+            return;
+        };
+        if let Some(reason) = self.archive_refusal(&anchor) {
+            self.message = Some(Arc::from(reason));
+            return;
+        }
+        let Some(section) = self.section_for_branch(&anchor) else {
+            self.message = Some(Arc::from("selected branch is outside a visible section"));
+            return;
+        };
+        let eligible: Arc<[BranchId]> = self.archive_eligible_in_section(section.as_ref()).into();
+        let eligible_index: HashMap<_, _> = eligible
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, branch)| (branch, index))
+            .collect();
+        let Some(&anchor_index) = eligible_index.get(&anchor) else {
+            self.message = Some(Arc::from("selected branch cannot start an archive range"));
+            return;
+        };
+        self.overlay = Overlay::ArchiveRange(ArchiveRange {
+            mode: self.archive_mode,
+            section,
+            endpoint: anchor.clone(),
+            anchor,
+            eligible,
+            eligible_index: Arc::new(eligible_index),
+            anchor_index,
+            endpoint_index: anchor_index,
+        });
+    }
+
+    fn handle_archive_range_key(&mut self, key: Key) -> Action {
+        let Overlay::ArchiveRange(mut range) = self.overlay.clone() else {
+            return Action::None;
+        };
+        match key {
+            Key::Escape => {
+                self.overlay = Overlay::None;
+                Action::None
+            }
+            Key::Up | Key::StackUp | Key::Character('k') | Key::Character('K') => {
+                self.move_archive_range(&mut range, -1);
+                self.overlay = Overlay::ArchiveRange(range);
+                Action::None
+            }
+            Key::Down | Key::StackDown | Key::Character('j') | Key::Character('J') => {
+                self.move_archive_range(&mut range, 1);
+                self.overlay = Overlay::ArchiveRange(range);
+                Action::None
+            }
+            Key::Enter => self.commit_archive_range(range),
+            _ => Action::None,
+        }
+    }
+
+    fn move_archive_range(&mut self, range: &mut ArchiveRange, delta: isize) {
+        let next = range.endpoint_index.saturating_add_signed(delta);
+        if next >= range.eligible.len() || next == range.endpoint_index {
+            self.message = Some(Arc::from("archive range reached the section boundary"));
+            return;
+        }
+        range.endpoint_index = next;
+        range.endpoint = range.eligible[next].clone();
+    }
+
+    fn commit_archive_range(&mut self, range: ArchiveRange) -> Action {
+        self.overlay = Overlay::None;
+        if range.mode != self.archive_mode {
+            self.message = Some(Arc::from("archive range changed; nothing was modified"));
+            return Action::None;
+        }
+        let eligible = self.archive_eligible_in_section(range.section.as_ref());
+        let expected = archive_range_slice(&eligible, &range.anchor, &range.endpoint);
+        if expected != Some(range.branches()) {
+            self.message = Some(Arc::from(
+                "repository changed; archive range was not modified",
+            ));
+            return Action::None;
+        }
+        let archived = matches!(self.archive_mode, ArchiveMode::Active);
+        let common_dir = self
+            .snapshot
+            .as_ref()
+            .expect("a valid range has a snapshot")
+            .common_dir
+            .clone();
+        let mut mutation = ConfigMutation::default();
+        for branch in range.branches() {
+            self.config.set_archived_in_memory(branch, archived);
+            mutation.set_archived(branch.clone(), archived);
+        }
+        self.message = Some(Arc::from(format!(
+            "{} {} branches; saving",
+            if archived { "archived" } else { "restored" },
+            range.branch_count()
+        )));
+        self.reproject();
+        if matches!(self.archive_mode, ArchiveMode::Archive) {
+            self.upstream_request_pending = true;
+        }
+        Action::PersistConfig(self.register_config_mutation(mutation, common_dir))
+    }
+
+    fn archive_eligible_in_section(&self, section: Option<&BranchId>) -> Vec<BranchId> {
+        let Some(range) = self
+            .projection
+            .section_ranges
+            .iter()
+            .find(|range| range.section.as_ref() == section)
+        else {
+            return Vec::new();
+        };
+        let start = self
+            .projection
+            .selectable_visual_rows
+            .partition_point(|visual| *visual < range.start);
+        let end = self
+            .projection
+            .selectable_visual_rows
+            .partition_point(|visual| *visual <= range.end);
+        self.projection.selectable[start..end]
+            .iter()
+            .filter(|branch| self.archive_refusal(branch).is_none())
+            .cloned()
+            .collect()
+    }
+
+    fn section_for_branch(&self, branch: &BranchId) -> Option<Option<BranchId>> {
+        let visual = *self.projection.branch_to_visual.get(branch)?;
+        self.projection
+            .section_ranges
+            .iter()
+            .find(|range| visual >= range.start && visual <= range.end)
+            .map(|range| range.section.clone())
+    }
+
+    pub fn archive_range_contains(&self, branch: &BranchId) -> bool {
+        matches!(&self.overlay, Overlay::ArchiveRange(range) if range.contains(branch))
+    }
+
+    fn deletion_target_in_flight(&self) -> Option<BranchId> {
+        match &self.mutation {
+            MutationState::ConfirmingDeletion(confirmation)
+            | MutationState::Deleting(confirmation) => Some(confirmation.request.branch.clone()),
+            MutationState::Reconciling {
+                operation: ReconciliationOperation::Deletion { request, .. },
+                ..
+            } => Some(request.branch.clone()),
+            MutationState::Idle
+            | MutationState::CheckingOut(_)
+            | MutationState::Reconciling { .. }
+            | MutationState::DeletionBlocked(_) => None,
+        }
+    }
+
+    fn cleanup_deleted_config_identity(
+        &mut self,
+        snapshot: &RepositorySnapshot,
+        target: &BranchId,
+    ) {
+        let mut mutation = ConfigMutation::default();
+        if self.config.is_archived(target) {
+            mutation.prune_archived([target.clone()]);
+        }
+        if self.config.color(target).is_some() {
+            mutation.set_color(target.clone(), None);
+        }
+        if self.config.stack_name(target).is_some() {
+            mutation.set_stack_name(target.clone(), None);
+        }
+        if mutation.is_empty() {
+            return;
+        }
+        self.config
+            .apply_mutation_in_memory(&mutation)
+            .expect("deletion cleanup only removes config identity");
+        self.queued_config_write =
+            Some(self.register_config_mutation(mutation, snapshot.common_dir.clone()));
+    }
+
+    fn prune_invalid_archives(&mut self, protected: Option<&BranchId>) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        let local: HashSet<&str> = snapshot
+            .branches
+            .iter()
+            .map(|branch| branch.id.0.as_ref())
+            .collect();
+        let protected_rows: HashSet<&str> = snapshot
+            .branches
+            .iter()
+            .filter(|branch| branch.current)
+            .map(|branch| branch.id.0.as_ref())
+            .chain(
+                snapshot
+                    .configured_trunks
+                    .iter()
+                    .map(|trunk| trunk.0.as_ref()),
+            )
+            .collect();
+        let invalid = self
+            .config
+            .archived
+            .iter()
+            .filter(|branch| {
+                protected_rows.contains(branch.as_str())
+                    || (!local.contains(branch.as_str())
+                        && protected
+                            .is_none_or(|protected| branch.as_str() != protected.0.as_ref()))
+            })
+            .cloned()
+            .map(BranchId::new)
+            .collect::<Vec<_>>();
+        if invalid.is_empty() {
+            return;
+        }
+        let common_dir = snapshot.common_dir.clone();
+        let mut mutation = ConfigMutation::default();
+        mutation.prune_archived(invalid);
+        self.config
+            .apply_mutation_in_memory(&mutation)
+            .expect("archive pruning is always valid");
+        self.queued_config_write = Some(self.register_config_mutation(mutation, common_dir));
+    }
+
+    fn nearby_selection_after(&self, target: &BranchId) -> Option<BranchId> {
+        if self.selected.as_ref() != Some(target) {
+            return None;
+        }
+        let index = self.projection.branch_to_selectable.get(target).copied()?;
+        self.projection
+            .selectable
+            .get(index + 1)
+            .or_else(|| {
+                index
+                    .checked_sub(1)
+                    .and_then(|index| self.projection.selectable.get(index))
+            })
+            .cloned()
     }
 
     fn handle_search_key(&mut self, key: Key) -> Action {
@@ -829,10 +1646,13 @@ impl App {
     }
 
     fn selected_url(&self) -> Option<Arc<str>> {
+        if matches!(self.archive_mode, ArchiveMode::Archive) {
+            return None;
+        }
         self.selected_branch()?.pr.as_ref().map(|pr| pr.url.clone())
     }
 
-    fn begin_delete_confirmation(&mut self) {
+    pub fn begin_delete_confirmation(&mut self) {
         if !matches!(self.mutation, MutationState::Idle) {
             self.message = Some(Arc::from("another repository mutation is active"));
             return;
@@ -849,7 +1669,7 @@ impl App {
         let Some(branch) = self.selected_branch() else {
             return;
         };
-        if let Some(refusal) = deletion_refusal(snapshot, branch) {
+        if let Some(refusal) = deletion_refusal(snapshot, branch, self.refresh_error.as_deref()) {
             self.message = Some(Arc::from(refusal));
             return;
         }
@@ -861,12 +1681,18 @@ impl App {
                 expected_provenance: branch.graphite,
             },
             pr_number: branch.pr.as_ref().map(|pr| pr.number),
+            selection_after: self.nearby_selection_after(&branch.id),
         });
     }
 
     fn handle_delete_confirmation(&mut self, key: Key) -> Action {
         match key {
             Key::Character('y') => {
+                if let Some(error) = &self.refresh_error {
+                    self.mutation = MutationState::Idle;
+                    self.message = Some(Arc::from(stale_deletion_refusal(error)));
+                    return Action::None;
+                }
                 let MutationState::ConfirmingDeletion(confirmation) = &self.mutation else {
                     return Action::None;
                 };
@@ -884,23 +1710,40 @@ impl App {
     }
 
     pub fn finish_checkout(&mut self, result: anyhow::Result<()>, request_epoch: u64) {
-        self.message = Some(Arc::from(match result {
-            Ok(()) => "checkout complete; reconciling".to_owned(),
-            Err(error) => format!("checkout blocked: {error}"),
-        }));
-        self.mutation = MutationState::Reconciling { request_epoch };
+        self.finish_checkout_at(result, request_epoch, Instant::now());
+    }
+
+    pub fn finish_checkout_at(
+        &mut self,
+        result: anyhow::Result<()>,
+        request_epoch: u64,
+        now: Instant,
+    ) {
+        let MutationState::CheckingOut(target) = &self.mutation else {
+            return;
+        };
+        let operation = ReconciliationOperation::Checkout {
+            target: target.clone(),
+            command_error: result.err().map(|error| Arc::from(error.to_string())),
+        };
+        self.mutation = MutationState::Reconciling {
+            operation,
+            request_epoch,
+            deadline: now + self.reconciliation_timeout,
+        };
     }
 
     pub fn finish_deletion(&mut self, result: anyhow::Result<DeleteOutcome>, request_epoch: u64) {
+        self.finish_deletion_at(result, request_epoch, Instant::now());
+    }
+
+    pub fn finish_deletion_at(
+        &mut self,
+        result: anyhow::Result<DeleteOutcome>,
+        request_epoch: u64,
+        now: Instant,
+    ) {
         match result {
-            Ok(DeleteOutcome::Deleted) => {
-                self.message = Some(Arc::from("branch deleted locally; reconciling"));
-                self.mutation = MutationState::Reconciling { request_epoch };
-            }
-            Ok(DeleteOutcome::Unchanged) => {
-                self.message = Some(Arc::from("branch was not deleted; reconciling"));
-                self.mutation = MutationState::Reconciling { request_epoch };
-            }
             Ok(DeleteOutcome::Inconsistent) => {
                 let message: Arc<str> = Arc::from(
                     "deletion result is inconsistent; inspect Git/Graphite before retrying",
@@ -908,11 +1751,88 @@ impl App {
                 self.message = Some(message.clone());
                 self.mutation = MutationState::DeletionBlocked(message);
             }
-            Err(error) => {
-                self.message = Some(Arc::from(format!("deletion blocked: {error}")));
-                self.mutation = MutationState::Reconciling { request_epoch };
+            result => {
+                let MutationState::Deleting(confirmation) = &self.mutation else {
+                    return;
+                };
+                let result = match result {
+                    Ok(outcome) => DeletionResult::Outcome(outcome),
+                    Err(error) => DeletionResult::Error(Arc::from(error.to_string())),
+                };
+                self.mutation = MutationState::Reconciling {
+                    operation: ReconciliationOperation::Deletion {
+                        request: confirmation.request.clone(),
+                        result,
+                        selection_after: confirmation.selection_after.clone(),
+                    },
+                    request_epoch,
+                    deadline: now + self.reconciliation_timeout,
+                };
             }
         }
+    }
+
+    pub fn mutation_progress(&self) -> Option<String> {
+        match &self.mutation {
+            MutationState::CheckingOut(target) => Some(format!("switching to {target}…")),
+            MutationState::Deleting(confirmation) => {
+                Some(format!("deleting {} locally…", confirmation.request.branch))
+            }
+            MutationState::Reconciling { operation, .. } => Some(match operation {
+                ReconciliationOperation::Checkout { target, .. } => {
+                    format!("verifying checkout of {target}…")
+                }
+                ReconciliationOperation::Deletion { request, .. } => {
+                    format!("verifying deletion of {}…", request.branch)
+                }
+            }),
+            MutationState::DeletionBlocked(message) => Some(format!("DELETION BLOCKED: {message}")),
+            MutationState::Idle | MutationState::ConfirmingDeletion(_) => None,
+        }
+    }
+
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_ref().map(|notice| notice.text.as_ref())
+    }
+
+    pub fn tick(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|notice| now >= notice.expires_at)
+        {
+            self.notice = None;
+            changed = true;
+        }
+        let timed_out = match &self.mutation {
+            MutationState::Reconciling {
+                operation,
+                deadline,
+                ..
+            } if now >= *deadline => Some(operation.clone()),
+            _ => None,
+        };
+        if let Some(operation) = timed_out {
+            let target = operation.target();
+            self.mutation = MutationState::Idle;
+            self.set_notice(
+                Arc::from(format!(
+                    "could not verify {} for {target}; press r to refresh",
+                    operation.description()
+                )),
+                now,
+            );
+            changed = true;
+        }
+        changed
+    }
+
+    fn set_notice(&mut self, text: Arc<str>, now: Instant) {
+        self.notice = Some(TransientNotice {
+            text,
+            expires_at: now + self.notice_duration,
+        });
     }
 
     pub fn checkout_running(&self) -> bool {
@@ -954,7 +1874,22 @@ impl App {
                         scope,
                         separators: self.separators,
                         filter: self.filter.clone(),
-                        ..ProjectionOptions::default()
+                        archive_mode: self.archive_mode,
+                        archived: self
+                            .config
+                            .archived
+                            .iter()
+                            .cloned()
+                            .map(BranchId::new)
+                            .collect(),
+                        stack_names: self
+                            .config
+                            .stack_names
+                            .iter()
+                            .map(|(stack, name)| {
+                                (BranchId::new(stack.clone()), Arc::from(name.as_str()))
+                            })
+                            .collect(),
                     });
             if matches!(self.scope, ViewScope::Untrunked) {
                 self.restrict_projection_to_untrunked();
@@ -985,6 +1920,9 @@ impl App {
                             .saturating_sub(self.viewport_height),
                     );
                 }
+            }
+            if matches!(self.archive_mode, ArchiveMode::Archive) {
+                self.upstream_request_pending = true;
             }
         }
     }
@@ -1372,6 +2310,14 @@ impl App {
     }
 
     fn keep_selected_visible(&mut self) {
+        let previous_scroll = self.scroll;
+        self.keep_selected_visible_inner();
+        if self.scroll != previous_scroll && matches!(self.archive_mode, ArchiveMode::Archive) {
+            self.upstream_request_pending = true;
+        }
+    }
+
+    fn keep_selected_visible_inner(&mut self) {
         let Some(index) = self
             .selected
             .as_ref()
@@ -1421,6 +2367,113 @@ impl App {
     }
 }
 
+impl ReconciliationOperation {
+    fn target(&self) -> &BranchId {
+        match self {
+            Self::Checkout { target, .. } => target,
+            Self::Deletion { request, .. } => &request.branch,
+        }
+    }
+
+    fn description(&self) -> &'static str {
+        match self {
+            Self::Checkout { .. } => "checkout",
+            Self::Deletion { .. } => "deletion",
+        }
+    }
+}
+
+fn reconciliation_notice(
+    snapshot: &RepositorySnapshot,
+    operation: &ReconciliationOperation,
+) -> Arc<str> {
+    match operation {
+        ReconciliationOperation::Checkout {
+            target,
+            command_error,
+        } => {
+            if snapshot.branch(target).is_some_and(|branch| branch.current) {
+                return Arc::from(format!("checked out {target}"));
+            }
+            let repository_position = snapshot
+                .branches
+                .iter()
+                .find(|branch| branch.current)
+                .map(|branch| branch.id.to_string())
+                .unwrap_or_else(|| match &snapshot.state {
+                    crate::model::RepositoryState::Detached => "detached HEAD".into(),
+                    crate::model::RepositoryState::Unborn => "an unborn branch".into(),
+                    crate::model::RepositoryState::OperationInProgress(operation) => {
+                        format!("operation in progress ({operation})")
+                    }
+                    crate::model::RepositoryState::Ready => "no current branch".into(),
+                });
+            if let Some(error) = command_error {
+                Arc::from(format!(
+                    "checkout of {target} failed ({error}); repository is on {repository_position}; press r to refresh"
+                ))
+            } else {
+                Arc::from(format!(
+                    "checkout of {target} was not confirmed; repository is on {repository_position}; press r to refresh"
+                ))
+            }
+        }
+        ReconciliationOperation::Deletion {
+            request, result, ..
+        } => {
+            let current = snapshot.branch(&request.branch);
+            if current.is_some_and(|branch| branch.oid != request.expected_oid) {
+                return Arc::from(format!(
+                    "{} changed since deletion began; inspect it before retrying",
+                    request.branch
+                ));
+            }
+            match (result, current) {
+                (DeletionResult::Outcome(DeleteOutcome::Deleted), None) => {
+                    Arc::from(format!("deleted {} locally", request.branch))
+                }
+                (DeletionResult::Outcome(DeleteOutcome::Deleted), Some(_)) => Arc::from(format!(
+                    "deletion of {} was not confirmed; branch still exists; press r to refresh",
+                    request.branch
+                )),
+                (DeletionResult::Outcome(DeleteOutcome::Unchanged), Some(_)) => {
+                    Arc::from(format!("{} was not deleted", request.branch))
+                }
+                (DeletionResult::Outcome(DeleteOutcome::Unchanged), None) => Arc::from(format!(
+                    "{} disappeared although deletion reported no change; inspect before retrying",
+                    request.branch
+                )),
+                (DeletionResult::Outcome(DeleteOutcome::Inconsistent), _) => Arc::from(
+                    "deletion result is inconsistent; inspect Git/Graphite before retrying",
+                ),
+                (DeletionResult::Error(error), Some(_)) => Arc::from(format!(
+                    "deletion of {} failed ({error}); press r to refresh",
+                    request.branch
+                )),
+                (DeletionResult::Error(error), None) => Arc::from(format!(
+                    "{} disappeared after deletion failed ({error}); inspect before retrying",
+                    request.branch
+                )),
+            }
+        }
+    }
+}
+
+fn archive_range_slice<'a>(
+    eligible: &'a [BranchId],
+    anchor: &BranchId,
+    endpoint: &BranchId,
+) -> Option<&'a [BranchId]> {
+    let anchor = eligible.iter().position(|branch| branch == anchor)?;
+    let endpoint = eligible.iter().position(|branch| branch == endpoint)?;
+    let (start, end) = if anchor <= endpoint {
+        (anchor, endpoint)
+    } else {
+        (endpoint, anchor)
+    };
+    Some(&eligible[start..=end])
+}
+
 fn order_option_index(mode: OrderMode) -> usize {
     ORDER_OPTIONS
         .iter()
@@ -1435,12 +2488,19 @@ fn confirmation_is_valid(snapshot: &RepositorySnapshot, confirmation: &DeleteCon
             .is_some_and(|branch| {
                 branch.oid == confirmation.request.expected_oid
                     && branch.graphite == confirmation.request.expected_provenance
-                    && deletion_refusal(snapshot, branch).is_none()
+                    && deletion_refusal(snapshot, branch, None).is_none()
             })
 }
 
-fn deletion_refusal(snapshot: &RepositorySnapshot, branch: &Branch) -> Option<String> {
-    if branch.graphite == crate::model::GraphiteProvenance::Tracked && branch.id.0.starts_with('-')
+fn deletion_refusal(
+    snapshot: &RepositorySnapshot,
+    branch: &Branch,
+    stale_error: Option<&str>,
+) -> Option<String> {
+    if let Some(error) = stale_error {
+        Some(stale_deletion_refusal(error))
+    } else if branch.graphite == crate::model::GraphiteProvenance::Tracked
+        && branch.id.0.starts_with('-')
     {
         Some(format!(
             "cannot safely delete option-shaped branch {}",
@@ -1469,4 +2529,8 @@ fn deletion_refusal(snapshot: &RepositorySnapshot, branch: &Branch) -> Option<St
     } else {
         None
     }
+}
+
+fn stale_deletion_refusal(error: &str) -> String {
+    format!("repository data is stale ({error}); press r before deleting")
 }

@@ -1,7 +1,7 @@
 ---
 title: "feat: Stabilize Stackmap's visual hierarchy and cleanup workflow"
 type: feat
-status: active
+status: completed
 date: 2026-07-19
 deepened: 2026-07-19
 ---
@@ -235,7 +235,7 @@ flowchart TB
 **Verification:**
 - Screen-order, lane-depth, connector-parent, section-bottom, and emphasis invariants are renderer-independent and benchmark growth remains approximately linear.
 
-- [ ] U2. **Render fixed geometry and layered visual identity**
+- [x] U2. **Render fixed geometry and layered visual identity**
 
 **Goal:** Render the agreed trunk/current/selection grammar, stack-local labels, reducer-provided width state, worktree badge, and edge-to-edge styling without sacrificing semantic colors.
 
@@ -332,7 +332,7 @@ flowchart TB
 **Verification:**
 - Every key has one owner in every state, view transitions do no provider work, and modifier fallbacks work in the user's terminal.
 
-- [ ] U8. **Repair causal mutation notices and footer recovery**
+- [x] U8. **Repair causal mutation notices and footer recovery**
 
 **Goal:** Fix the reported checkout footer bug independently of Archive work and retain enough mutation identity to verify causal results.
 
@@ -366,7 +366,7 @@ flowchart TB
 **Verification:**
 - Checkout progress cannot permanently replace controls, and verification always refers to the captured target rather than current selection.
 
-- [ ] U4. **Persist reversible branch archives and bulk cleanup**
+- [x] U4. **Persist reversible branch archives and bulk cleanup**
 
 **Goal:** Add repository-local hidden state, Active/Archive projections, single-row and contiguous-range cleanup, and concurrency-safe config persistence.
 
@@ -412,7 +412,7 @@ flowchart TB
 **Verification:**
 - Archive is fully reversible, survives reboot, performs no Git mutation, and remains safe under rapid ranges and concurrent worktrees.
 
-- [ ] U5. **Add lazy Archive remote-ref and upstream evidence**
+- [x] U5. **Add lazy Archive remote-ref and upstream evidence**
 
 **Goal:** Report local remote-ref/upstream evidence for hidden branches without presenting it as fresh network truth, slowing the normal viewer, or performing network operations.
 
@@ -460,7 +460,7 @@ flowchart TB
 **Verification:**
 - Archive badges truthfully describe local remote-tracking state without network access or unbounded work.
 
-- [ ] U6. **Integrate guarded deletion with Archive state**
+- [x] U6. **Integrate guarded deletion with Archive state**
 
 **Goal:** Preserve guarded deletion behind uppercase `X`, integrate it with Archive state, and clean persistent identity only after authoritative postconditions.
 
@@ -497,7 +497,7 @@ flowchart TB
 **Verification:**
 - Destructive behavior is never reachable from lowercase cleanup keys, and mutation status cannot permanently replace ordinary controls.
 
-- [ ] U7. **Integrate, document, benchmark, and reinstall v0.0**
+- [x] U7. **Integrate, document, benchmark, and reinstall v0.0**
 
 **Goal:** Verify the complete redesigned workflow under real topology, terminal, refresh, memory, and installed-binary conditions.
 

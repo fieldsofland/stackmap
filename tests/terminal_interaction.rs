@@ -18,6 +18,14 @@ fn key_events_preserve_phase_and_normalize_portable_navigation_fallbacks() {
     assert_eq!(
         Input::from_event(event(
             KeyCode::Down,
+            KeyModifiers::SUPER,
+            KeyEventKind::Press
+        )),
+        Some(Input::press(Key::StackDown))
+    );
+    assert_eq!(
+        Input::from_event(event(
+            KeyCode::Down,
             KeyModifiers::ALT,
             KeyEventKind::Repeat
         )),
@@ -111,6 +119,12 @@ fn repeats_move_but_cannot_toggle_or_start_mutations() {
         Action::None
     );
     assert!(matches!(app.mutation, MutationState::Idle));
+    assert!(!app.config.is_archived(&BranchId::new("feature")));
+    assert_eq!(
+        app.handle_input(Input::repeat(Key::Character('X'))),
+        Action::None
+    );
+    assert!(matches!(app.mutation, MutationState::Idle));
 }
 
 #[test]
@@ -164,7 +178,7 @@ fn deletion_confirmation_has_precedence_over_overlay_owner() {
         common::branch("merged", None, "merged", false),
     ]));
     app.selected = Some(BranchId::new("merged"));
-    app.handle_input(Input::press(Key::Character('x')));
+    app.begin_delete_confirmation();
     assert!(matches!(app.mutation, MutationState::ConfirmingDeletion(_)));
 
     app.overlay = Overlay::Search;

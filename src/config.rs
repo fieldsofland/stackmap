@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -11,10 +11,64 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::BranchId;
 
+pub const MAX_STACK_NAME_CHARS: usize = 80;
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub colors: BTreeMap<String, String>,
+    #[serde(default)]
+    pub archived: BTreeSet<String>,
+    #[serde(default)]
+    pub stack_names: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArchiveMutation {
+    Set(bool),
+    Prune,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ConfigMutation {
+    pub color_updates: BTreeMap<BranchId, Option<Arc<str>>>,
+    pub archive_updates: BTreeMap<BranchId, ArchiveMutation>,
+    pub stack_name_updates: BTreeMap<BranchId, Option<Arc<str>>>,
+}
+
+impl ConfigMutation {
+    pub fn set_color(&mut self, root: BranchId, color: Option<Arc<str>>) {
+        self.color_updates.insert(root, color);
+    }
+
+    pub fn set_archived(&mut self, branch: BranchId, archived: bool) {
+        self.archive_updates
+            .insert(branch, ArchiveMutation::Set(archived));
+    }
+
+    pub fn set_stack_name(&mut self, stack: BranchId, name: Option<Arc<str>>) {
+        self.stack_name_updates.insert(stack, name);
+    }
+
+    pub fn prune_archived(&mut self, branches: impl IntoIterator<Item = BranchId>) {
+        self.archive_updates.extend(
+            branches
+                .into_iter()
+                .map(|branch| (branch, ArchiveMutation::Prune)),
+        );
+    }
+
+    pub fn merge(&mut self, newer: Self) {
+        self.color_updates.extend(newer.color_updates);
+        self.archive_updates.extend(newer.archive_updates);
+        self.stack_name_updates.extend(newer.stack_name_updates);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.color_updates.is_empty()
+            && self.archive_updates.is_empty()
+            && self.stack_name_updates.is_empty()
+    }
 }
 
 impl Config {
@@ -27,11 +81,34 @@ impl Config {
         for color in config.colors.values() {
             validate_color(color)?;
         }
+        for name in config.stack_names.values() {
+            validate_stack_name(name)?;
+        }
         Ok(config)
     }
 
     pub fn color(&self, root: &BranchId) -> Option<&str> {
         self.colors.get(root.0.as_ref()).map(String::as_str)
+    }
+
+    pub fn is_archived(&self, branch: &BranchId) -> bool {
+        self.archived.contains(branch.0.as_ref())
+    }
+
+    pub fn stack_name(&self, stack: &BranchId) -> Option<&str> {
+        self.stack_names.get(stack.0.as_ref()).map(String::as_str)
+    }
+
+    pub fn set_stack_name_in_memory(&mut self, stack: &BranchId, name: Option<&str>) -> Result<()> {
+        let name = name.map(str::trim).filter(|name| !name.is_empty());
+        if let Some(name) = name {
+            validate_stack_name(name)?;
+            self.stack_names
+                .insert(stack.0.to_string(), name.to_owned());
+        } else {
+            self.stack_names.remove(stack.0.as_ref());
+        }
+        Ok(())
     }
 
     pub fn set_color(
@@ -56,6 +133,26 @@ impl Config {
         Ok(())
     }
 
+    pub fn set_archived(
+        &mut self,
+        common_dir: &Path,
+        branch: &BranchId,
+        archived: bool,
+    ) -> Result<()> {
+        let fallback = self.clone();
+        Self::persist_archived(common_dir, branch, archived, &fallback)?;
+        self.set_archived_in_memory(branch, archived);
+        Ok(())
+    }
+
+    pub fn set_archived_in_memory(&mut self, branch: &BranchId, archived: bool) {
+        if archived {
+            self.archived.insert(branch.0.to_string());
+        } else {
+            self.archived.remove(branch.0.as_ref());
+        }
+    }
+
     pub fn persist_color(
         common_dir: &Path,
         root: &BranchId,
@@ -71,19 +168,66 @@ impl Config {
         updates: &BTreeMap<BranchId, Option<Arc<str>>>,
         fallback: &Self,
     ) -> Result<()> {
+        let mutation = ConfigMutation {
+            color_updates: updates.clone(),
+            archive_updates: BTreeMap::new(),
+            stack_name_updates: BTreeMap::new(),
+        };
+        Self::persist_mutation(common_dir, &mutation, fallback)
+    }
+
+    pub fn persist_archived(
+        common_dir: &Path,
+        branch: &BranchId,
+        archived: bool,
+        fallback: &Self,
+    ) -> Result<()> {
+        let mut mutation = ConfigMutation::default();
+        mutation.set_archived(branch.clone(), archived);
+        Self::persist_mutation(common_dir, &mutation, fallback)
+    }
+
+    pub fn persist_mutation(
+        common_dir: &Path,
+        mutation: &ConfigMutation,
+        fallback: &Self,
+    ) -> Result<()> {
         let _lock = ConfigLock::acquire(common_dir)?;
         // Merge against the latest on-disk value so two worktrees changing
-        // different stack roots do not overwrite one another.
+        // different config fields or branch names do not overwrite one another.
         let mut merged = Self::load(common_dir).unwrap_or_else(|_| fallback.clone());
-        for (root, color) in updates {
+        merged.apply_mutation_in_memory(mutation)?;
+        merged.save(common_dir)?;
+        Ok(())
+    }
+
+    pub fn apply_mutation_in_memory(&mut self, mutation: &ConfigMutation) -> Result<()> {
+        for color in mutation.color_updates.values().flatten() {
+            validate_color(color)?;
+        }
+        for name in mutation.stack_name_updates.values().flatten() {
+            validate_stack_name(name)?;
+        }
+        for (root, color) in &mutation.color_updates {
             if let Some(color) = color {
-                validate_color(color)?;
-                merged.colors.insert(root.0.to_string(), color.to_string());
+                self.colors.insert(root.0.to_string(), color.to_string());
             } else {
-                merged.colors.remove(root.0.as_ref());
+                self.colors.remove(root.0.as_ref());
             }
         }
-        merged.save(common_dir)?;
+        for (branch, update) in &mutation.archive_updates {
+            match update {
+                ArchiveMutation::Set(true) => {
+                    self.archived.insert(branch.0.to_string());
+                }
+                ArchiveMutation::Set(false) | ArchiveMutation::Prune => {
+                    self.archived.remove(branch.0.as_ref());
+                }
+            }
+        }
+        for (stack, name) in &mutation.stack_name_updates {
+            self.set_stack_name_in_memory(stack, name.as_deref())?;
+        }
         Ok(())
     }
 
@@ -167,6 +311,22 @@ fn validate_color(color: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_stack_name(name: &str) -> Result<()> {
+    if name.trim() != name {
+        bail!("stack names cannot start or end with whitespace")
+    }
+    if name.is_empty() {
+        bail!("stack names cannot be empty")
+    }
+    if name.chars().count() > MAX_STACK_NAME_CHARS {
+        bail!("stack names are limited to {MAX_STACK_NAME_CHARS} characters")
+    }
+    if name.chars().any(char::is_control) {
+        bail!("stack names cannot contain control characters")
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Barrier};
@@ -199,5 +359,141 @@ mod tests {
         assert_eq!(config.colors.len(), 2);
         assert_eq!(config.colors["one"], "#7aa2f7");
         assert_eq!(config.colors["two"], "#bb9af7");
+    }
+
+    #[test]
+    fn legacy_toml_without_archived_branches_loads() {
+        let directory = tempdir().unwrap();
+        let path = config_path(directory.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "[colors]\none = \"#7aa2f7\"\n").unwrap();
+
+        let config = Config::load(directory.path()).unwrap();
+
+        assert_eq!(config.colors["one"], "#7aa2f7");
+        assert!(config.archived.is_empty());
+    }
+
+    #[test]
+    fn concurrent_color_and_archive_mutations_retain_both_fields() {
+        let directory = tempdir().unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let color_path = directory.path().to_owned();
+        let color_barrier = barrier.clone();
+        let color = thread::spawn(move || {
+            let mut mutation = ConfigMutation::default();
+            mutation.set_color(BranchId::new("colored"), Some(Arc::from("#7aa2f7")));
+            color_barrier.wait();
+            Config::persist_mutation(&color_path, &mutation, &Config::default()).unwrap();
+        });
+        let archive_path = directory.path().to_owned();
+        let archive_barrier = barrier.clone();
+        let archive = thread::spawn(move || {
+            let mut mutation = ConfigMutation::default();
+            mutation.set_archived(BranchId::new("hidden"), true);
+            archive_barrier.wait();
+            Config::persist_mutation(&archive_path, &mutation, &Config::default()).unwrap();
+        });
+
+        barrier.wait();
+        color.join().unwrap();
+        archive.join().unwrap();
+
+        let config = Config::load(directory.path()).unwrap();
+        assert_eq!(config.colors["colored"], "#7aa2f7");
+        assert_eq!(config.archived, BTreeSet::from(["hidden".to_owned()]));
+    }
+
+    #[test]
+    fn stack_names_round_trip_and_empty_mutation_clears_them() {
+        let directory = tempdir().unwrap();
+        let stack = BranchId::new("stack-root");
+        let mut mutation = ConfigMutation::default();
+        mutation.set_stack_name(stack.clone(), Some(Arc::from("Release train")));
+        Config::persist_mutation(directory.path(), &mutation, &Config::default()).unwrap();
+
+        let loaded = Config::load(directory.path()).unwrap();
+        assert_eq!(loaded.stack_name(&stack), Some("Release train"));
+
+        let mut clear = ConfigMutation::default();
+        clear.set_stack_name(stack.clone(), None);
+        Config::persist_mutation(directory.path(), &clear, &loaded).unwrap();
+        assert_eq!(
+            Config::load(directory.path()).unwrap().stack_name(&stack),
+            None
+        );
+    }
+
+    #[test]
+    fn stack_names_are_bounded_single_line_text() {
+        let mut config = Config::default();
+        let stack = BranchId::new("stack-root");
+        assert!(
+            config
+                .set_stack_name_in_memory(&stack, Some("line\nbreak"))
+                .is_err()
+        );
+        assert!(
+            config
+                .set_stack_name_in_memory(&stack, Some(&"x".repeat(MAX_STACK_NAME_CHARS + 1)))
+                .is_err()
+        );
+        config
+            .set_stack_name_in_memory(&stack, Some("  trimmed name  "))
+            .unwrap();
+        assert_eq!(config.stack_name(&stack), Some("trimmed name"));
+    }
+
+    #[test]
+    fn concurrent_archive_mutations_retain_both_memberships() {
+        let directory = tempdir().unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let mut handles = Vec::new();
+        for name in ["one", "two"] {
+            let path = directory.path().to_owned();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                let mut mutation = ConfigMutation::default();
+                mutation.set_archived(BranchId::new(name), true);
+                barrier.wait();
+                Config::persist_mutation(&path, &mutation, &Config::default()).unwrap();
+            }));
+        }
+
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let config = Config::load(directory.path()).unwrap();
+        assert_eq!(
+            config.archived,
+            BTreeSet::from(["one".to_owned(), "two".to_owned()])
+        );
+    }
+
+    #[test]
+    fn mutation_prunes_only_named_archives_and_preserves_other_fields() {
+        let directory = tempdir().unwrap();
+        let fallback = Config {
+            colors: BTreeMap::from([("colored".to_owned(), "#7aa2f7".to_owned())]),
+            archived: BTreeSet::from(["gone".to_owned(), "kept".to_owned(), "restored".to_owned()]),
+            stack_names: BTreeMap::from([("named".to_owned(), "Keep me".to_owned())]),
+        };
+        fallback.save(directory.path()).unwrap();
+        let mut mutation = ConfigMutation::default();
+        mutation.prune_archived([BranchId::new("gone")]);
+        mutation.set_archived(BranchId::new("restored"), false);
+        mutation.set_archived(BranchId::new("added"), true);
+
+        Config::persist_mutation(directory.path(), &mutation, &fallback).unwrap();
+
+        let config = Config::load(directory.path()).unwrap();
+        assert_eq!(config.colors, fallback.colors);
+        assert_eq!(config.stack_names, fallback.stack_names);
+        assert_eq!(
+            config.archived,
+            BTreeSet::from(["added".to_owned(), "kept".to_owned()])
+        );
     }
 }

@@ -21,48 +21,53 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use stackmap::adapters::{git::DeleteRequest, git::GitAdapter, github, platform};
-use stackmap::app::{Action, App, ColorWriteRequest};
+use stackmap::app::{Action, App, ConfigWriteRequest};
 use stackmap::config::Config;
 use stackmap::events::{Input, Key};
+use stackmap::model::topology::ArchiveMode;
 use stackmap::refresh::{RefreshEvent, RefreshHandle};
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const GITHUB_TTL: Duration = Duration::from_secs(30);
+const CONFIG_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 enum PlatformResult {
     Open(Result<()>),
     Copy(Result<()>),
 }
 
-struct ColorPersistenceResult {
+struct ConfigPersistenceResult {
     sequence: u64,
     result: Result<()>,
 }
 
 #[derive(Default)]
-struct ColorPersistenceQueue {
-    active: bool,
-    pending: Option<ColorWriteRequest>,
+struct ConfigPersistenceQueue {
+    active: Option<ConfigWriteRequest>,
+    pending: Option<ConfigWriteRequest>,
+    last_request: Option<ConfigWriteRequest>,
 }
 
-impl ColorPersistenceQueue {
-    fn submit(&mut self, request: ColorWriteRequest) -> Option<ColorWriteRequest> {
-        if self.active {
+impl ConfigPersistenceQueue {
+    fn submit(&mut self, request: ConfigWriteRequest) -> Option<ConfigWriteRequest> {
+        self.last_request = Some(request.clone());
+        if self.active.is_some() {
             self.pending = Some(request);
             None
         } else {
-            self.active = true;
+            self.active = Some(request.clone());
             Some(request)
         }
     }
 
-    fn complete(&mut self) -> Option<ColorWriteRequest> {
-        self.active = false;
+    fn complete(&mut self) -> Option<ConfigWriteRequest> {
+        self.active = None;
         self.pending.take()
     }
 
-    fn activate(&mut self) {
-        self.active = true;
+    fn activate(&mut self, request: &ConfigWriteRequest) {
+        self.active = Some(request.clone());
+        self.last_request = Some(request.clone());
     }
 }
 
@@ -167,8 +172,8 @@ fn run() -> Result<()> {
     let (delete_send, delete_receive) = mpsc::sync_channel(1);
     let (github_send, github_receive) = mpsc::sync_channel(1);
     let (platform_send, platform_receive) = mpsc::sync_channel(1);
-    let (color_send, color_receive) = mpsc::sync_channel::<ColorPersistenceResult>(1);
-    let mut color_queue = ColorPersistenceQueue::default();
+    let (config_send, config_receive) = mpsc::sync_channel::<ConfigPersistenceResult>(1);
+    let mut config_queue = ConfigPersistenceQueue::default();
     let mut github_in_flight = false;
     let mut next_github_fetch = Instant::now();
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -180,7 +185,7 @@ fn run() -> Result<()> {
         signal_hook::flag::register(signal, shutdown.clone())?;
     }
 
-    let _guard = TerminalGuard::enter()?;
+    let guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
     let mut app = App::default();
@@ -199,8 +204,16 @@ fn run() -> Result<()> {
                     request_epoch,
                     snapshot,
                 } => {
-                    app.apply_structural_snapshot(snapshot, request_epoch);
-                    if !github_in_flight && Instant::now() >= next_github_fetch {
+                    app.apply_structural_snapshot_at(snapshot, request_epoch, Instant::now());
+                    if let Some(request) = app.take_config_write_request()
+                        && let Some(start) = config_queue.submit(request)
+                    {
+                        spawn_config_persistence(start, config_send.clone())?;
+                    }
+                    if matches!(app.archive_mode, ArchiveMode::Active)
+                        && !github_in_flight
+                        && Instant::now() >= next_github_fetch
+                    {
                         github_in_flight = true;
                         app.mark_github_loading();
                         let directory = start_dir.clone();
@@ -214,6 +227,7 @@ fn run() -> Result<()> {
                     }
                 }
                 RefreshEvent::Enriched(snapshot) => app.apply_enriched_snapshot(snapshot),
+                RefreshEvent::Upstream(batch) => app.apply_upstream_batch(batch),
                 RefreshEvent::Failed(error) => app.mark_stale(error),
             }
         }
@@ -240,28 +254,36 @@ fn run() -> Result<()> {
             }
             redraw = true;
         }
-        while let Ok(result) = color_receive.try_recv() {
-            app.finish_color_persistence(result.sequence, result.result);
-            if let Some(next) = color_queue
+        while let Ok(result) = config_receive.try_recv() {
+            app.finish_config_persistence(result.sequence, result.result);
+            if let Some(next) = config_queue
                 .complete()
-                .and_then(|request| app.prepare_pending_color_persistence(request))
+                .and_then(|request| app.prepare_pending_config_persistence(request))
             {
-                color_queue.activate();
-                spawn_color_persistence(next, color_send.clone())?;
+                config_queue.activate(&next);
+                spawn_config_persistence(next, config_send.clone())?;
             }
             redraw = true;
         }
         while let Ok(result) = checkout_receive.try_recv() {
             let request_epoch = refresh.request();
-            app.finish_checkout(result, request_epoch);
+            app.finish_checkout_at(result, request_epoch, Instant::now());
             redraw = true;
         }
         while let Ok(result) = delete_receive.try_recv() {
             let request_epoch = refresh.request();
-            app.finish_deletion(result, request_epoch);
+            app.finish_deletion_at(result, request_epoch, Instant::now());
             redraw = true;
         }
 
+        if let Some(command) = app.take_upstream_command() {
+            refresh.request_upstream(command);
+            redraw = true;
+        }
+
+        if app.tick(Instant::now()) {
+            redraw = true;
+        }
         if last_clock_tick.elapsed() >= Duration::from_secs(30) {
             redraw = true;
             last_clock_tick = Instant::now();
@@ -293,18 +315,15 @@ fn run() -> Result<()> {
                         Action::Refresh => {
                             refresh.request();
                         }
-                        Action::PersistColor(request) => {
-                            if let Some(start) = color_queue.submit(request) {
-                                spawn_color_persistence(start, color_send.clone())?;
+                        Action::PersistConfig(request) => {
+                            if let Some(start) = config_queue.submit(request) {
+                                spawn_config_persistence(start, config_send.clone())?;
                             }
                         }
                         Action::Checkout(branch) => {
-                            app.message = Some(Arc::from(format!("switching to {branch}…")));
                             spawn_checkout(adapter.clone(), branch, checkout_send.clone())?;
                         }
                         Action::Delete(request) => {
-                            app.message =
-                                Some(Arc::from(format!("deleting {} locally…", request.branch)));
                             spawn_delete(adapter.clone(), request, delete_send.clone())?;
                         }
                         Action::OpenUrl(url) => {
@@ -328,19 +347,85 @@ fn run() -> Result<()> {
             }
         }
     }
+    drop(terminal);
+    drop(guard);
+    flush_config_persistence(&mut app, &mut config_queue, &config_send, &config_receive)?;
     Ok(())
 }
 
-fn spawn_color_persistence(
-    request: ColorWriteRequest,
-    sender: std::sync::mpsc::SyncSender<ColorPersistenceResult>,
+fn flush_config_persistence(
+    app: &mut App,
+    queue: &mut ConfigPersistenceQueue,
+    sender: &std::sync::mpsc::SyncSender<ConfigPersistenceResult>,
+    receiver: &std::sync::mpsc::Receiver<ConfigPersistenceResult>,
+) -> Result<()> {
+    let mut final_retry_used = false;
+    if let Some(request) = app.take_config_write_request()
+        && let Some(start) = queue.submit(request)
+    {
+        spawn_config_persistence(start, sender.clone())?;
+    } else if queue.active.is_none()
+        && let Some(retry) = queue
+            .last_request
+            .clone()
+            .and_then(|request| app.prepare_pending_config_persistence(request))
+    {
+        final_retry_used = true;
+        let start = queue
+            .submit(retry)
+            .expect("an idle persistence queue starts its shutdown retry");
+        spawn_config_persistence(start, sender.clone())?;
+    }
+    let deadline = Instant::now() + CONFIG_SHUTDOWN_TIMEOUT;
+    while queue.active.is_some() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("timed out flushing stackmap configuration after terminal restore");
+        }
+        let result = receiver
+            .recv_timeout(remaining)
+            .map_err(|error| match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => anyhow::anyhow!(
+                    "timed out flushing stackmap configuration after terminal restore"
+                ),
+                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                    anyhow::anyhow!("configuration persistence worker disconnected during shutdown")
+                }
+            })?;
+        let failed = result.result.is_err();
+        let active = queue.active.clone();
+        let had_pending = queue.pending.is_some();
+        app.finish_config_persistence(result.sequence, result.result);
+        let pending = queue.complete();
+        let retry = if failed && !had_pending && !final_retry_used {
+            final_retry_used = true;
+            active
+        } else {
+            None
+        };
+        let next = pending
+            .or(retry)
+            .and_then(|request| app.prepare_pending_config_persistence(request));
+        if let Some(next) = next {
+            queue.activate(&next);
+            spawn_config_persistence(next, sender.clone())?;
+        } else if failed {
+            anyhow::bail!("configuration could not be saved during shutdown after one retry");
+        }
+    }
+    Ok(())
+}
+
+fn spawn_config_persistence(
+    request: ConfigWriteRequest,
+    sender: std::sync::mpsc::SyncSender<ConfigPersistenceResult>,
 ) -> io::Result<()> {
     thread::Builder::new()
-        .name("stackmap-color".into())
+        .name("stackmap-config".into())
         .spawn(move || {
             let result =
-                Config::persist_colors(&request.common_dir, &request.updates, &request.fallback);
-            let _ = sender.try_send(ColorPersistenceResult {
+                Config::persist_mutation(&request.common_dir, &request.mutation, &request.fallback);
+            let _ = sender.try_send(ConfigPersistenceResult {
                 sequence: request.sequence,
                 result,
             });
@@ -419,10 +504,7 @@ impl TerminalGuard {
         if keyboard_enhanced
             && let Err(error) = execute!(
                 stdout(),
-                PushKeyboardEnhancementFlags(
-                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                )
+                PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
             )
         {
             let _ = execute!(stdout(), LeaveAlternateScreen);
@@ -431,6 +513,13 @@ impl TerminalGuard {
         }
         Ok(Self { keyboard_enhanced })
     }
+}
+
+fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
 }
 
 impl Drop for TerminalGuard {
@@ -451,28 +540,131 @@ fn restore_terminal(writer: &mut impl Write, keyboard_enhanced: bool) -> io::Res
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Arc;
 
-    use stackmap::model::BranchId;
+    use stackmap::model::{
+        Branch, BranchId, ConfiguredUpstream, DiffState, GraphiteProvenance, RemoteRefEvidence,
+        RepositorySnapshot, RepositoryState,
+    };
 
     use super::*;
 
-    fn request(sequence: u64) -> ColorWriteRequest {
-        ColorWriteRequest {
+    fn request(sequence: u64) -> ConfigWriteRequest {
+        let mut mutation = stackmap::config::ConfigMutation::default();
+        mutation.set_color(BranchId::new("stack"), None);
+        ConfigWriteRequest {
             sequence,
             common_dir: PathBuf::from("/tmp/stackmap-color-test"),
-            updates: std::collections::BTreeMap::from([(BranchId::new("stack"), None)]),
+            mutation,
             fallback: Config::default(),
         }
     }
 
+    fn config_snapshot(common_dir: PathBuf) -> Arc<RepositorySnapshot> {
+        let branch = |name: &str, current: bool| Branch {
+            id: BranchId::new(name),
+            oid: Arc::from(format!("oid-{name}")),
+            parent: None,
+            diff_parent: None,
+            stack_root: BranchId::new(name),
+            trunk: Some(BranchId::new("main")),
+            graphite: GraphiteProvenance::Tracked,
+            committed_at: 1,
+            current,
+            dirty: false,
+            worktree: None,
+            configured_upstream: ConfiguredUpstream::None,
+            remote_ref: RemoteRefEvidence::NotRequested,
+            diff: DiffState::Loading,
+            pr: None,
+        };
+        let branches = vec![branch("main", true), branch("alpha", false)];
+        Arc::new(RepositorySnapshot {
+            generation: 1,
+            root: PathBuf::from("/repo"),
+            git_dir: common_dir.clone(),
+            common_dir,
+            repository_id: Arc::from("config-shutdown-test"),
+            default_trunk: Some(BranchId::new("main")),
+            configured_trunks: Arc::from([BranchId::new("main")]),
+            trunks: Arc::from([BranchId::new("main")]),
+            graphite_children: Arc::from([(
+                BranchId::new("main"),
+                Arc::from([BranchId::new("alpha")]),
+            )]),
+            branch_index: RepositorySnapshot::index_branches(&branches),
+            branches: branches.into(),
+            state: RepositoryState::Ready,
+            graphite_status: Arc::from("fixture"),
+            stale_error: None,
+        })
+    }
+
     #[test]
     fn color_queue_keeps_one_active_and_only_the_latest_pending_write() {
-        let mut queue = ColorPersistenceQueue::default();
+        let mut queue = ConfigPersistenceQueue::default();
         assert_eq!(queue.submit(request(1)).unwrap().sequence, 1);
         assert!(queue.submit(request(2)).is_none());
         assert!(queue.submit(request(3)).is_none());
         assert_eq!(queue.complete().unwrap().sequence, 3);
         assert!(queue.complete().is_none());
+    }
+
+    #[test]
+    fn immediate_quit_flushes_active_and_latest_pending_config_mutations() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::default();
+        app.apply_snapshot(config_snapshot(directory.path().to_owned()));
+        app.selected = Some(BranchId::new("alpha"));
+        let Action::PersistConfig(color) = app.handle_key(Key::Character('c')) else {
+            panic!("color mutation");
+        };
+        let Action::PersistConfig(archive) = app.handle_key(Key::Character('x')) else {
+            panic!("archive mutation");
+        };
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut queue = ConfigPersistenceQueue::default();
+        let start = queue.submit(color).expect("first write starts");
+        spawn_config_persistence(start, sender.clone()).unwrap();
+        assert!(queue.submit(archive).is_none());
+
+        flush_config_persistence(&mut app, &mut queue, &sender, &receiver).unwrap();
+
+        let saved = Config::load(directory.path()).unwrap();
+        assert_eq!(saved.color(&BranchId::new("alpha")), Some("#7aa2f7"));
+        assert!(saved.is_archived(&BranchId::new("alpha")));
+    }
+
+    #[test]
+    fn final_shutdown_write_failure_retries_once_then_returns_visible_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let invalid_common_dir = directory.path().join("not-a-directory");
+        std::fs::write(&invalid_common_dir, "file blocks config directory creation").unwrap();
+        let mut app = App::default();
+        app.apply_snapshot(config_snapshot(invalid_common_dir));
+        app.selected = Some(BranchId::new("alpha"));
+        let Action::PersistConfig(request) = app.handle_key(Key::Character('c')) else {
+            panic!("color mutation");
+        };
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut queue = ConfigPersistenceQueue::default();
+        let start = queue.submit(request).expect("write starts");
+        spawn_config_persistence(start, sender.clone()).unwrap();
+        let initial = receiver.recv().unwrap();
+        assert!(initial.result.is_err());
+        app.finish_config_persistence(initial.sequence, initial.result);
+        assert!(queue.complete().is_none());
+        assert!(queue.active.is_none());
+
+        let error = flush_config_persistence(&mut app, &mut queue, &sender, &receiver)
+            .expect_err("the deterministic shutdown retry must surface its failure");
+
+        assert!(
+            error
+                .to_string()
+                .contains("could not be saved during shutdown after one retry")
+        );
+        assert!(queue.active.is_none());
     }
 
     #[test]
@@ -484,6 +676,15 @@ mod tests {
         let mut fallback = Vec::new();
         restore_terminal(&mut fallback, false).unwrap();
         assert_eq!(fallback, b"\x1b[?1049l");
+    }
+
+    #[test]
+    fn enhanced_terminals_request_complete_modifier_reporting() {
+        let flags = keyboard_enhancement_flags();
+        assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
+        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
     }
 
     #[test]

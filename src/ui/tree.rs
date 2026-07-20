@@ -9,8 +9,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::App;
-use crate::model::topology::{ConnectorRow, DividerRow, Emphasis, ProjectedRow, ProjectionEntry};
-use crate::model::{Branch, BranchId, DiffState};
+use crate::model::topology::{
+    ArchiveMode, ConnectorRow, DividerRow, Emphasis, ProjectedRow, ProjectionEntry, StackLabelRow,
+};
+use crate::model::{Branch, BranchId, ConfiguredUpstream, DiffState, RemoteRefEvidence};
 
 use super::layout::{ColumnRange, RenderGeometry, WidthMode, width_mode};
 use super::theme::{current_background, selected_background, stack_color, trunk_color};
@@ -61,7 +63,11 @@ pub fn render_with_mode(
     if app.projection.selectable.is_empty() {
         frame.render_widget(
             Paragraph::new(if app.filter.is_empty() {
-                "No local branches"
+                if matches!(app.archive_mode, ArchiveMode::Archive) {
+                    "No archived branches · press a to return to Active"
+                } else {
+                    "No local branches"
+                }
             } else {
                 "No branches match the filter"
             }),
@@ -99,6 +105,9 @@ pub fn render_with_mode(
         let visual_row = start + offset;
         let line = match entry {
             ProjectionEntry::Section(section) => section_line(&section.title, geometry),
+            ProjectionEntry::StackLabel(label) => {
+                stack_label_line(app, visual_row, label, geometry)
+            }
             ProjectionEntry::Divider(divider) => divider_line(app, visual_row, divider, geometry),
             ProjectionEntry::Branch(row) => {
                 let Some(branch) = snapshot.branch(&row.branch) else {
@@ -158,6 +167,33 @@ fn section_line(title: &str, geometry: RenderGeometry) -> Line<'static> {
     cells_to_line(cells, None)
 }
 
+fn stack_label_line(
+    app: &App,
+    visual_row: usize,
+    label: &StackLabelRow,
+    geometry: RenderGeometry,
+) -> Line<'static> {
+    let mut cells = blank_cells(geometry.width);
+    let (bits, styles) = rail_bits(app, visual_row, geometry);
+    paint_bits(&mut cells, &bits, &styles, geometry.metadata_start);
+    if geometry.lane_overflows(label.lane) {
+        paint_overflow_cue(&mut cells, geometry);
+    }
+    put_text(
+        &mut cells,
+        geometry.name_x(label.lane),
+        geometry.name_width(label.lane),
+        &label.text,
+        emphasized(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+            label.emphasis,
+        ),
+    );
+    cells_to_line(cells, None)
+}
+
 fn divider_line(
     app: &App,
     visual_row: usize,
@@ -169,12 +205,34 @@ fn divider_line(
     match divider {
         DividerRow::Connector(connector) => {
             add_connector(app, connector, geometry, &mut bits, &mut styles);
+            if geometry.lane_overflows(connector.from_lane)
+                || geometry.lane_overflows(connector.to_lane)
+            {
+                paint_overflow_cue(&mut cells, geometry);
+            }
         }
         DividerRow::Placeholder(placeholder) => {
             let x = geometry.lane_x(placeholder.lane);
             if x < geometry.metadata_start {
                 bits[x] |= UP | DOWN;
                 styles[x] = identity_style(app, &placeholder.stack_id, false, placeholder.emphasis);
+            }
+            if geometry.lane_overflows(placeholder.lane) {
+                paint_overflow_cue(&mut cells, geometry);
+            }
+            if matches!(app.archive_mode, ArchiveMode::Archive) {
+                let style = identity_style(app, &placeholder.stack_id, false, placeholder.emphasis)
+                    .add_modifier(Modifier::DIM);
+                if x < geometry.metadata_start {
+                    set_symbol(&mut cells, x, "○", style);
+                }
+                put_text(
+                    &mut cells,
+                    geometry.name_x(placeholder.lane),
+                    geometry.name_width(placeholder.lane),
+                    placeholder.branch.0.as_ref(),
+                    style,
+                );
             }
         }
         DividerRow::Spacer { .. } => {}
@@ -193,7 +251,21 @@ fn branch_line(
 ) -> Line<'static> {
     let selected = app.selected.as_ref() == Some(&branch.id);
     let background = if selected {
-        Some(selected_background())
+        let accent = if row.is_trunk {
+            trunk_color()
+        } else {
+            let repository_id = app
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.repository_id.as_ref())
+                .unwrap_or_default();
+            stack_color(repository_id, &row.stack_id, &app.config)
+        };
+        Some(if accent == Color::Reset {
+            selected_background()
+        } else {
+            accent
+        })
     } else if branch.current {
         Some(current_background())
     } else {
@@ -205,7 +277,13 @@ fn branch_line(
 
     let mut identity = identity_style(app, &row.stack_id, row.is_trunk, row.emphasis);
     if selected {
-        identity = identity.add_modifier(Modifier::BOLD);
+        identity = if background == Some(selected_background()) {
+            identity.add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        };
     }
     if row.context_only {
         identity = identity.add_modifier(Modifier::DIM);
@@ -226,9 +304,20 @@ fn branch_line(
         if lane_x < geometry.metadata_start {
             set_symbol(&mut cells, lane_x, "○", identity);
         }
+        if geometry.lane_overflows(row.lane) {
+            paint_overflow_cue(&mut cells, geometry);
+        }
     }
     if selected {
         set_symbol(&mut cells, 1, "›", identity);
+    }
+    if app.archive_range_contains(&branch.id) {
+        set_symbol(
+            &mut cells,
+            1,
+            "■",
+            Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        );
     }
 
     let name_x = geometry.name_x(row.lane);
@@ -243,43 +332,174 @@ fn branch_line(
     );
 
     let metadata_emphasis = row.emphasis;
-    if let Some(range) = geometry.time {
-        put_right(
+    if matches!(app.archive_mode, ArchiveMode::Archive) {
+        paint_archive_evidence(&mut cells, branch, geometry, metadata_emphasis);
+    } else {
+        if let Some(range) = geometry.time {
+            put_right(
+                &mut cells,
+                range,
+                &relative_time(branch.committed_at, now),
+                emphasized(Style::default().fg(Color::Gray), metadata_emphasis),
+            );
+        }
+        paint_diff(&mut cells, geometry.diff, &branch.diff, metadata_emphasis);
+        paint_worktree(
             &mut cells,
-            range,
-            &relative_time(branch.committed_at, now),
-            emphasized(Style::default().fg(Color::Gray), metadata_emphasis),
+            geometry.worktree,
+            branch.worktree.as_deref(),
+            metadata_emphasis,
         );
-    }
-    paint_diff(&mut cells, geometry.diff, &branch.diff, metadata_emphasis);
-    paint_worktree(
-        &mut cells,
-        geometry.worktree,
-        branch.worktree.as_deref(),
-        metadata_emphasis,
-    );
-    if let Some(range) = geometry.pr
-        && let Some(pr) = &branch.pr
-    {
-        put_right(
-            &mut cells,
-            range,
-            &format!("#{}", pr.number),
-            emphasized(Style::default().fg(Color::Yellow), metadata_emphasis),
-        );
+        if let Some(range) = geometry.pr
+            && let Some(pr) = &branch.pr
+        {
+            put_right(
+                &mut cells,
+                range,
+                &format!("#{}", pr.number),
+                emphasized(Style::default().fg(Color::Yellow), metadata_emphasis),
+            );
+        }
     }
 
     cells_to_line(cells, background)
 }
 
-fn rail_bits(app: &App, visual_row: usize, geometry: RenderGeometry) -> (Vec<u8>, Vec<Style>) {
-    let mut bits = vec![0; geometry.metadata_start];
-    let mut styles = vec![Style::default(); geometry.metadata_start];
-    for lane in 0..app.projection.lane_count {
-        let x = geometry.lane_x(lane);
-        if x >= geometry.metadata_start {
-            break;
+fn paint_archive_evidence(
+    cells: &mut [RenderCell],
+    branch: &Branch,
+    geometry: RenderGeometry,
+    emphasis: Emphasis,
+) {
+    let range = ColumnRange {
+        x: geometry.metadata_start,
+        width: geometry.width.saturating_sub(geometry.metadata_start),
+    };
+    let compact = range.width < 20;
+    let mut badges = Vec::with_capacity(3);
+    if let Some(path) = branch.worktree.as_deref() {
+        badges.push(if compact {
+            "⎇".to_owned()
+        } else {
+            let basename = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("worktree");
+            format!("⎇ {}", truncate(basename, 10))
+        });
+    }
+    if let Some(upstream) = upstream_badge(&branch.configured_upstream, compact) {
+        badges.push(upstream);
+    }
+    badges.push(remote_badge(&branch.remote_ref, compact));
+    let label = truncate(&badges.join(" "), range.width);
+    let color = match branch.remote_ref {
+        RemoteRefEvidence::Contained { .. } => Color::Green,
+        RemoteRefEvidence::LocalOnly { .. } => Color::Yellow,
+        RemoteRefEvidence::Checking
+        | RemoteRefEvidence::NotRequested
+        | RemoteRefEvidence::Unavailable { .. } => Color::DarkGray,
+    };
+    put_text(
+        cells,
+        range.x,
+        range.width,
+        &label,
+        emphasized(Style::default().fg(color), emphasis),
+    );
+}
+
+fn upstream_badge(upstream: &ConfiguredUpstream, compact: bool) -> Option<String> {
+    Some(match upstream {
+        ConfiguredUpstream::None => return None,
+        ConfiguredUpstream::Equal { .. } => {
+            if compact {
+                "=".into()
+            } else {
+                "up =".into()
+            }
         }
+        ConfiguredUpstream::Ahead { ahead, .. } => {
+            if compact {
+                format!("↑{ahead}")
+            } else {
+                format!("up ↑{ahead}")
+            }
+        }
+        ConfiguredUpstream::Behind { behind, .. } => {
+            if compact {
+                format!("↓{behind}")
+            } else {
+                format!("up ↓{behind}")
+            }
+        }
+        ConfiguredUpstream::Diverged { ahead, behind, .. } => {
+            if compact {
+                format!("↑{ahead}↓{behind}")
+            } else {
+                format!("up ↑{ahead}↓{behind}")
+            }
+        }
+        ConfiguredUpstream::Gone { .. } => {
+            if compact {
+                "gone".into()
+            } else {
+                "up gone".into()
+            }
+        }
+        ConfiguredUpstream::Unavailable { .. } => {
+            if compact {
+                "up?".into()
+            } else {
+                "upstream ?".into()
+            }
+        }
+    })
+}
+
+fn remote_badge(evidence: &RemoteRefEvidence, compact: bool) -> String {
+    match evidence {
+        RemoteRefEvidence::Contained { .. } => {
+            if compact {
+                "r✓"
+            } else {
+                "remote-ref ✓"
+            }
+        }
+        RemoteRefEvidence::LocalOnly { .. } => {
+            if compact {
+                "local"
+            } else {
+                "local only"
+            }
+        }
+        RemoteRefEvidence::Checking => {
+            if compact {
+                "…"
+            } else {
+                "checking…"
+            }
+        }
+        RemoteRefEvidence::NotRequested | RemoteRefEvidence::Unavailable { .. } => {
+            if compact {
+                "r?"
+            } else {
+                "remote ?"
+            }
+        }
+    }
+    .into()
+}
+
+fn rail_bits(app: &App, visual_row: usize, geometry: RenderGeometry) -> (Vec<u8>, Vec<Style>) {
+    let mut bits = vec![0; geometry.graph_buffer_width()];
+    let mut styles = vec![Style::default(); geometry.graph_buffer_width()];
+    for lane in 0..=geometry
+        .last_visible_lane
+        .min(app.projection.lane_count.saturating_sub(1))
+    {
+        let x = geometry.lane_x(lane);
         let Some(span) = app.projection.active_lane_span(lane, visual_row) else {
             continue;
         };
@@ -310,11 +530,17 @@ fn add_connector(
 ) {
     let left = geometry.lane_x(connector.to_lane);
     let right = geometry.lane_x(connector.from_lane);
-    if left >= geometry.metadata_start {
+    if bits.is_empty() || left >= bits.len() {
         return;
     }
-    let right = right.min(geometry.metadata_start.saturating_sub(1));
-    let style = identity_style(app, &connector.stack_id, false, connector.emphasis);
+    let right = right.min(bits.len().saturating_sub(1));
+    let child_style = identity_style(app, &connector.stack_id, false, connector.emphasis);
+    let parent_style = connector
+        .parent
+        .as_ref()
+        .and_then(|parent| app.projection.row_for(parent))
+        .map(|row| identity_style(app, &row.stack_id, row.is_trunk, row.emphasis))
+        .unwrap_or(styles[left]);
     for x in left..=right {
         if x > left {
             bits[x] |= LEFT;
@@ -322,7 +548,7 @@ fn add_connector(
         if x < right {
             bits[x] |= RIGHT;
         }
-        styles[x] = style;
+        styles[x] = if x == left { parent_style } else { child_style };
     }
 }
 
@@ -332,6 +558,17 @@ fn paint_bits(cells: &mut [RenderCell], bits: &[u8], styles: &[Style], limit: us
             set_symbol(cells, x, glyph, styles[x]);
         }
     }
+}
+
+fn paint_overflow_cue(cells: &mut [RenderCell], geometry: RenderGeometry) {
+    set_symbol(
+        cells,
+        geometry.overflow_cue_x(),
+        "»",
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
 }
 
 fn bit_glyph(bits: u8) -> Option<&'static str> {
@@ -347,7 +584,7 @@ fn bit_glyph(bits: u8) -> Option<&'static str> {
         9 => Some("└"),
         5 => Some("┘"),
         12 | 4 | 8 => Some("─"),
-        3 | 1 | 2 => Some("│"),
+        1..=3 => Some("│"),
         _ => Some("┼"),
     }
 }
@@ -571,4 +808,126 @@ pub fn detail(branch: &Branch) -> String {
         worktree,
         pr
     )
+}
+
+pub fn local_detail(branch: &Branch) -> String {
+    let worktree = branch
+        .worktree
+        .as_ref()
+        .map(|path| format!("Worktree: {}", path.display()))
+        .unwrap_or_else(|| "Worktree: not checked out".into());
+    format!(
+        "{}\nLast edited: {}\n{}\n{}\n{}\nArchive view: local refs only · no fetch",
+        branch.id,
+        exact_time(branch.committed_at),
+        worktree,
+        upstream_detail(&branch.configured_upstream),
+        remote_detail(&branch.remote_ref),
+    )
+}
+
+pub fn evidence_source_footer(branch: &Branch) -> String {
+    match &branch.remote_ref {
+        RemoteRefEvidence::Contained {
+            source_token,
+            checked_at,
+            ..
+        }
+        | RemoteRefEvidence::LocalOnly {
+            source_token,
+            checked_at,
+        } => format!(
+            "local-ref token {:016x} @ {}",
+            source_token,
+            system_time(*checked_at)
+        ),
+        RemoteRefEvidence::Unavailable {
+            source_token,
+            checked_at,
+            ..
+        } => format!(
+            "local-ref token {} @ {}",
+            source_token
+                .map(|token| format!("{token:016x}"))
+                .unwrap_or_else(|| "unknown".into()),
+            system_time(*checked_at)
+        ),
+        RemoteRefEvidence::Checking => "local-ref evidence checking…".into(),
+        RemoteRefEvidence::NotRequested => "local-ref evidence not checked".into(),
+    }
+}
+
+fn upstream_detail(upstream: &ConfiguredUpstream) -> String {
+    match upstream {
+        ConfiguredUpstream::None => "Configured upstream: none".into(),
+        ConfiguredUpstream::Equal { reference } => {
+            format!("Configured upstream: {reference} (equal)")
+        }
+        ConfiguredUpstream::Ahead { reference, ahead } => {
+            format!("Configured upstream: {reference} (ahead {ahead})")
+        }
+        ConfiguredUpstream::Behind { reference, behind } => {
+            format!("Configured upstream: {reference} (behind {behind})")
+        }
+        ConfiguredUpstream::Diverged {
+            reference,
+            ahead,
+            behind,
+        } => format!("Configured upstream: {reference} (ahead {ahead}, behind {behind})"),
+        ConfiguredUpstream::Gone { reference } => {
+            format!("Configured upstream: {reference} (gone from local refs)")
+        }
+        ConfiguredUpstream::Unavailable { reference, reason } => format!(
+            "Configured upstream: {} (unavailable: {reason})",
+            reference.as_deref().unwrap_or("unknown")
+        ),
+    }
+}
+
+fn remote_detail(evidence: &RemoteRefEvidence) -> String {
+    match evidence {
+        RemoteRefEvidence::NotRequested => "Remote-ref evidence: not checked".into(),
+        RemoteRefEvidence::Checking => "Remote-ref evidence: checking local refs…".into(),
+        RemoteRefEvidence::Contained {
+            reference,
+            source_token,
+            checked_at,
+        } => format!(
+            "Remote-ref evidence: contained in {reference}; source {:016x} @ {}",
+            source_token,
+            system_time(*checked_at)
+        ),
+        RemoteRefEvidence::LocalOnly {
+            source_token,
+            checked_at,
+        } => format!(
+            "Remote-ref evidence: local only; source {:016x} @ {}",
+            source_token,
+            system_time(*checked_at)
+        ),
+        RemoteRefEvidence::Unavailable {
+            reason,
+            source_token,
+            checked_at,
+        } => format!(
+            "Remote-ref evidence: unavailable ({reason}); source {} @ {}",
+            source_token
+                .map(|token| format!("{token:016x}"))
+                .unwrap_or_else(|| "unknown".into()),
+            system_time(*checked_at)
+        ),
+    }
+}
+
+fn system_time(time: SystemTime) -> String {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| DateTime::from_timestamp(duration.as_secs() as i64, 0))
+        .map(|value| {
+            value
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M:%S %:z")
+                .to_string()
+        })
+        .unwrap_or_else(|| "unavailable".into())
 }

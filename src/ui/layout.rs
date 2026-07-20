@@ -21,6 +21,8 @@ pub struct RenderGeometry {
     pub width: usize,
     pub mode: WidthMode,
     pub effective_pitch: usize,
+    pub last_visible_lane: usize,
+    pub graph_max_x: usize,
     pub metadata_start: usize,
     pub time: Option<ColumnRange>,
     pub diff: ColumnRange,
@@ -69,27 +71,30 @@ impl RenderGeometry {
             WidthMode::Medium => 3,
             WidthMode::Wide => 4,
         };
+        const MINIMUM_NAME_WIDTH: usize = 8;
+        let maximum_center = metadata_start.saturating_sub(MINIMUM_NAME_WIDTH + 3);
+        let maximum_pitch = maximum_center.saturating_sub(3).max(1);
         let effective_pitch = match requested {
-            LanePitch::Auto => automatic,
-            LanePitch::Fixed(requested) => {
-                let denominator = lane_count.saturating_sub(2);
-                let maximum = if denominator == 0 {
-                    requested as usize
-                } else {
-                    metadata_start
-                        .saturating_sub(6)
-                        .checked_div(denominator)
-                        .unwrap_or(1)
-                        .max(1)
-                };
-                (requested as usize).min(maximum).max(1)
-            }
+            LanePitch::Auto => automatic.min(maximum_pitch),
+            LanePitch::Fixed(requested) => (requested as usize).min(maximum_pitch).max(1),
+        };
+        let maximum_lane = lane_count.saturating_sub(1);
+        let last_visible_lane = if maximum_lane == 0 || maximum_center < 3 {
+            0
+        } else {
+            (1 + maximum_center.saturating_sub(3) / effective_pitch).min(maximum_lane)
+        };
+        let graph_max_x = match last_visible_lane {
+            0 => 0,
+            lane => 3 + (lane - 1) * effective_pitch,
         };
 
         Self {
             width,
             mode,
             effective_pitch,
+            last_visible_lane,
+            graph_max_x,
             metadata_start,
             time,
             diff,
@@ -99,7 +104,7 @@ impl RenderGeometry {
     }
 
     pub fn lane_x(self, lane: usize) -> usize {
-        match lane {
+        match lane.min(self.last_visible_lane) {
             0 => 0,
             lane => 3 + (lane - 1) * self.effective_pitch,
         }
@@ -112,6 +117,18 @@ impl RenderGeometry {
     pub fn name_width(self, lane: usize) -> usize {
         self.metadata_start
             .saturating_sub(self.name_x(lane).saturating_add(1))
+    }
+
+    pub fn lane_overflows(self, lane: usize) -> bool {
+        lane > self.last_visible_lane
+    }
+
+    pub fn overflow_cue_x(self) -> usize {
+        self.graph_max_x.saturating_add(1)
+    }
+
+    pub fn graph_buffer_width(self) -> usize {
+        self.graph_max_x.saturating_add(1)
     }
 }
 

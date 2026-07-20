@@ -2,11 +2,14 @@ mod common;
 
 use std::fs;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use stackmap::adapters::git::GitAdapter;
-use stackmap::app::{Action, App, LanePitch, MutationState, Overlay, ViewScope};
-use stackmap::config::{Config, config_path};
+use stackmap::app::{
+    Action, App, LanePitch, MutationState, Overlay, ReconciliationOperation, ViewScope,
+};
+use stackmap::config::{ArchiveMutation, Config, ConfigMutation, config_path};
 use stackmap::events::{Input, Key};
 use stackmap::model::BranchId;
 use stackmap::model::topology::{OrderMode, ProjectionEntry};
@@ -163,12 +166,12 @@ fn color_picker_previews_rolls_back_and_commits_one_write() {
 
     app.handle_key(Key::Character('C'));
     app.handle_key(Key::Down);
-    let Action::PersistColor(request) = app.handle_key(Key::Enter) else {
+    let Action::PersistConfig(request) = app.handle_key(Key::Enter) else {
         panic!("color picker commit should persist exactly once");
     };
-    assert_eq!(request.updates.len(), 1);
+    assert_eq!(request.mutation.color_updates.len(), 1);
     assert_eq!(
-        request.updates.get(&BranchId::new("alpha")),
+        request.mutation.color_updates.get(&BranchId::new("alpha")),
         Some(&Some(Arc::from("#7aa2f7")))
     );
     assert_eq!(app.overlay, Overlay::None);
@@ -211,6 +214,64 @@ fn color_picker_refuses_trunks_and_closes_if_its_target_disappears() {
             .unwrap()
             .contains("color picker closed")
     );
+}
+
+#[test]
+fn stack_name_editor_prefills_saves_clears_cancels_and_refuses_trunks() {
+    let mut app = App::default();
+    app.apply_snapshot(view_snapshot());
+    app.selected = Some(BranchId::new("alpha"));
+
+    app.handle_key(Key::Character('n'));
+    assert!(matches!(app.overlay, Overlay::StackNameEditor(_)));
+    for character in "Release train".chars() {
+        app.handle_key(Key::Character(character));
+    }
+    let Action::PersistConfig(request) = app.handle_key(Key::Enter) else {
+        panic!("saving a stack name should persist once");
+    };
+    assert_eq!(
+        request
+            .mutation
+            .stack_name_updates
+            .get(&BranchId::new("alpha")),
+        Some(&Some(Arc::from("Release train")))
+    );
+    assert!(app.projection.entries.iter().any(|entry| {
+        matches!(entry, ProjectionEntry::StackLabel(label) if label.text.as_ref() == "Release train")
+    }));
+
+    app.handle_key(Key::Character('n'));
+    let Overlay::StackNameEditor(editor) = &app.overlay else {
+        panic!("name editor should reopen");
+    };
+    assert_eq!(editor.draft, "Release train");
+    app.handle_key(Key::Escape);
+    assert_eq!(
+        app.config.stack_name(&BranchId::new("alpha")),
+        Some("Release train")
+    );
+
+    app.handle_key(Key::Character('n'));
+    for _ in 0.."Release train".chars().count() {
+        app.handle_key(Key::Backspace);
+    }
+    let Action::PersistConfig(request) = app.handle_key(Key::Enter) else {
+        panic!("clearing a stack name should persist once");
+    };
+    assert_eq!(
+        request
+            .mutation
+            .stack_name_updates
+            .get(&BranchId::new("alpha")),
+        Some(&None)
+    );
+    assert_eq!(app.config.stack_name(&BranchId::new("alpha")), None);
+
+    app.selected = Some(BranchId::new("main"));
+    app.handle_key(Key::Character('n'));
+    assert_eq!(app.overlay, Overlay::None);
+    assert!(app.message.as_deref().unwrap().contains("trunk"));
 }
 
 #[test]
@@ -563,36 +624,108 @@ fn deletion_requires_exact_blocking_confirmation() {
         common::branch("merged", None, "merged", false),
     ]));
     app.selected = Some(BranchId::new("merged"));
-    assert_eq!(app.handle_key(Key::Character('x')), Action::None);
+    app.begin_delete_confirmation();
     assert!(matches!(app.mutation, MutationState::ConfirmingDeletion(_)));
     assert_eq!(app.handle_key(Key::Character('o')), Action::None);
     assert_eq!(app.handle_key(Key::Character('n')), Action::None);
     assert!(matches!(app.mutation, MutationState::Idle));
 
-    app.handle_key(Key::Character('x'));
+    app.begin_delete_confirmation();
     let action = app.handle_key(Key::Character('y'));
     assert!(matches!(action, Action::Delete(_)));
     assert!(matches!(app.mutation, MutationState::Deleting(_)));
 }
 
 #[test]
-fn deletion_refuses_current_trunk_worktree_and_degraded_branches() {
-    let mut current = common::branch("main", None, "main", true);
-    current.trunk = Some(BranchId::new("main"));
-    current.graphite = stackmap::model::GraphiteProvenance::Tracked;
+fn lowercase_x_is_only_reversible_and_uppercase_x_requires_press_confirmation_in_both_modes() {
+    let mut app = App::default();
+    app.apply_snapshot(common::snapshot(vec![
+        common::branch("main", None, "main", true),
+        common::branch("merged", None, "merged", false),
+    ]));
+    app.selected = Some(BranchId::new("merged"));
+
+    let active_archive = app.handle_input(Input::press(Key::Character('x')));
+    assert!(matches!(active_archive, Action::PersistConfig(_)));
+    assert!(!matches!(active_archive, Action::Delete(_)));
+    assert!(matches!(app.mutation, MutationState::Idle));
+
+    app.handle_key(Key::Character('a'));
+    app.selected = Some(BranchId::new("merged"));
+    let archive_restore = app.handle_input(Input::press(Key::Character('x')));
+    assert!(matches!(archive_restore, Action::PersistConfig(_)));
+    assert!(!matches!(archive_restore, Action::Delete(_)));
+    assert!(matches!(app.mutation, MutationState::Idle));
+
+    app.handle_key(Key::Character('a'));
+    app.selected = Some(BranchId::new("merged"));
+    assert!(matches!(
+        app.handle_key(Key::Character('x')),
+        Action::PersistConfig(_)
+    ));
+    app.handle_key(Key::Character('a'));
+    app.selected = Some(BranchId::new("merged"));
+    assert_eq!(
+        app.handle_input(Input::repeat(Key::Character('X'))),
+        Action::None
+    );
+    assert!(matches!(app.mutation, MutationState::Idle));
+    assert_eq!(
+        app.handle_input(Input::press(Key::Character('X'))),
+        Action::None
+    );
+    assert!(matches!(app.mutation, MutationState::ConfirmingDeletion(_)));
+    assert_eq!(app.handle_key(Key::Character('n')), Action::None);
+    assert!(matches!(app.mutation, MutationState::Idle));
+
+    app.handle_key(Key::Character('a'));
+    app.selected = Some(BranchId::new("merged"));
+    assert_eq!(app.handle_key(Key::Character('X')), Action::None);
+    let active_delete = app.handle_key(Key::Character('y'));
+    assert!(matches!(active_delete, Action::Delete(_)));
+}
+
+#[test]
+fn uppercase_delete_preserves_current_trunk_worktree_degraded_and_nonleaf_refusals() {
+    let current = common::branch("current", None, "current", true);
+    let mut trunk = common::branch("main", None, "main", false);
+    trunk.trunk = Some(BranchId::new("main"));
+    trunk.graphite = stackmap::model::GraphiteProvenance::Tracked;
     let mut linked = common::branch("linked", None, "linked", false);
     linked.worktree = Some("/tmp/linked".into());
     let mut degraded = common::branch("degraded", None, "degraded", false);
     degraded.graphite = stackmap::model::GraphiteProvenance::Degraded;
+    let mut parent = common::branch("parent", None, "parent", false);
+    parent.graphite = stackmap::model::GraphiteProvenance::Tracked;
+    let mut child = common::branch("child", Some("parent"), "parent", false);
+    child.graphite = stackmap::model::GraphiteProvenance::Tracked;
     let mut app = App::default();
-    app.apply_snapshot(common::snapshot(vec![current, linked, degraded]));
+    app.apply_snapshot(common::snapshot(vec![
+        current, trunk, linked, degraded, parent, child,
+    ]));
 
-    for branch in ["main", "linked", "degraded"] {
+    for branch in ["current", "main", "linked", "degraded", "parent"] {
         app.selected = Some(BranchId::new(branch));
-        assert_eq!(app.handle_key(Key::Character('x')), Action::None);
+        assert_eq!(app.handle_key(Key::Character('X')), Action::None);
         assert!(matches!(app.mutation, MutationState::Idle));
         assert!(app.message.is_some());
     }
+
+    app.selected = Some(BranchId::new("child"));
+    app.mark_stale(Arc::from("inventory refresh failed"));
+    assert_eq!(app.handle_key(Key::Character('X')), Action::None);
+    assert!(matches!(app.mutation, MutationState::Idle));
+    assert!(app.message.as_deref().unwrap().contains("stale"));
+    assert!(app.message.as_deref().unwrap().contains("press r"));
+
+    app.apply_snapshot(app.snapshot.clone().unwrap());
+    app.selected = Some(BranchId::new("child"));
+    assert_eq!(app.handle_key(Key::Character('X')), Action::None);
+    assert!(matches!(app.mutation, MutationState::ConfirmingDeletion(_)));
+    app.mark_stale(Arc::from("refresh failed during confirmation"));
+    assert_eq!(app.handle_key(Key::Character('y')), Action::None);
+    assert!(matches!(app.mutation, MutationState::Idle));
+    assert!(app.message.as_deref().unwrap().contains("stale"));
 }
 
 fn with_generation(
@@ -604,24 +737,162 @@ fn with_generation(
     Arc::new(snapshot)
 }
 
+fn deletion_cleanup_fixture() -> (
+    tempfile::TempDir,
+    App,
+    Arc<stackmap::model::RepositorySnapshot>,
+    Option<BranchId>,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let target = BranchId::new("delete-me");
+    let neighbor = BranchId::new("keep-me");
+    let mut seed = ConfigMutation::default();
+    seed.set_archived(target.clone(), true);
+    seed.set_archived(neighbor.clone(), true);
+    seed.set_archived(BranchId::new("other"), true);
+    seed.set_color(target.clone(), Some(Arc::from("#7aa2f7")));
+    seed.set_color(neighbor.clone(), Some(Arc::from("#bb9af7")));
+    Config::persist_mutation(directory.path(), &seed, &Config::default()).unwrap();
+
+    let mut snapshot = (*common::snapshot(vec![
+        common::branch("main", None, "main", true),
+        common::branch("delete-me", None, "delete-me", false),
+        common::branch("keep-me", None, "keep-me", false),
+        common::branch("other", None, "other", false),
+    ]))
+    .clone();
+    snapshot.generation = 20;
+    snapshot.common_dir = directory.path().to_owned();
+    let snapshot = Arc::new(snapshot);
+
+    let mut app = App::default();
+    app.apply_snapshot(snapshot.clone());
+    app.handle_key(Key::Character('a'));
+    app.selected = Some(target.clone());
+    let target_index = app.projection.branch_to_selectable[&target];
+    let nearby = app
+        .projection
+        .selectable
+        .get(target_index + 1)
+        .or_else(|| {
+            target_index
+                .checked_sub(1)
+                .and_then(|index| app.projection.selectable.get(index))
+        })
+        .cloned();
+    assert_eq!(app.handle_key(Key::Character('X')), Action::None);
+    assert!(matches!(
+        app.handle_key(Key::Character('y')),
+        Action::Delete(_)
+    ));
+    (directory, app, snapshot, nearby)
+}
+
+fn deletion_snapshot_without(
+    snapshot: &Arc<stackmap::model::RepositorySnapshot>,
+    target: &BranchId,
+    generation: u64,
+) -> Arc<stackmap::model::RepositorySnapshot> {
+    let mut changed = (**snapshot).clone();
+    changed.generation = generation;
+    let branches = changed
+        .branches
+        .iter()
+        .filter(|branch| &branch.id != target)
+        .cloned()
+        .collect::<Vec<_>>();
+    changed.branch_index = stackmap::model::RepositorySnapshot::index_branches(&branches);
+    changed.branches = Arc::from(branches);
+    Arc::new(changed)
+}
+
 #[test]
 fn checkout_reconciliation_ignores_a_pre_mutation_refresh_that_arrives_late() {
     let snapshot = common::snapshot(vec![
         common::branch("main", None, "main", true),
         common::branch("feature", None, "feature", false),
     ]);
-    let mut app = App::default();
+    let now = Instant::now();
+    let mut app = App::with_mutation_timing(Duration::from_secs(10), Duration::from_secs(2));
     app.apply_snapshot(with_generation(&snapshot, 5));
     app.selected = Some(BranchId::new("feature"));
     assert!(matches!(app.handle_key(Key::Enter), Action::Checkout(_)));
-    app.finish_checkout(Ok(()), 42);
-    app.apply_structural_snapshot(with_generation(&snapshot, 6), 41);
+    app.finish_checkout_at(Ok(()), 42, now);
+    app.apply_structural_snapshot_at(with_generation(&snapshot, 6), 41, now);
     assert!(matches!(
         app.mutation,
-        MutationState::Reconciling { request_epoch: 42 }
+        MutationState::Reconciling {
+            operation: ReconciliationOperation::Checkout { ref target, .. },
+            request_epoch: 42,
+            ..
+        } if target == &BranchId::new("feature")
     ));
-    app.apply_structural_snapshot(with_generation(&snapshot, 7), 42);
+
+    let matching = common::snapshot(vec![
+        common::branch("main", None, "main", false),
+        common::branch("feature", None, "feature", true),
+    ]);
+    app.apply_structural_snapshot_at(with_generation(&matching, 7), 42, now);
     assert!(matches!(app.mutation, MutationState::Idle));
+    assert_eq!(
+        app.message, None,
+        "successful reconciliation must not leave the footer stuck on progress"
+    );
+    assert_eq!(app.notice(), Some("checked out feature"));
+    assert!(!app.tick(now + Duration::from_secs(1)));
+    assert!(app.tick(now + Duration::from_secs(2)));
+    assert_eq!(app.notice(), None);
+}
+
+#[test]
+fn causal_checkout_mismatch_unlocks_with_targeted_refresh_guidance() {
+    let now = Instant::now();
+    let snapshot = common::snapshot(vec![
+        common::branch("main", None, "main", true),
+        common::branch("feature", None, "feature", false),
+    ]);
+    let mut app = App::with_mutation_timing(Duration::from_secs(10), Duration::from_secs(5));
+    app.apply_snapshot(with_generation(&snapshot, 5));
+    app.selected = Some(BranchId::new("feature"));
+    assert_eq!(
+        app.handle_key(Key::Enter),
+        Action::Checkout(BranchId::new("feature"))
+    );
+    app.finish_checkout_at(Ok(()), 42, now);
+
+    app.selected = Some(BranchId::new("main"));
+    app.apply_structural_snapshot_at(with_generation(&snapshot, 6), 42, now);
+
+    assert!(matches!(app.mutation, MutationState::Idle));
+    let notice = app.notice().expect("bounded mismatch notice");
+    assert!(notice.contains("feature"));
+    assert!(notice.contains("main"));
+    assert!(notice.contains("press r"));
+}
+
+#[test]
+fn checkout_reconciliation_deadline_unlocks_and_expires_deterministically() {
+    let now = Instant::now();
+    let snapshot = common::snapshot(vec![
+        common::branch("main", None, "main", true),
+        common::branch("feature", None, "feature", false),
+    ]);
+    let mut app = App::with_mutation_timing(Duration::from_secs(3), Duration::from_secs(2));
+    app.apply_snapshot(snapshot);
+    app.selected = Some(BranchId::new("feature"));
+    assert!(matches!(app.handle_key(Key::Enter), Action::Checkout(_)));
+    app.finish_checkout_at(Ok(()), 9, now);
+    app.mark_stale(Arc::from("refresh failed"));
+
+    assert!(!app.tick(now + Duration::from_secs(2)));
+    assert!(matches!(app.mutation, MutationState::Reconciling { .. }));
+    assert!(app.tick(now + Duration::from_secs(3)));
+    assert!(matches!(app.mutation, MutationState::Idle));
+    assert!(app.notice().unwrap().contains("press r"));
+    assert_eq!(app.refresh_error.as_deref(), Some("refresh failed"));
+    assert!(!app.tick(now + Duration::from_secs(4)));
+    assert!(app.tick(now + Duration::from_secs(5)));
+    assert_eq!(app.notice(), None);
 }
 
 #[test]
@@ -633,7 +904,7 @@ fn deletion_reconciliation_ignores_a_pre_mutation_refresh_that_arrives_late() {
     let mut app = App::default();
     app.apply_snapshot(with_generation(&snapshot, 8));
     app.selected = Some(BranchId::new("merged"));
-    app.handle_key(Key::Character('x'));
+    app.begin_delete_confirmation();
     assert!(matches!(
         app.handle_key(Key::Character('y')),
         Action::Delete(_)
@@ -642,9 +913,114 @@ fn deletion_reconciliation_ignores_a_pre_mutation_refresh_that_arrives_late() {
     app.apply_structural_snapshot(with_generation(&snapshot, 9), 17);
     assert!(matches!(
         app.mutation,
-        MutationState::Reconciling { request_epoch: 18 }
+        MutationState::Reconciling {
+            operation: ReconciliationOperation::Deletion { ref request, .. },
+            request_epoch: 18,
+            ..
+        } if request.branch == BranchId::new("merged") && request.expected_oid.as_ref() == "oid-merged"
     ));
     app.apply_structural_snapshot(with_generation(&snapshot, 10), 18);
+    assert!(matches!(app.mutation, MutationState::Idle));
+}
+
+#[test]
+fn successful_deletion_cleans_exact_config_identity_only_after_authoritative_absence() {
+    let (directory, mut app, snapshot, nearby) = deletion_cleanup_fixture();
+    let target = BranchId::new("delete-me");
+    app.finish_deletion(Ok(stackmap::adapters::git::DeleteOutcome::Deleted), 50);
+
+    app.apply_structural_snapshot(deletion_snapshot_without(&snapshot, &target, 21), 49);
+    assert!(app.config.is_archived(&target));
+    assert_eq!(app.config.color(&target), Some("#7aa2f7"));
+    assert!(app.take_config_write_request().is_none());
+    assert!(matches!(app.mutation, MutationState::Reconciling { .. }));
+
+    app.apply_structural_snapshot(deletion_snapshot_without(&snapshot, &target, 22), 50);
+    assert!(matches!(app.mutation, MutationState::Idle));
+    assert!(!app.config.is_archived(&target));
+    assert_eq!(app.config.color(&target), None);
+    assert!(app.config.is_archived(&BranchId::new("keep-me")));
+    assert_eq!(app.config.color(&BranchId::new("keep-me")), Some("#bb9af7"));
+    assert_eq!(app.selected, nearby);
+    let cleanup = app
+        .take_config_write_request()
+        .expect("verified deletion should enter the config outbox");
+    assert_eq!(
+        cleanup.mutation.archive_updates.get(&target),
+        Some(&ArchiveMutation::Prune)
+    );
+    assert_eq!(cleanup.mutation.color_updates.get(&target), Some(&None));
+    Config::persist_mutation(&cleanup.common_dir, &cleanup.mutation, &cleanup.fallback).unwrap();
+    app.finish_config_persistence(cleanup.sequence, Ok(()));
+    let saved = Config::load(directory.path()).unwrap();
+    assert!(!saved.is_archived(&target));
+    assert_eq!(saved.color(&target), None);
+    assert!(saved.is_archived(&BranchId::new("keep-me")));
+    assert_eq!(saved.color(&BranchId::new("keep-me")), Some("#bb9af7"));
+}
+
+#[test]
+fn deletion_does_not_clean_config_on_unchanged_error_or_same_name_new_oid() {
+    let target = BranchId::new("delete-me");
+
+    let (_directory, mut unchanged, snapshot, _) = deletion_cleanup_fixture();
+    unchanged.finish_deletion(Ok(stackmap::adapters::git::DeleteOutcome::Unchanged), 60);
+    unchanged.apply_structural_snapshot(deletion_snapshot_without(&snapshot, &target, 21), 60);
+    assert!(unchanged.config.is_archived(&target));
+    assert_eq!(unchanged.config.color(&target), Some("#7aa2f7"));
+    assert!(unchanged.take_config_write_request().is_none());
+
+    let (_directory, mut failed, snapshot, _) = deletion_cleanup_fixture();
+    failed.finish_deletion(Err(anyhow::anyhow!("provider refused")), 70);
+    failed.apply_structural_snapshot(deletion_snapshot_without(&snapshot, &target, 21), 70);
+    assert!(failed.config.is_archived(&target));
+    assert_eq!(failed.config.color(&target), Some("#7aa2f7"));
+    assert!(failed.take_config_write_request().is_none());
+
+    let (_directory, mut replaced, snapshot, _) = deletion_cleanup_fixture();
+    replaced.finish_deletion(Ok(stackmap::adapters::git::DeleteOutcome::Deleted), 80);
+    let mut replacement = (*snapshot).clone();
+    replacement.generation = 21;
+    let branches = Arc::make_mut(&mut replacement.branches);
+    branches
+        .iter_mut()
+        .find(|branch| branch.id == target)
+        .unwrap()
+        .oid = Arc::from("new-oid");
+    replaced.apply_structural_snapshot(Arc::new(replacement), 80);
+    assert!(replaced.config.is_archived(&target));
+    assert_eq!(replaced.config.color(&target), Some("#7aa2f7"));
+    assert!(replaced.take_config_write_request().is_none());
+    assert!(replaced.notice().unwrap().contains("changed"));
+}
+
+#[test]
+fn deletion_reconciliation_preserves_user_navigation_away_from_the_target() {
+    let (_directory, mut app, snapshot, nearby) = deletion_cleanup_fixture();
+    let target = BranchId::new("delete-me");
+    let user_choice = app
+        .projection
+        .selectable
+        .iter()
+        .find(|branch| **branch != target && Some((*branch).clone()) != nearby)
+        .cloned()
+        .expect("fixture has a non-nearby branch");
+    let target_index = app.projection.branch_to_selectable[&target];
+    let choice_index = app.projection.branch_to_selectable[&user_choice];
+    let key = if choice_index < target_index {
+        Key::Up
+    } else {
+        Key::Down
+    };
+    for _ in 0..target_index.abs_diff(choice_index) {
+        app.handle_key(key.clone());
+    }
+    assert_eq!(app.selected, Some(user_choice.clone()));
+
+    app.finish_deletion(Ok(stackmap::adapters::git::DeleteOutcome::Deleted), 90);
+    app.apply_structural_snapshot(deletion_snapshot_without(&snapshot, &target, 21), 90);
+
+    assert_eq!(app.selected, Some(user_choice));
     assert!(matches!(app.mutation, MutationState::Idle));
 }
 
@@ -654,6 +1030,8 @@ fn inconsistent_provider_deletion_blocks_further_mutation() {
     app.finish_deletion(Ok(stackmap::adapters::git::DeleteOutcome::Inconsistent), 18);
     assert!(matches!(app.mutation, MutationState::DeletionBlocked(_)));
     assert!(app.message.as_deref().unwrap().contains("inconsistent"));
+    assert!(!app.tick(Instant::now() + Duration::from_secs(60)));
+    assert!(matches!(app.mutation, MutationState::DeletionBlocked(_)));
 }
 
 #[test]
@@ -672,7 +1050,7 @@ fn color_input_updates_memory_without_waiting_for_a_contended_disk_lock() {
     let mut app = App::default();
     app.apply_snapshot(Arc::new(snapshot));
     app.selected = Some(BranchId::new("feature"));
-    let Action::PersistColor(request) = app.handle_key(Key::Character('c')) else {
+    let Action::PersistConfig(request) = app.handle_key(Key::Character('c')) else {
         panic!("color persistence action");
     };
     assert_eq!(app.config.color(&BranchId::new("feature")), Some("#7aa2f7"));
@@ -690,10 +1068,10 @@ fn stale_color_results_cannot_overwrite_the_latest_choice_or_message() {
         common::branch("feature", None, "feature", false),
     ]));
     app.selected = Some(BranchId::new("feature"));
-    let Action::PersistColor(first) = app.handle_key(Key::Character('c')) else {
+    let Action::PersistConfig(first) = app.handle_key(Key::Character('c')) else {
         panic!("first color action");
     };
-    let Action::PersistColor(second) = app.handle_key(Key::Character('c')) else {
+    let Action::PersistConfig(second) = app.handle_key(Key::Character('c')) else {
         panic!("second color action");
     };
     let latest_message = app.message.clone();
@@ -704,11 +1082,11 @@ fn stale_color_results_cannot_overwrite_the_latest_choice_or_message() {
         .prepare_pending_color_persistence(second.clone())
         .expect("failed and newer color remains pending");
     assert_eq!(
-        retry.updates.get(&BranchId::new("feature")),
+        retry.mutation.color_updates.get(&BranchId::new("feature")),
         Some(&Some(Arc::from("#bb9af7")))
     );
     app.finish_color_persistence(second.sequence, Ok(()));
-    assert_eq!(app.message.as_deref(), Some("stack color saved"));
+    assert_eq!(app.message.as_deref(), Some("configuration saved"));
 }
 
 #[test]
@@ -725,16 +1103,16 @@ fn completed_color_root_is_not_replayed_over_an_external_writer() {
     let mut app = App::default();
     app.apply_snapshot(Arc::new(snapshot));
     app.selected = Some(BranchId::new("alpha"));
-    let Action::PersistColor(first) = app.handle_key(Key::Character('c')) else {
+    let Action::PersistConfig(first) = app.handle_key(Key::Character('c')) else {
         panic!("first color action");
     };
     app.selected = Some(BranchId::new("beta"));
-    let Action::PersistColor(second) = app.handle_key(Key::Character('c')) else {
+    let Action::PersistConfig(second) = app.handle_key(Key::Character('c')) else {
         panic!("second color action");
     };
-    assert_eq!(second.updates.len(), 2);
+    assert_eq!(second.mutation.color_updates.len(), 2);
 
-    Config::persist_colors(&first.common_dir, &first.updates, &first.fallback).unwrap();
+    Config::persist_mutation(&first.common_dir, &first.mutation, &first.fallback).unwrap();
     app.finish_color_persistence(first.sequence, Ok(()));
     let mut external = Config::load(directory.path()).unwrap();
     external
@@ -743,10 +1121,10 @@ fn completed_color_root_is_not_replayed_over_an_external_writer() {
 
     let filtered = app.prepare_pending_color_persistence(second).unwrap();
     assert_eq!(
-        filtered.updates.keys().collect::<Vec<_>>(),
+        filtered.mutation.color_updates.keys().collect::<Vec<_>>(),
         vec![&BranchId::new("beta")]
     );
-    Config::persist_colors(&filtered.common_dir, &filtered.updates, &filtered.fallback).unwrap();
+    Config::persist_mutation(&filtered.common_dir, &filtered.mutation, &filtered.fallback).unwrap();
     app.finish_color_persistence(filtered.sequence, Ok(()));
 
     let saved = Config::load(directory.path()).unwrap();
@@ -784,6 +1162,6 @@ fn option_shaped_untracked_branch_is_deletion_eligible() {
         common::branch("--force", None, "--force", false),
     ]));
     app.selected = Some(BranchId::new("--force"));
-    assert_eq!(app.handle_key(Key::Character('x')), Action::None);
+    app.begin_delete_confirmation();
     assert!(matches!(app.mutation, MutationState::ConfirmingDeletion(_)));
 }

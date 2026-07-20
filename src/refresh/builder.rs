@@ -59,6 +59,8 @@ impl SnapshotBuilder {
                     current: inventory.current.as_ref() == Some(&source.id),
                     dirty: inventory.current.as_ref() == Some(&source.id) && inventory.dirty,
                     worktree: source.worktree.clone(),
+                    configured_upstream: source.configured_upstream.clone(),
+                    remote_ref: crate::model::RemoteRefEvidence::NotRequested,
                     diff: DiffState::Loading,
                     pr: None,
                 });

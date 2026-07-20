@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::path::PathBuf;
 
 use stackmap::model::{
-    Branch, BranchId, DiffState, GraphiteProvenance, RepositorySnapshot, RepositoryState,
+    Branch, BranchId, ConfiguredUpstream, DiffState, GraphiteProvenance, RemoteRefEvidence,
+    RepositorySnapshot, RepositoryState,
 };
 
 pub fn branches(count: usize, stack_size: usize) -> Vec<Branch> {
@@ -26,6 +27,8 @@ pub fn branches(count: usize, stack_size: usize) -> Vec<Branch> {
             current: index == 0,
             dirty: false,
             worktree: None,
+            configured_upstream: ConfiguredUpstream::None,
+            remote_ref: RemoteRefEvidence::NotRequested,
             diff: DiffState::Loading,
             pr: None,
         });

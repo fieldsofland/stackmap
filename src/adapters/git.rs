@@ -8,10 +8,12 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use super::command::{CommandError, CommandOutput, run_bounded};
 use super::graphite::{raw_branch_metadata_has_child, raw_branch_metadata_presence, read_topology};
-use crate::model::{BranchId, DiffStat, GraphiteProvenance, RepositoryState};
+use crate::model::{BranchId, ConfiguredUpstream, DiffStat, GraphiteProvenance, RepositoryState};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(3);
+const UPSTREAM_GIT_TIMEOUT: Duration = Duration::from_millis(250);
 const OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+const UPSTREAM_OUTPUT_LIMIT: usize = 256 * 1024;
 type DeleteContractCache = Arc<Mutex<Option<Result<(), Arc<str>>>>>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,6 +36,7 @@ pub struct GitBranch {
     pub oid: Arc<str>,
     pub committed_at: i64,
     pub worktree: Option<PathBuf>,
+    pub configured_upstream: ConfiguredUpstream,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,34 +125,46 @@ impl GitAdapter {
         let root = self.root.clone();
         let git_dir = self.git_dir.clone();
         let common_dir = self.common_dir.clone();
+        let configured_upstreams = self.configured_upstream_branches();
         let output = self.git(
             &[
                 "for-each-ref",
                 "--sort=refname",
-                "--format=%(refname:short)%00%(objectname)%00%(committerdate:unix)%00%(worktreepath)%00",
+                "--format=%(refname)%00%(objectname)%00%(committerdate:unix)%00%(worktreepath)%00%(upstream)%00%(upstream:track,nobracket)%00",
                 "refs/heads",
             ],
             OUTPUT_LIMIT,
         )?;
         ensure_success(&output, "enumerate local branches")?;
         let fields: Vec<&[u8]> = output.stdout.split(|byte| *byte == 0).collect();
-        let mut branches = Vec::with_capacity(fields.len() / 4);
-        for chunk in fields.chunks(4) {
-            if chunk.len() < 4 || chunk[0].is_empty() {
+        let mut branches = Vec::with_capacity(fields.len() / 6);
+        for chunk in fields.chunks(6) {
+            if chunk.len() < 6 || chunk[0].is_empty() {
                 continue;
             }
-            let name_bytes = strip_record_separator(chunk[0]);
-            let name = text(name_bytes, "branch name")?;
+            let reference = text(strip_record_separator(chunk[0]), "ref name")?;
             let oid = text(chunk[1], "object id")?;
+            let Some(name) = reference.strip_prefix("refs/heads/") else {
+                continue;
+            };
             let committed_at = text(chunk[2], "committer timestamp")?
                 .parse::<i64>()
                 .with_context(|| format!("invalid committer timestamp for {name}"))?;
             let worktree_text = text(chunk[3], "worktree path")?;
+            let upstream = text(chunk[4], "configured upstream")?;
+            let tracking = text(chunk[5], "configured upstream tracking")?;
             branches.push(GitBranch {
                 id: BranchId::new(name),
                 oid: Arc::from(oid),
                 committed_at,
                 worktree: (!worktree_text.is_empty()).then(|| PathBuf::from(worktree_text)),
+                configured_upstream: parse_configured_upstream(
+                    upstream,
+                    tracking,
+                    configured_upstreams
+                        .as_ref()
+                        .map(|configured| configured.contains(name)),
+                ),
             });
         }
 
@@ -195,6 +210,88 @@ impl GitAdapter {
             state,
             source_token,
         })
+    }
+
+    pub fn remote_ref_token(&self) -> Result<u64> {
+        let output = self.git_upstream(&[
+            "for-each-ref",
+            "--sort=refname",
+            "--format=%(refname)%00%(objectname)%00",
+            "refs/remotes",
+        ])?;
+        ensure_success(&output, "read local remote-tracking refs")?;
+        let fields: Vec<&[u8]> = output.stdout.split(|byte| *byte == 0).collect();
+        let mut refs = Vec::with_capacity(fields.len() / 2);
+        for chunk in fields.chunks(2) {
+            if chunk.len() < 2 || chunk[0].is_empty() {
+                continue;
+            }
+            refs.push((
+                text(strip_record_separator(chunk[0]), "remote ref name")?,
+                text(chunk[1], "remote ref object id")?,
+            ));
+        }
+        Ok(remote_ref_token(refs))
+    }
+
+    pub fn containing_remote_ref(&self, oid: &str) -> Result<Option<Arc<str>>> {
+        let contains = format!("--contains={oid}");
+        let output = run_bounded(
+            OsStr::new("git"),
+            [
+                OsStr::new("for-each-ref"),
+                OsStr::new("--sort=refname"),
+                OsStr::new("--count=1"),
+                OsStr::new("--format=%(refname:short)"),
+                OsStr::new(&contains),
+                OsStr::new("refs/remotes"),
+            ],
+            &self.start_dir,
+            UPSTREAM_GIT_TIMEOUT,
+            UPSTREAM_OUTPUT_LIMIT,
+        )
+        .map_err(|error| anyhow!(error))?;
+        ensure_success(&output, "check local remote-ref containment")?;
+        let first = output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .find(|line| !line.is_empty());
+        first
+            .map(|line| text(line, "containing remote ref").map(Arc::from))
+            .transpose()
+    }
+
+    fn configured_upstream_branches(&self) -> Option<std::collections::HashSet<String>> {
+        let output = self
+            .git(
+                &[
+                    "config",
+                    "--null",
+                    "--name-only",
+                    "--get-regexp",
+                    "^branch\\..*\\.(remote|merge)$",
+                ],
+                256 * 1024,
+            )
+            .ok()?;
+        if output.stdout_truncated || (!output.status.success() && output.status.code() != Some(1))
+        {
+            return None;
+        }
+        let mut branches = std::collections::HashSet::new();
+        for key in output.stdout.split(|byte| *byte == 0) {
+            let key = std::str::from_utf8(key).ok()?;
+            let Some(key) = key.strip_prefix("branch.") else {
+                continue;
+            };
+            if let Some(branch) = key
+                .strip_suffix(".remote")
+                .or_else(|| key.strip_suffix(".merge"))
+            {
+                branches.insert(branch.to_owned());
+            }
+        }
+        Some(branches)
     }
 
     pub fn diffstat(&self, parent_oid: &str, child_oid: &str) -> Result<DiffStat> {
@@ -532,6 +629,17 @@ impl GitAdapter {
         self.git_os(&args.iter().map(OsStr::new).collect::<Vec<_>>(), limit)
     }
 
+    fn git_upstream(&self, args: &[&str]) -> Result<CommandOutput> {
+        run_bounded(
+            OsStr::new("git"),
+            args.iter().map(OsStr::new),
+            &self.start_dir,
+            UPSTREAM_GIT_TIMEOUT,
+            UPSTREAM_OUTPUT_LIMIT,
+        )
+        .map_err(|error| anyhow!(error))
+    }
+
     fn git_os(&self, args: &[&OsStr], limit: usize) -> Result<CommandOutput> {
         run_bounded(OsStr::new("git"), args, &self.start_dir, GIT_TIMEOUT, limit)
             .map_err(|error| anyhow!(error))
@@ -633,10 +741,72 @@ fn token_for(branches: &[GitBranch], current: Option<&BranchId>, state: &Reposit
         branch.id.hash(&mut hasher);
         branch.oid.hash(&mut hasher);
         branch.worktree.hash(&mut hasher);
+        branch.configured_upstream.hash(&mut hasher);
     }
     current.hash(&mut hasher);
     std::mem::discriminant(state).hash(&mut hasher);
     hasher.finish()
+}
+
+fn remote_ref_token<'a>(refs: impl IntoIterator<Item = (&'a str, &'a str)>) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (reference, oid) in refs {
+        reference.hash(&mut hasher);
+        oid.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn parse_configured_upstream(
+    reference: &str,
+    tracking: &str,
+    configured: Option<bool>,
+) -> ConfiguredUpstream {
+    if reference.is_empty() {
+        return if configured == Some(true) {
+            ConfiguredUpstream::Unavailable {
+                reference: None,
+                reason: Arc::from("configured upstream does not resolve to a local ref"),
+            }
+        } else if configured.is_none() {
+            ConfiguredUpstream::Unavailable {
+                reference: None,
+                reason: Arc::from("configured upstream scan unavailable"),
+            }
+        } else {
+            ConfiguredUpstream::None
+        };
+    }
+    let reference: Arc<str> = Arc::from(reference);
+    let tracking = tracking.trim();
+    if tracking.is_empty() {
+        return ConfiguredUpstream::Equal { reference };
+    }
+    if tracking == "gone" {
+        return ConfiguredUpstream::Gone { reference };
+    }
+    let mut ahead = None;
+    let mut behind = None;
+    for part in tracking.split(',').map(str::trim) {
+        if let Some(value) = part.strip_prefix("ahead ") {
+            ahead = value.parse().ok();
+        } else if let Some(value) = part.strip_prefix("behind ") {
+            behind = value.parse().ok();
+        }
+    }
+    match (ahead, behind) {
+        (Some(ahead), Some(behind)) => ConfiguredUpstream::Diverged {
+            reference,
+            ahead,
+            behind,
+        },
+        (Some(ahead), None) => ConfiguredUpstream::Ahead { reference, ahead },
+        (None, Some(behind)) => ConfiguredUpstream::Behind { reference, behind },
+        _ => ConfiguredUpstream::Unavailable {
+            reference: Some(reference),
+            reason: Arc::from(format!("unrecognized tracking state: {tracking}")),
+        },
+    }
 }
 
 #[cfg(test)]

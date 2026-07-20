@@ -49,6 +49,7 @@ pub struct ProjectionOptions {
     pub filter: String,
     pub archive_mode: ArchiveMode,
     pub archived: HashSet<BranchId>,
+    pub stack_names: HashMap<BranchId, Arc<str>>,
 }
 
 impl Default for ProjectionOptions {
@@ -60,6 +61,7 @@ impl Default for ProjectionOptions {
             filter: String::new(),
             archive_mode: ArchiveMode::Active,
             archived: HashSet::new(),
+            stack_names: HashMap::new(),
         }
     }
 }
@@ -103,6 +105,14 @@ pub struct PlaceholderRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StackLabelRow {
+    pub stack_id: BranchId,
+    pub lane: usize,
+    pub text: Arc<str>,
+    pub emphasis: Emphasis,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DividerRow {
     Spacer { section: Option<BranchId> },
     Connector(ConnectorRow),
@@ -112,6 +122,7 @@ pub enum DividerRow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProjectionEntry {
     Section(ProjectedSection),
+    StackLabel(StackLabelRow),
     Branch(ProjectedRow),
     Divider(DividerRow),
 }
@@ -173,7 +184,7 @@ struct StackGroup {
     component_id: BranchId,
     branches: Vec<BranchId>,
     attach_parent: Option<BranchId>,
-    child_stacks: Vec<BranchId>,
+    child_stacks_by_parent: HashMap<BranchId, Vec<BranchId>>,
     activity: i64,
     default_index: usize,
 }
@@ -319,6 +330,7 @@ impl TopologyIndex {
                 continue;
             }
             if !self.groups.contains_key(&stack_id) {
+                let group_attach_parent = attach_parent.clone();
                 let parent_stack = attach_parent
                     .as_ref()
                     .and_then(|parent| self.stack_by_branch.get(parent))
@@ -334,8 +346,8 @@ impl TopologyIndex {
                         id: stack_id.clone(),
                         component_id,
                         branches: Vec::new(),
-                        attach_parent,
-                        child_stacks: Vec::new(),
+                        attach_parent: group_attach_parent.clone(),
+                        child_stacks_by_parent: HashMap::new(),
                         activity: i64::MIN,
                         default_index: *next_default_index,
                     },
@@ -344,7 +356,13 @@ impl TopologyIndex {
                 if let Some(parent_stack) = parent_stack
                     && let Some(parent) = self.groups.get_mut(&parent_stack)
                 {
-                    parent.child_stacks.push(stack_id.clone());
+                    if let Some(attach_parent) = group_attach_parent {
+                        parent
+                            .child_stacks_by_parent
+                            .entry(attach_parent)
+                            .or_default()
+                            .push(stack_id.clone());
+                    }
                 }
             }
             self.stack_by_branch
@@ -458,7 +476,7 @@ impl TopologyIndex {
 
         let mut projection = TopologyProjection {
             entries: Vec::with_capacity(
-                structural_visible.len() + self.groups.len() * 2 + self.trunks.len() + 1,
+                structural_visible.len() + self.groups.len() * 3 + self.trunks.len() + 1,
             ),
             selectable: Vec::with_capacity(named_visible.len()),
             selectable_visual_rows: Vec::with_capacity(named_visible.len()),
@@ -795,37 +813,63 @@ impl TopologyIndex {
         group_states: &[ProjectionGroupState],
         projection: &mut TopologyProjection,
     ) -> Option<usize> {
-        let group = self.groups.get(stack)?;
-        if !group_states[group.default_index].visible {
+        #[derive(Clone, Copy)]
+        enum EmitPhase {
+            StartBranch,
+            Children,
+            FinishBranch,
+        }
+
+        struct EmitFrame {
+            stack: BranchId,
+            lane: usize,
+            branch_index: usize,
+            phase: EmitPhase,
+            current_branch: Option<BranchId>,
+            children: Vec<BranchId>,
+            next_child: usize,
+            pending_child: Option<BranchId>,
+            first_row: Option<usize>,
+            last_row: Option<usize>,
+            head: Option<(BranchId, usize)>,
+            all_structural: bool,
+            all_named: bool,
+        }
+
+        let root = self.groups.get(stack)?;
+        let root_state = group_states[root.default_index];
+        if !root_state.visible {
             return None;
         }
-        let mut first_row = None;
-        let mut last_row = None;
-        let mut head = None;
-        let group_state = group_states[group.default_index];
-        let all_structural = group_state.structural_count == group.branches.len();
-        let all_named = group_state.named_count == group.branches.len();
-        for branch in group.branches.iter().rev() {
-            let mut children: Vec<_> = group
-                .child_stacks
-                .iter()
-                .filter(|child| self.groups[*child].attach_parent.as_ref() == Some(branch))
-                .filter(|child| self.group_state(child, group_states).visible)
-                .cloned()
-                .collect();
-            self.sort_groups(&mut children, options.order, group_states);
-            for child in children {
-                let Some(child_span) = self.emit_hierarchical_group(
-                    &child,
-                    lane + 1,
-                    section,
-                    options,
-                    structural_visible,
-                    named_visible,
-                    exact_matches,
-                    group_states,
-                    projection,
-                ) else {
+
+        let mut started = HashSet::new();
+        started.insert(stack.clone());
+        let mut frames = vec![EmitFrame {
+            stack: stack.clone(),
+            lane,
+            branch_index: 0,
+            phase: EmitPhase::StartBranch,
+            current_branch: None,
+            children: Vec::new(),
+            next_child: 0,
+            pending_child: None,
+            first_row: None,
+            last_row: None,
+            head: None,
+            all_structural: root_state.structural_count == root.branches.len(),
+            all_named: root_state.named_count == root.branches.len(),
+        }];
+        let mut returned: Option<(BranchId, Option<usize>)> = None;
+
+        loop {
+            if let Some((child, child_span)) = returned.take() {
+                let Some(parent_frame) = frames.last_mut() else {
+                    return child_span;
+                };
+                if parent_frame.pending_child.take().as_ref() != Some(&child) {
+                    continue;
+                }
+                let Some(child_span) = child_span else {
                     continue;
                 };
                 if options.separators {
@@ -842,81 +886,202 @@ impl TopologyIndex {
                         ConnectorRow {
                             section: section.cloned(),
                             stack_id: child.clone(),
-                            parent: Some(branch.clone()),
-                            from_lane: lane + 1,
-                            to_lane: lane,
+                            parent: parent_frame.current_branch.clone(),
+                            from_lane: parent_frame.lane + 1,
+                            to_lane: parent_frame.lane,
                             emphasis: self.group_state(&child, group_states).emphasis,
                         },
                     )));
-                projection.lane_count = projection.lane_count.max(lane + 2);
+                projection.lane_count = projection.lane_count.max(parent_frame.lane + 2);
                 projection.lane_spans[child_span].end = connector_row;
-                first_row.get_or_insert(connector_row);
-                last_row = Some(connector_row);
-            }
-            if !all_structural && !structural_visible.contains(branch) {
+                parent_frame.first_row.get_or_insert(connector_row);
+                parent_frame.last_row = Some(connector_row);
                 continue;
             }
-            let visual_row = projection.entries.len();
-            first_row.get_or_insert(visual_row);
-            last_row = Some(visual_row);
-            let emphasis = if matches!(options.scope, ProjectionScope::All) {
-                Emphasis::Full
-            } else {
-                projection
-                    .emphasis_by_branch
-                    .get(branch)
-                    .copied()
-                    .unwrap_or_default()
-            };
-            if all_named || named_visible.contains(branch) {
-                head.get_or_insert_with(|| (branch.clone(), visual_row));
-                push_branch(
-                    projection,
-                    ProjectedRow {
-                        branch: branch.clone(),
-                        depth: lane,
-                        stack_index: group.default_index,
-                        stack_id: group.id.clone(),
-                        lane,
-                        context_only: exact_matches
-                            .is_some_and(|matches| !matches.contains(branch)),
-                        is_trunk: false,
-                        emphasis,
-                    },
-                );
-            } else {
-                projection
-                    .entries
-                    .push(ProjectionEntry::Divider(DividerRow::Placeholder(
-                        PlaceholderRow {
-                            section: section.cloned(),
-                            branch: branch.clone(),
-                            parent: self.nodes.get(branch).and_then(|node| node.parent.clone()),
-                            stack_id: group.id.clone(),
-                            lane,
-                            emphasis,
-                        },
-                    )));
-                projection.lane_count = projection.lane_count.max(lane + 1);
+
+            let phase = frames.last().map(|frame| frame.phase)?;
+            match phase {
+                EmitPhase::StartBranch => {
+                    let (stack, branch_index) = {
+                        let frame = frames.last().expect("emission frame");
+                        (frame.stack.clone(), frame.branch_index)
+                    };
+                    let group = self.groups.get(&stack)?;
+                    if branch_index == group.branches.len() {
+                        let frame = frames.pop().expect("completed emission frame");
+                        let span = frame.first_row.zip(frame.last_row).map(|(start, end)| {
+                            let span_index = projection.lane_spans.len();
+                            projection.lane_spans.push(LaneSpan {
+                                stack_id: frame.stack.clone(),
+                                lane: frame.lane,
+                                start,
+                                end,
+                            });
+                            projection.lane_count = projection.lane_count.max(frame.lane + 1);
+                            if let Some((branch, visual_row)) = frame.head {
+                                projection.stack_heads.push(StackAnchor {
+                                    branch,
+                                    stack_id: frame.stack.clone(),
+                                    visual_row,
+                                });
+                            }
+                            span_index
+                        });
+                        returned = Some((frame.stack, span));
+                        continue;
+                    }
+
+                    let branch = group.branches[group.branches.len() - 1 - branch_index].clone();
+                    let mut children: Vec<_> = group
+                        .child_stacks_by_parent
+                        .get(&branch)
+                        .into_iter()
+                        .flatten()
+                        .filter(|child| self.group_state(child, group_states).visible)
+                        .cloned()
+                        .collect();
+                    self.sort_groups(&mut children, options.order, group_states);
+                    let frame = frames.last_mut().expect("emission frame");
+                    frame.current_branch = Some(branch);
+                    frame.children = children;
+                    frame.next_child = 0;
+                    frame.phase = EmitPhase::Children;
+                }
+                EmitPhase::Children => {
+                    let next = {
+                        let frame = frames.last_mut().expect("emission frame");
+                        let child = frame.children.get(frame.next_child).cloned();
+                        frame.next_child += usize::from(child.is_some());
+                        child.map(|child| (child, frame.lane + 1))
+                    };
+                    let Some((child, child_lane)) = next else {
+                        frames.last_mut().expect("emission frame").phase = EmitPhase::FinishBranch;
+                        continue;
+                    };
+                    if !started.insert(child.clone()) {
+                        continue;
+                    }
+                    let Some(child_group) = self.groups.get(&child) else {
+                        continue;
+                    };
+                    let child_state = group_states[child_group.default_index];
+                    if !child_state.visible {
+                        continue;
+                    }
+                    frames
+                        .last_mut()
+                        .expect("parent emission frame")
+                        .pending_child = Some(child.clone());
+                    frames.push(EmitFrame {
+                        stack: child,
+                        lane: child_lane,
+                        branch_index: 0,
+                        phase: EmitPhase::StartBranch,
+                        current_branch: None,
+                        children: Vec::new(),
+                        next_child: 0,
+                        pending_child: None,
+                        first_row: None,
+                        last_row: None,
+                        head: None,
+                        all_structural: child_state.structural_count == child_group.branches.len(),
+                        all_named: child_state.named_count == child_group.branches.len(),
+                    });
+                }
+                EmitPhase::FinishBranch => {
+                    let (branch, lane, stack_id, stack_index, all_structural, all_named) = {
+                        let frame = frames.last().expect("emission frame");
+                        let group = &self.groups[&frame.stack];
+                        (
+                            frame
+                                .current_branch
+                                .clone()
+                                .expect("branch prepared before emission"),
+                            frame.lane,
+                            group.id.clone(),
+                            group.default_index,
+                            frame.all_structural,
+                            frame.all_named,
+                        )
+                    };
+                    if all_structural || structural_visible.contains(&branch) {
+                        let emphasis = if matches!(options.scope, ProjectionScope::All) {
+                            Emphasis::Full
+                        } else {
+                            projection
+                                .emphasis_by_branch
+                                .get(&branch)
+                                .copied()
+                                .unwrap_or_default()
+                        };
+                        if all_named || named_visible.contains(&branch) {
+                            if frames.last().is_some_and(|frame| frame.head.is_none())
+                                && let Some(text) = options.stack_names.get(&stack_id).cloned()
+                            {
+                                let label_row = projection.entries.len();
+                                let frame = frames.last_mut().expect("emission frame");
+                                frame.first_row.get_or_insert(label_row);
+                                frame.last_row = Some(label_row);
+                                projection.entries.push(ProjectionEntry::StackLabel(
+                                    StackLabelRow {
+                                        stack_id: stack_id.clone(),
+                                        lane,
+                                        text,
+                                        emphasis,
+                                    },
+                                ));
+                            }
+                            let visual_row = projection.entries.len();
+                            let frame = frames.last_mut().expect("emission frame");
+                            frame.first_row.get_or_insert(visual_row);
+                            frame.last_row = Some(visual_row);
+                            frame
+                                .head
+                                .get_or_insert_with(|| (branch.clone(), visual_row));
+                            push_branch(
+                                projection,
+                                ProjectedRow {
+                                    branch: branch.clone(),
+                                    depth: lane,
+                                    stack_index,
+                                    stack_id,
+                                    lane,
+                                    context_only: exact_matches
+                                        .is_some_and(|matches| !matches.contains(&branch)),
+                                    is_trunk: false,
+                                    emphasis,
+                                },
+                            );
+                        } else {
+                            let visual_row = projection.entries.len();
+                            let frame = frames.last_mut().expect("emission frame");
+                            frame.first_row.get_or_insert(visual_row);
+                            frame.last_row = Some(visual_row);
+                            projection.entries.push(ProjectionEntry::Divider(
+                                DividerRow::Placeholder(PlaceholderRow {
+                                    section: section.cloned(),
+                                    branch: branch.clone(),
+                                    parent: self
+                                        .nodes
+                                        .get(&branch)
+                                        .and_then(|node| node.parent.clone()),
+                                    stack_id,
+                                    lane,
+                                    emphasis,
+                                }),
+                            ));
+                            projection.lane_count = projection.lane_count.max(lane + 1);
+                        }
+                    }
+
+                    let frame = frames.last_mut().expect("emission frame");
+                    frame.branch_index += 1;
+                    frame.phase = EmitPhase::StartBranch;
+                    frame.current_branch = None;
+                    frame.children.clear();
+                }
             }
         }
-        let (start, end) = first_row.zip(last_row)?;
-        let span_index = projection.lane_spans.len();
-        projection.lane_spans.push(LaneSpan {
-            stack_id: group.id.clone(),
-            lane,
-            start,
-            end,
-        });
-        projection.lane_count = projection.lane_count.max(lane + 1);
-        if let Some((branch, visual_row)) = head {
-            projection.stack_heads.push(StackAnchor {
-                branch,
-                stack_id: group.id.clone(),
-                visual_row,
-            });
-        }
-        Some(span_index)
     }
 }
 

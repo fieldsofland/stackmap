@@ -1,5 +1,6 @@
 pub mod builder;
 pub mod diffstats;
+pub mod upstream;
 pub mod watcher;
 
 use std::collections::VecDeque;
@@ -14,6 +15,7 @@ use crate::model::RepositorySnapshot;
 
 use self::builder::SnapshotBuilder;
 use self::diffstats::DiffCache;
+use self::upstream::{UpstreamBatch, UpstreamCommand, UpstreamCoordinator};
 
 #[derive(Debug)]
 pub enum RefreshEvent {
@@ -22,6 +24,7 @@ pub enum RefreshEvent {
         snapshot: Arc<RepositorySnapshot>,
     },
     Enriched(Arc<RepositorySnapshot>),
+    Upstream(UpstreamBatch),
     Failed(Arc<str>),
 }
 
@@ -36,6 +39,7 @@ pub struct RefreshHandle {
     events: Arc<Mutex<VecDeque<RefreshEvent>>>,
     workers: Vec<JoinHandle<()>>,
     diff_state: Arc<(Mutex<DiffCoordinator>, Condvar)>,
+    upstream: UpstreamCoordinator,
     shutdown: Arc<AtomicBool>,
     _watcher: Option<notify::RecommendedWatcher>,
 }
@@ -79,6 +83,7 @@ impl RefreshHandle {
         let diff_state = Arc::new((Mutex::new(DiffCoordinator::default()), Condvar::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let latest_generation = Arc::new(AtomicU64::new(0));
+        let upstream = UpstreamCoordinator::start(adapter.clone())?;
         let structural_worker = thread::Builder::new()
             .name("stackmap-refresh".into())
             .spawn({
@@ -159,6 +164,7 @@ impl RefreshHandle {
             events,
             workers: vec![structural_worker, diff_worker],
             diff_state,
+            upstream,
             shutdown,
             _watcher: watcher,
         };
@@ -171,7 +177,15 @@ impl RefreshHandle {
     }
 
     pub fn try_event(&self) -> Option<RefreshEvent> {
-        self.events.lock().ok()?.pop_front()
+        self.events
+            .lock()
+            .ok()?
+            .pop_front()
+            .or_else(|| self.upstream.try_result().map(RefreshEvent::Upstream))
+    }
+
+    pub fn request_upstream(&self, command: UpstreamCommand) {
+        self.upstream.submit(command);
     }
 }
 

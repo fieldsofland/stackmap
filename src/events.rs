@@ -59,8 +59,20 @@ impl Key {
         match event.code {
             KeyCode::Up if event.modifiers.contains(KeyModifiers::ALT) => Self::SectionUp,
             KeyCode::Down if event.modifiers.contains(KeyModifiers::ALT) => Self::SectionDown,
-            KeyCode::Up if event.modifiers.contains(KeyModifiers::SHIFT) => Self::StackUp,
-            KeyCode::Down if event.modifiers.contains(KeyModifiers::SHIFT) => Self::StackDown,
+            KeyCode::Up
+                if event
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::SUPER) =>
+            {
+                Self::StackUp
+            }
+            KeyCode::Down
+                if event
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::SUPER) =>
+            {
+                Self::StackDown
+            }
             KeyCode::Up => Self::Up,
             KeyCode::Down => Self::Down,
             KeyCode::Enter => Self::Enter,

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BranchId(pub Arc<str>);
@@ -33,6 +34,56 @@ pub enum DiffState {
     Unavailable(Arc<str>),
 }
 
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub enum ConfiguredUpstream {
+    #[default]
+    None,
+    Equal {
+        reference: Arc<str>,
+    },
+    Ahead {
+        reference: Arc<str>,
+        ahead: u64,
+    },
+    Behind {
+        reference: Arc<str>,
+        behind: u64,
+    },
+    Diverged {
+        reference: Arc<str>,
+        ahead: u64,
+        behind: u64,
+    },
+    Gone {
+        reference: Arc<str>,
+    },
+    Unavailable {
+        reference: Option<Arc<str>>,
+        reason: Arc<str>,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum RemoteRefEvidence {
+    #[default]
+    NotRequested,
+    Checking,
+    Contained {
+        reference: Arc<str>,
+        source_token: u64,
+        checked_at: SystemTime,
+    },
+    LocalOnly {
+        source_token: u64,
+        checked_at: SystemTime,
+    },
+    Unavailable {
+        reason: Arc<str>,
+        source_token: Option<u64>,
+        checked_at: SystemTime,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PullRequest {
     pub number: u64,
@@ -60,6 +111,8 @@ pub struct Branch {
     pub current: bool,
     pub dirty: bool,
     pub worktree: Option<PathBuf>,
+    pub configured_upstream: ConfiguredUpstream,
+    pub remote_ref: RemoteRefEvidence,
     pub diff: DiffState,
     pub pr: Option<PullRequest>,
 }

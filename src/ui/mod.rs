@@ -26,6 +26,9 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, now: SystemTime) {
         Overlay::Help => panels::help(frame, app),
         Overlay::OrderPicker(_) => panels::order_picker(frame, app),
         Overlay::ColorPicker(_) => panels::color_picker(frame, app),
-        Overlay::None | Overlay::Search => {}
+        Overlay::None
+        | Overlay::Search
+        | Overlay::StackNameEditor(_)
+        | Overlay::ArchiveRange(_) => {}
     }
 }

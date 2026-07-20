@@ -1,6 +1,6 @@
 mod common;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use stackmap::model::BranchId;
@@ -81,6 +81,34 @@ fn linear_stack_is_bottom_up_with_trunk_at_section_bottom() {
     assert_eq!(projection.stack_heads[0].branch, BranchId::new("tip"));
     assert_eq!(projection.row_for(&BranchId::new("root")).unwrap().lane, 1);
     assert_eq!(projection.row_for(&BranchId::new("main")).unwrap().lane, 0);
+}
+
+#[test]
+fn stack_name_is_a_nonselectable_row_immediately_above_the_stack_head() {
+    let snapshot = fork_snapshot();
+    let projection = TopologyIndex::build(&snapshot).project(&ProjectionOptions {
+        stack_names: HashMap::from([(BranchId::new("1"), Arc::<str>::from("Primary work"))]),
+        ..ProjectionOptions::default()
+    });
+    let head = projection
+        .stack_heads
+        .iter()
+        .find(|head| head.stack_id == BranchId::new("1"))
+        .expect("named stack head");
+    let label_row = head.visual_row.checked_sub(1).expect("label before head");
+    assert!(matches!(
+        &projection.entries[label_row],
+        ProjectionEntry::StackLabel(label)
+            if label.stack_id == BranchId::new("1") && label.text.as_ref() == "Primary work"
+    ));
+    assert_eq!(
+        projection.selectable.len(),
+        projection
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry, ProjectionEntry::Branch(_)))
+            .count()
+    );
 }
 
 #[test]
@@ -533,6 +561,63 @@ fn five_thousand_branches_have_linear_projection_metadata() {
 }
 
 #[test]
+fn broad_comb_projects_each_attach_parent_without_quadratic_child_scans() {
+    const DEPTH: usize = 2_000;
+    let mut branches = Vec::with_capacity(DEPTH * 2 + 2);
+    branches.push(tracked("main", None, "main", "main", 0));
+    let mut child_order = Vec::with_capacity(DEPTH + 1);
+    child_order.push((
+        BranchId::new("main"),
+        Arc::from([BranchId::new("primary-0000")]),
+    ));
+    for index in 0..=DEPTH {
+        let primary = format!("primary-{index:04}");
+        let parent = (index > 0).then(|| format!("primary-{:04}", index - 1));
+        branches.push(tracked(
+            &primary,
+            parent.as_deref(),
+            "primary-0000",
+            "main",
+            index as i64 + 1,
+        ));
+        if index < DEPTH {
+            let side = format!("side-{index:04}");
+            branches.push(tracked(
+                &side,
+                Some(&primary),
+                "primary-0000",
+                "main",
+                index as i64 + 1,
+            ));
+            let mut children = Vec::with_capacity(2);
+            children.push(BranchId::new(format!("primary-{:04}", index + 1)));
+            children.push(BranchId::new(side));
+            child_order.push((BranchId::new(primary), children.into()));
+        }
+    }
+    let mut snapshot = (*common::snapshot(branches)).clone();
+    snapshot.graphite_children = child_order.into();
+
+    let projection = TopologyIndex::build(&snapshot).project(&ProjectionOptions::default());
+
+    assert_eq!(projection.selectable.len(), DEPTH * 2 + 2);
+    assert_eq!(
+        projection
+            .row_for(&BranchId::new("primary-2000"))
+            .unwrap()
+            .lane,
+        1
+    );
+    for index in [0, DEPTH / 2, DEPTH - 1] {
+        let side = BranchId::new(format!("side-{index:04}"));
+        let row = projection.row_for(&side).unwrap();
+        assert_eq!(row.lane, 2);
+        assert_eq!(row.stack_id, side);
+    }
+    assert!(projection.entries.len() <= DEPTH * 6 + 4);
+}
+
+#[test]
 fn five_thousand_deep_stack_has_linear_projection_metadata() {
     let mut branches = Vec::with_capacity(5_000);
     for index in 0..5_000 {
@@ -550,4 +635,45 @@ fn five_thousand_deep_stack_has_linear_projection_metadata() {
     assert_eq!(projection.section_ranges.len(), 1);
     assert_eq!(projection.lane_count, 2);
     assert!(projection.is_true_stack(&BranchId::new("deep-0000")));
+}
+
+#[test]
+fn five_thousand_deep_comb_emits_every_branch_once_without_recursion() {
+    const DEPTH: usize = 5_000;
+
+    let mut branches = Vec::with_capacity(DEPTH * 2);
+    for index in 0..DEPTH {
+        let side = format!("comb-side-{index:04}");
+        let parent = (index > 0).then(|| format!("comb-side-{:04}", index - 1));
+        branches.push(common::branch(
+            &side,
+            parent.as_deref(),
+            "comb-side-0000",
+            false,
+        ));
+        branches.push(common::branch(
+            &format!("comb-primary-{index:04}"),
+            Some(&side),
+            "comb-side-0000",
+            false,
+        ));
+    }
+
+    let snapshot = common::snapshot(branches);
+    let projection = TopologyIndex::build(&snapshot).project(&ProjectionOptions {
+        separators: false,
+        ..ProjectionOptions::default()
+    });
+    let unique: HashSet<_> = projection.selectable.iter().collect();
+    let connectors = projection
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry, ProjectionEntry::Divider(DividerRow::Connector(_))))
+        .count();
+
+    assert_eq!(projection.selectable.len(), DEPTH * 2);
+    assert_eq!(unique.len(), DEPTH * 2);
+    assert_eq!(projection.lane_spans.len(), DEPTH);
+    assert_eq!(connectors, DEPTH - 1);
+    assert_eq!(projection.lane_count, DEPTH + 1);
 }

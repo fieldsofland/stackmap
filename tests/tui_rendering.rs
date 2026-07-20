@@ -1,13 +1,15 @@
 mod common;
 
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::{Color, Modifier};
 use stackmap::app::{App, LanePitch};
-use stackmap::model::{BranchId, DiffStat, DiffState};
+use stackmap::events::Key;
+use stackmap::model::{BranchId, ConfiguredUpstream, DiffStat, DiffState, RemoteRefEvidence};
 use stackmap::ui::layout::{RenderGeometry, areas};
 use stackmap::ui::theme::{
     TRUNK_COLOR_HEX, current_background, selected_background, stack_color, trunk_color,
@@ -133,7 +135,9 @@ fn render_geometry_is_left_anchored_and_selection_independent() {
         LanePitch::Fixed(6),
         30,
     );
-    assert_eq!(clamped.effective_pitch, 1);
+    assert_eq!(clamped.effective_pitch, 6);
+    assert!(clamped.last_visible_lane < 29);
+    assert!(clamped.name_width(29) >= 8);
 }
 
 #[test]
@@ -148,13 +152,18 @@ fn current_nontrunk_has_status_and_topology_circles_in_fixed_columns() {
         .unwrap();
     let lines = rendered_lines(&terminal);
     let (y, line) = line_with(&lines, "current");
-    assert_eq!(line.chars().nth(0), Some('●'));
+    assert_eq!(line.chars().next(), Some('●'));
     assert_eq!(line.chars().nth(1), Some('›'));
     assert_eq!(line.chars().nth(3), Some('○'));
     assert_eq!(char_column(line, "current"), Some(5));
+    let accent = stack_color("test-repository", &BranchId::new("current"), &app.config);
     assert_eq!(
         terminal.backend().buffer()[(0, y as u16)].bg,
-        selected_background()
+        if accent == Color::Reset {
+            selected_background()
+        } else {
+            accent
+        }
     );
 }
 
@@ -173,8 +182,13 @@ fn trunk_uses_reserved_bold_hue_and_checked_out_marker() {
         .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let lines = rendered_lines(&terminal);
-    let (y, line) = line_with(&lines, "main");
-    assert_eq!(line.chars().nth(0), Some('◉'));
+    let (y, line) = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| char_column(line, "main") == Some(2))
+        .map(|(y, line)| (y, line.as_str()))
+        .expect("trunk branch row");
+    assert_eq!(line.chars().next(), Some('◉'));
     assert_eq!(char_column(line, "main"), Some(2));
     let marker = &terminal.backend().buffer()[(0, y as u16)];
     assert_eq!(marker.fg, trunk_color());
@@ -183,10 +197,17 @@ fn trunk_uses_reserved_bold_hue_and_checked_out_marker() {
     app.config
         .set_color_in_memory(&BranchId::new("conflict"), Some(TRUNK_COLOR_HEX))
         .unwrap();
-    assert_ne!(
-        stack_color("repository", &BranchId::new("conflict"), &app.config),
-        trunk_color()
+    assert!(
+        stackmap::app::COLOR_OPTIONS
+            .iter()
+            .all(|(_, value)| *value != Some(TRUNK_COLOR_HEX))
     );
+    if trunk_color() != Color::Reset {
+        assert_ne!(
+            stack_color("repository", &BranchId::new("conflict"), &app.config),
+            trunk_color()
+        );
+    }
 }
 
 #[test]
@@ -209,6 +230,12 @@ fn selected_and_current_backgrounds_fill_rows_without_destroying_diff_colors() {
     let lines = rendered_lines(&terminal);
     let (current_y, _) = line_with(&lines, "current");
     let (selected_y, _) = line_with(&lines, "selected");
+    let selected_accent = stack_color("test-repository", &BranchId::new("selected"), &app.config);
+    let selected_accent = if selected_accent == Color::Reset {
+        selected_background()
+    } else {
+        selected_accent
+    };
     for x in 0..80 {
         assert_eq!(
             terminal.backend().buffer()[(x, current_y as u16)].bg,
@@ -216,7 +243,12 @@ fn selected_and_current_backgrounds_fill_rows_without_destroying_diff_colors() {
         );
         assert_eq!(
             terminal.backend().buffer()[(x, selected_y as u16)].bg,
-            selected_background()
+            selected_accent
+        );
+        assert!(
+            !terminal.backend().buffer()[(x, selected_y as u16)]
+                .modifier
+                .contains(Modifier::REVERSED)
         );
     }
     let mut selected_cells = (0..80).map(|x| &terminal.backend().buffer()[(x, selected_y as u16)]);
@@ -226,6 +258,83 @@ fn selected_and_current_backgrounds_fill_rows_without_destroying_diff_colors() {
             .any(|cell| cell.symbol() == "+" && cell.fg == Color::Green)
     );
     assert!(selected_cells.any(|cell| cell.symbol() == "-" && cell.fg == Color::Red));
+}
+
+#[test]
+fn named_stack_renders_a_white_nonselectable_label_above_its_head() {
+    let mut app = App::default();
+    app.apply_snapshot(common::snapshot(vec![
+        common::branch("root", None, "root", false),
+        common::branch("tip", Some("root"), "root", false),
+    ]));
+    app.selected = Some(BranchId::new("root"));
+    app.handle_key(Key::Character('n'));
+    for character in "Release train".chars() {
+        app.handle_key(Key::Character(character));
+    }
+    app.handle_key(Key::Enter);
+
+    let mut terminal = Terminal::new(TestBackend::new(90, 10)).unwrap();
+    terminal
+        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let lines = rendered_lines(&terminal);
+    let (label_y, label_line) = line_with(&lines, "Release train");
+    let (tip_y, _) = line_with(&lines, "tip");
+    assert_eq!(label_y + 1, tip_y);
+    let label_x = char_column(label_line, "Release train").unwrap() as u16;
+    let cell = &terminal.backend().buffer()[(label_x, label_y as u16)];
+    assert_eq!(cell.fg, Color::White);
+    assert!(cell.modifier.contains(Modifier::BOLD));
+    assert_eq!(app.projection.selectable.len(), 2);
+}
+
+#[test]
+fn archive_view_renders_unarchived_ancestry_dimmed_and_nonselectable() {
+    let mut app = App::default();
+    app.apply_snapshot(common::snapshot(vec![
+        common::branch("parent", None, "parent", false),
+        common::branch("archived-tip", Some("parent"), "parent", false),
+    ]));
+    app.selected = Some(BranchId::new("archived-tip"));
+    app.handle_key(Key::Character('x'));
+    app.handle_key(Key::Character('a'));
+
+    let mut terminal = Terminal::new(TestBackend::new(90, 10)).unwrap();
+    terminal
+        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let lines = rendered_lines(&terminal);
+    let (parent_y, parent_line) = lines
+        .iter()
+        .enumerate()
+        .find(|(_, line)| line.contains("parent") && !line.contains("archived-tip"))
+        .map(|(y, line)| (y, line.as_str()))
+        .expect("dim parent context");
+    let parent_x = char_column(parent_line, "parent").unwrap() as u16;
+    assert!(
+        terminal.backend().buffer()[(parent_x, parent_y as u16)]
+            .modifier
+            .contains(Modifier::DIM)
+    );
+    assert!(!app.projection.selectable.contains(&BranchId::new("parent")));
+}
+
+#[test]
+fn footer_labels_a_as_view_archive() {
+    let mut app = App::default();
+    app.apply_snapshot(common::snapshot(vec![common::branch(
+        "branch", None, "branch", false,
+    )]));
+    let mut terminal = Terminal::new(TestBackend::new(120, 8)).unwrap();
+    terminal
+        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    assert!(
+        rendered_lines(&terminal)
+            .iter()
+            .any(|line| line.contains("a View Archive"))
+    );
 }
 
 #[test]
@@ -298,7 +407,13 @@ fn stack_local_name_columns_are_stable_across_selection_and_child_lanes() {
         let body_width = stackmap::ui::layout::areas(ratatui::layout::Rect::new(0, 0, width, 12))
             .body
             .width;
-        let lines = rendered_lines(&terminal);
+        let lines: Vec<String> = (0..12)
+            .map(|y| {
+                (0..body_width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
         let columns: Vec<_> = ["root", "primary", "side"]
             .into_iter()
             .map(|name| {
@@ -321,7 +436,13 @@ fn stack_local_name_columns_are_stable_across_selection_and_child_lanes() {
         terminal
             .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
             .unwrap();
-        let selected_lines = rendered_lines(&terminal);
+        let selected_lines: Vec<String> = (0..12)
+            .map(|y| {
+                (0..body_width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
         for (name, expected) in ["root", "primary", "side"].into_iter().zip(columns) {
             let (_, line) = line_with(&selected_lines, name);
             assert_eq!(char_column(line, name), Some(expected));
@@ -390,6 +511,26 @@ fn connectors_draw_exact_lane_endpoints_and_root_contact() {
             .then_some(row)
         })
         .collect();
+    let side_connector = connectors
+        .iter()
+        .find(|(_, connector)| connector.parent.as_ref() == Some(&BranchId::new("root")))
+        .map(|(_, connector)| connector)
+        .expect("side-stack connector");
+    let parent_stack = app
+        .projection
+        .row_for(&BranchId::new("root"))
+        .expect("parent projection row")
+        .stack_id
+        .clone();
+    app.config
+        .set_color_in_memory(&parent_stack, Some("#123456"))
+        .unwrap();
+    app.config
+        .set_color_in_memory(&side_connector.stack_id, Some("#abcdef"))
+        .unwrap();
+    let repository_id = app.snapshot.as_ref().unwrap().repository_id.as_ref();
+    let parent_color = stack_color(repository_id, &parent_stack, &app.config);
+    let child_color = stack_color(repository_id, &side_connector.stack_id, &app.config);
     let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
     terminal
         .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
@@ -404,6 +545,12 @@ fn connectors_draw_exact_lane_endpoints_and_root_contact() {
         for x in left + 1..right {
             assert!(matches!(buffer[(x, y)].symbol(), "─" | "┼" | "┬" | "┴"));
         }
+        if connector.parent.as_ref() == Some(&BranchId::new("root")) {
+            assert_eq!(buffer[(left, y)].fg, parent_color);
+            for x in left + 1..=right {
+                assert_eq!(buffer[(x, y)].fg, child_color);
+            }
+        }
         if connector.parent.as_ref() == Some(&BranchId::new("main")) {
             assert_eq!(buffer[(0, y)].symbol(), "┌");
             assert_eq!(buffer[(0, y + 1)].symbol(), "○");
@@ -415,6 +562,48 @@ fn connectors_draw_exact_lane_endpoints_and_root_contact() {
             assert_eq!(buffer[(x, y)].symbol(), " ");
         }
     }
+}
+
+#[test]
+fn focused_sibling_rows_keep_geometry_and_use_dim_modifier() {
+    let tracked = |name: &str, parent: Option<&str>, root: &str, current: bool| {
+        let mut branch = common::branch(name, parent, root, current);
+        branch.trunk = Some(BranchId::new("main"));
+        branch.graphite = stackmap::model::GraphiteProvenance::Tracked;
+        branch
+    };
+    let mut snapshot = (*common::snapshot(vec![
+        tracked("main", None, "main", false),
+        tracked("alpha", None, "alpha", true),
+        tracked("alpha-tip", Some("alpha"), "alpha", false),
+        tracked("beta", None, "beta", false),
+    ]))
+    .clone();
+    snapshot.configured_trunks = Arc::from([BranchId::new("main")]);
+    snapshot.trunks = snapshot.configured_trunks.clone();
+    let mut app = App::default();
+    app.apply_snapshot(Arc::new(snapshot));
+    app.selected = Some(BranchId::new("alpha"));
+    app.handle_key(stackmap::events::Key::Character('h'));
+    let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+    terminal
+        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let lines = rendered_lines(&terminal);
+    let (alpha_y, alpha_line) = line_with(&lines, "alpha-tip");
+    let (beta_y, beta_line) = line_with(&lines, "beta");
+    let alpha_x = char_column(alpha_line, "alpha-tip").unwrap() as u16;
+    let beta_x = char_column(beta_line, "beta").unwrap() as u16;
+    assert!(
+        !terminal.backend().buffer()[(alpha_x, alpha_y as u16)]
+            .modifier
+            .contains(Modifier::DIM)
+    );
+    assert!(
+        terminal.backend().buffer()[(beta_x, beta_y as u16)]
+            .modifier
+            .contains(Modifier::DIM)
+    );
 }
 
 #[test]
@@ -469,7 +658,7 @@ fn deletion_confirmation_keeps_choices_visible_at_minimum_width() {
     terminal
         .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
-    app.handle_key(stackmap::events::Key::Character('x'));
+    app.begin_delete_confirmation();
     terminal
         .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
@@ -481,6 +670,7 @@ fn deletion_confirmation_keeps_choices_visible_at_minimum_width() {
         .map(|cell| cell.symbol())
         .collect();
     assert!(rendered.contains("Confirm deletion"));
+    assert!(rendered.contains("uppercase X"));
     assert!(rendered.contains("[y] delete"));
     assert!(rendered.contains("[n/Esc] cancel"));
 }
@@ -504,6 +694,61 @@ fn too_narrow_terminal_has_explicit_state() {
         .map(|cell| cell.symbol())
         .collect();
     assert!(rendered.contains("at least 40 columns"));
+}
+
+#[test]
+fn archive_mode_is_unmistakably_framed_and_empty_state_explains_return() {
+    let mut app = App::default();
+    app.apply_snapshot(common::snapshot(vec![common::branch(
+        "main", None, "main", true,
+    )]));
+    app.handle_key(stackmap::events::Key::Character('a'));
+    app.message = Some(Arc::from("configuration saved"));
+    let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+    terminal
+        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let rendered = rendered_lines(&terminal).join("\n");
+    assert!(rendered.contains("ARCHIVE · local refs only · no fetch"));
+    assert!(rendered.contains("No archived branches · press a to return to Active"));
+    assert!(rendered.contains("x restore"));
+    assert!(rendered.contains("X delete"));
+}
+
+#[test]
+fn archive_badge_stays_visible_at_minimum_width_with_a_long_repository_path() {
+    let mut snapshot =
+        (*common::snapshot(vec![common::branch("main", None, "main", true)])).clone();
+    snapshot.root = "/a/very/long/repository/path/that/must/not/cover/archive".into();
+    let mut app = App::default();
+    app.apply_snapshot(Arc::new(snapshot));
+    app.handle_key(stackmap::events::Key::Character('a'));
+    let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+    terminal
+        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let header = rendered_lines(&terminal)[0].clone();
+    assert!(header.contains("ARCHIVE · local refs only · no fetch"));
+}
+
+#[test]
+fn archive_range_uses_a_non_color_marker_and_exposes_action_count_and_endpoints() {
+    let mut app = App::default();
+    app.apply_snapshot(common::snapshot(vec![
+        common::branch("main", None, "main", true),
+        common::branch("feature", None, "feature", false),
+    ]));
+    app.selected = Some(BranchId::new("feature"));
+    app.handle_key(stackmap::events::Key::Character('v'));
+    let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+    terminal
+        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let rendered = rendered_lines(&terminal).join("\n");
+    assert!(rendered.contains("■"));
+    assert!(rendered.contains("RANGE ARCHIVE 1 branches"));
+    assert!(rendered.contains("feature → feature"));
+    assert!(rendered.contains("Enter archive"));
 }
 
 #[test]
@@ -605,6 +850,100 @@ fn stale_health_remains_visible_alongside_messages() {
 }
 
 #[test]
+fn footer_keeps_controls_progress_notices_and_stale_health_independent() {
+    let now = Instant::now();
+    let initial = common::snapshot(vec![
+        common::branch("main", None, "main", true),
+        common::branch("feature", None, "feature", false),
+    ]);
+    let mut app = App::with_mutation_timing(Duration::from_secs(10), Duration::from_secs(5));
+    app.apply_snapshot(initial);
+    app.selected = Some(BranchId::new("feature"));
+    app.message = Some(Arc::from("ordinary message"));
+    app.mark_stale(Arc::from("refresh failed"));
+    assert!(matches!(
+        app.handle_key(stackmap::events::Key::Enter),
+        stackmap::app::Action::Checkout(_)
+    ));
+    app.finish_checkout_at(Ok(()), 42, now);
+
+    let mut terminal = Terminal::new(TestBackend::new(180, 8)).unwrap();
+    terminal
+        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let progress = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(progress.contains("? help"));
+    assert!(progress.contains("ordinary message"));
+    assert!(progress.contains("verifying checkout of feature"));
+    assert!(progress.contains("STALE: refresh failed"));
+
+    let mut matching = (*common::snapshot(vec![
+        common::branch("main", None, "main", false),
+        common::branch("feature", None, "feature", true),
+    ]))
+    .clone();
+    matching.generation = 2;
+    app.apply_structural_snapshot_at(Arc::new(matching), 42, now);
+    app.mark_stale(Arc::from("later refresh failed"));
+    terminal
+        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let reconciled = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(reconciled.contains("? help"));
+    assert!(reconciled.contains("ordinary message"));
+    assert!(reconciled.contains("checked out feature"));
+    assert!(reconciled.contains("STALE: later refresh failed"));
+    assert!(!reconciled.contains("verifying checkout"));
+}
+
+#[test]
+fn verified_deletion_returns_to_controls_without_stuck_progress() {
+    let now = Instant::now();
+    let initial = common::snapshot(vec![
+        common::branch("main", None, "main", true),
+        common::branch("merged", None, "merged", false),
+    ]);
+    let mut app = App::default();
+    app.apply_snapshot(initial);
+    app.selected = Some(BranchId::new("merged"));
+    assert_eq!(
+        app.handle_key(stackmap::events::Key::Character('X')),
+        stackmap::app::Action::None
+    );
+    assert!(matches!(
+        app.handle_key(stackmap::events::Key::Character('y')),
+        stackmap::app::Action::Delete(_)
+    ));
+    app.finish_deletion_at(Ok(stackmap::adapters::git::DeleteOutcome::Deleted), 51, now);
+    let mut matching =
+        (*common::snapshot(vec![common::branch("main", None, "main", true)])).clone();
+    matching.generation = 2;
+    app.apply_structural_snapshot_at(Arc::new(matching), 51, now);
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 8)).unwrap();
+    terminal
+        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let rendered = rendered_lines(&terminal).join("\n");
+    assert!(rendered.contains("X delete"));
+    assert!(rendered.contains("? help"));
+    assert!(rendered.contains("deleted merged locally"));
+    assert!(!rendered.contains("verifying deletion"));
+}
+
+#[test]
 fn forty_columns_keeps_deep_stack_rows_on_one_line() {
     let mut branches = Vec::new();
     for index in 0..30 {
@@ -637,7 +976,184 @@ fn forty_columns_keeps_deep_stack_rows_on_one_line() {
 }
 
 #[test]
-fn help_documents_deletion_entry_and_confirmation_keys() {
+fn nested_side_stacks_clamp_to_visible_graph_edge_with_stable_overflow_cue() {
+    let mut branches = vec![common::branch("root", None, "root", true)];
+    let mut graphite_children = Vec::new();
+    let mut parent = "root".to_owned();
+    for depth in 1..=12 {
+        let primary = format!("primary-{depth:02}");
+        let side = format!("side-{depth:02}");
+        branches.push(common::branch(&primary, Some(&parent), "root", false));
+        branches.push(common::branch(&side, Some(&parent), "root", false));
+        graphite_children.push((
+            BranchId::new(parent.clone()),
+            Arc::from([BranchId::new(primary), BranchId::new(side.clone())]),
+        ));
+        parent = side;
+    }
+    let mut snapshot = (*common::snapshot(branches)).clone();
+    snapshot.graphite_children = Arc::from(graphite_children);
+    let mut app = App::default();
+    app.apply_snapshot(Arc::new(snapshot));
+    let deepest = BranchId::new("side-12");
+    let logical_lane = app.projection.row_for(&deepest).unwrap().lane;
+    let geometry = RenderGeometry::new(
+        40,
+        stackmap::ui::layout::WidthMode::Narrow,
+        app.lane_pitch,
+        app.projection.lane_count,
+    );
+    assert!(logical_lane > geometry.last_visible_lane);
+    assert!(geometry.graph_buffer_width() < geometry.metadata_start);
+    assert!(geometry.name_width(logical_lane) >= 8);
+
+    for _ in 0..3 {
+        app.handle_key(stackmap::events::Key::Character('+'));
+    }
+    let expanded = RenderGeometry::new(
+        40,
+        stackmap::ui::layout::WidthMode::Narrow,
+        app.lane_pitch,
+        app.projection.lane_count,
+    );
+    assert_eq!(expanded.effective_pitch, 6);
+    assert!(expanded.name_width(logical_lane) >= 8);
+    app.handle_key(stackmap::events::Key::Character('0'));
+
+    let mut terminal = Terminal::new(TestBackend::new(40, 100)).unwrap();
+    terminal
+        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let initial_lines = rendered_lines(&terminal);
+    let (_, initial) = line_with(&initial_lines, "side-12");
+    assert_eq!(
+        char_column(initial, "side-12"),
+        Some(geometry.name_x(logical_lane))
+    );
+    assert_eq!(initial.chars().nth(geometry.graph_max_x), Some('○'));
+    assert_eq!(initial.chars().nth(geometry.overflow_cue_x()), Some('»'));
+    assert_eq!(initial.chars().count(), 40);
+
+    app.selected = Some(deepest);
+    terminal
+        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let selected_lines = rendered_lines(&terminal);
+    let (_, selected) = line_with(&selected_lines, "side-12");
+    assert_eq!(
+        char_column(selected, "side-12"),
+        char_column(initial, "side-12")
+    );
+    assert_eq!(selected.chars().nth(geometry.overflow_cue_x()), Some('»'));
+}
+
+#[test]
+fn forty_column_archive_row_composes_worktree_divergence_and_containment() {
+    let mut hidden = common::branch("useful-hidden-name", None, "useful-hidden-name", false);
+    hidden.worktree = Some(PathBuf::from("/tmp/worktrees/hidden-worktree"));
+    hidden.configured_upstream = ConfiguredUpstream::Diverged {
+        reference: Arc::from("refs/remotes/origin/main"),
+        ahead: 2,
+        behind: 3,
+    };
+    hidden.remote_ref = RemoteRefEvidence::Contained {
+        reference: Arc::from("origin/backup"),
+        source_token: 44,
+        checked_at: SystemTime::UNIX_EPOCH,
+    };
+    let mut app = App::default();
+    app.apply_snapshot(common::snapshot(vec![
+        common::branch("main", None, "main", true),
+        hidden,
+    ]));
+    app.config
+        .set_archived_in_memory(&BranchId::new("useful-hidden-name"), true);
+    app.handle_key(stackmap::events::Key::Character('a'));
+
+    let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+    terminal
+        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let rendered = rendered_lines(&terminal).join("\n");
+    assert!(rendered.contains("useful-hidden"));
+    assert!(rendered.contains('⎇'));
+    assert!(rendered.contains("↑2↓3"));
+    assert!(rendered.contains("r✓"));
+    assert!(rendered.contains("ARCHIVE"));
+    assert!(rendered.contains("000000000000002c"));
+
+    let mut wide = Terminal::new(TestBackend::new(140, 10)).unwrap();
+    wide.draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let lines = rendered_lines(&wide);
+    let (_, branch_line) = line_with(&lines, "useful-hidden-name");
+    assert!(branch_line.contains('⎇'));
+    assert!(branch_line.contains("up ↑2↓3"));
+    assert!(branch_line.contains("remote-ref ✓"));
+}
+
+#[test]
+fn wide_archive_detail_reports_canonical_upstream_source_token_time_and_no_fetch() {
+    let mut hidden = common::branch("hidden", None, "hidden", false);
+    hidden.configured_upstream = ConfiguredUpstream::Behind {
+        reference: Arc::from("refs/remotes/origin/main"),
+        behind: 4,
+    };
+    hidden.remote_ref = RemoteRefEvidence::Contained {
+        reference: Arc::from("origin/release"),
+        source_token: 0x2a,
+        checked_at: SystemTime::UNIX_EPOCH,
+    };
+    let mut app = App::default();
+    app.apply_snapshot(common::snapshot(vec![
+        common::branch("main", None, "main", true),
+        hidden,
+    ]));
+    app.config
+        .set_archived_in_memory(&BranchId::new("hidden"), true);
+    app.handle_key(stackmap::events::Key::Character('a'));
+
+    let mut terminal = Terminal::new(TestBackend::new(180, 12)).unwrap();
+    terminal
+        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let rendered = rendered_lines(&terminal).join("\n");
+    assert!(rendered.contains("refs/remotes/origin/main"));
+    assert!(rendered.contains("origin/release"));
+    assert!(rendered.contains("000000000000002a"));
+    assert!(rendered.contains("1969-12-31") || rendered.contains("1970-01-01"));
+    assert!(rendered.contains("no fetch"));
+}
+
+#[test]
+fn unavailable_archive_evidence_never_renders_as_local_only() {
+    let mut hidden = common::branch("uncertain", None, "uncertain", false);
+    hidden.remote_ref = RemoteRefEvidence::Unavailable {
+        reason: Arc::from("bounded command timed out"),
+        source_token: None,
+        checked_at: SystemTime::UNIX_EPOCH,
+    };
+    let mut app = App::default();
+    app.apply_snapshot(common::snapshot(vec![
+        common::branch("main", None, "main", true),
+        hidden,
+    ]));
+    app.config
+        .set_archived_in_memory(&BranchId::new("uncertain"), true);
+    app.handle_key(stackmap::events::Key::Character('a'));
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 10)).unwrap();
+    terminal
+        .draw(|frame| stackmap::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let rendered = rendered_lines(&terminal).join("\n");
+    assert!(rendered.contains("remote ?"));
+    assert!(rendered.contains("unavailable"));
+    assert!(!rendered.contains("local only"));
+}
+
+#[test]
+fn help_documents_archive_range_and_picker_keys() {
     let mut app = App::default();
     app.apply_snapshot(common::snapshot(vec![common::branch(
         "main", None, "main", true,
@@ -655,10 +1171,18 @@ fn help_documents_deletion_entry_and_confirmation_keys() {
         .iter()
         .map(|cell| cell.symbol())
         .collect();
-    assert!(rendered.contains("guarded local branch deletion"));
-    assert!(rendered.contains("confirm / cancel deletion"));
+    assert!(rendered.contains("archive / restore selected local branch"));
+    assert!(rendered.contains("guarded delete exact local branch"));
+    assert!(rendered.contains("preview contiguous archive/restore range"));
     assert!(rendered.contains("order picker"));
     assert!(rendered.contains("color picker"));
+    assert!(rendered.contains("› selected"));
+    assert!(rendered.contains("○ branch"));
+    assert!(rendered.contains("● current"));
+    assert!(rendered.contains("◉ trunk"));
+    assert!(rendered.contains("■ range"));
+    assert!(rendered.contains("* dirty"));
+    assert!(rendered.contains("⎇ worktree"));
 }
 
 #[test]

@@ -6,7 +6,8 @@ use std::process::Command;
 use std::sync::Arc;
 
 use stackmap::model::{
-    Branch, BranchId, DiffState, GraphiteProvenance, RepositorySnapshot, RepositoryState,
+    Branch, BranchId, ConfiguredUpstream, DiffState, GraphiteProvenance, RemoteRefEvidence,
+    RepositorySnapshot, RepositoryState,
 };
 use tempfile::TempDir;
 
@@ -51,6 +52,8 @@ pub fn branch(name: &str, parent: Option<&str>, root: &str, current: bool) -> Br
         current,
         dirty: false,
         worktree: None,
+        configured_upstream: ConfiguredUpstream::None,
+        remote_ref: RemoteRefEvidence::NotRequested,
         diff: DiffState::Loading,
         pr: None,
     }
