@@ -31,7 +31,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 crossterm = "0.29"
 notify = "8.2"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 signal-hook = "0.3"
