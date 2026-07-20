@@ -26,13 +26,18 @@
 - Rendering uses direct snapshot-row, projected-row, lane-count, and lane-span indexes; viewport work does not scan the complete branch or stack set.
 - Connector junction cells retain the parent/left rail color; the horizontal segment and child corner switch to the child stack color. The selected row fills edge-to-edge with its stack/trunk identity color while the checked-out branch retains its subtler tint when not selected.
 - Enhanced terminals receive the complete Crossterm keyboard protocol flags. Shift+Arrow and Command+Arrow both map to stack jumps when the terminal reports their modifier; Stackmap decodes standard `ESC [1;2A/B` Shift sequences, and `J/K` remains the portable fallback when a terminal intercepts or erases modifiers.
-- The crate and lockfile are pinned to Rust 1.88.0. Formatting, strict offline Clippy, 174 all-target/all-feature tests, the offline release build, focused Tier-2 review, real Git/Graphite integration, and PTY smoke tests pass on that toolchain.
+- The crate and lockfile are pinned to Rust 1.88.0. Formatting, strict offline Clippy, 175 all-target/all-feature tests, the offline release build, focused Tier-2 review, real Git/Graphite integration, and PTY smoke tests pass on that toolchain.
+- The open-source alpha identity is `0.1.0-alpha.1`. Cargo publication is disabled; GitHub source and two-architecture macOS prerelease assets are the intended distribution paths.
+- The executable exposes a narrow documented runtime facade. White-box integration coverage is crate-internal and benchmarks use a feature-gated benchmark facade rather than public application internals.
+- Release policy includes pinned macOS 15 ARM64/Intel CI, a stable-Rust compatibility lane, cargo-deny policy, Dependabot, fail-closed release aggregation, checksums, and artifact attestations.
+- Core responsibilities are split behind private modules: topology projection/index/emission, Git inventory/mutation, App state/overlays/archive/mutation, and tree details/connectors.
+- Recoverable production paths return typed or degraded outcomes. Remaining topology `expect` calls represent documented iterative-emission programmer invariants.
 - The installed release binary is 3,713,072 bytes. In a synthetic 2,001-branch repository the preceding release measured about 15.4 MB RSS after startup, warmed to about 19.3 MB with Archive evidence, and plateaued at 19.856-19.888 MB after 100 refresh requests and repeated view/order/layout/navigation toggles.
 - Release benchmarks measured about 0.108 ms per 500-branch projection, 1.10 ms per 5,000-branch projection, and 0.94 ms per projection of one 5,000-branch deep stack. A 5,000-level/10,000-branch deep comb emits iteratively without call-stack recursion; broad attach-parent lookup is indexed.
 - `stackmap 0.0.0` is installed at `/Users/matt/.cargo/bin/stackmap` and resolves on `PATH`.
 
 ## Next steps
 
-- Begin hands-on terminal testing in representative repositories by running `stackmap` from a worktree.
-- Watch for terminal-specific shifted-arrow encoding; `J/K` remain the portable stack-jump fallback.
-- Consider a longer allocator-instrumented overnight soak and render timing on unusually wide real branch inventories after hands-on use establishes representative workloads.
+- Exercise the public alpha in representative repositories and record manual Terminal.app evidence for both macOS architectures.
+- Cut `v0.1.0-alpha.1` only after reviewing the protected prerelease environment and the release checklist in `docs/releasing.md`.
+- Resolve alpha feedback and make the Developer ID signing/notarization decision before a stable `0.1.0` release.

@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-07-20
+
+- Prepared Stackmap `0.1.0-alpha.1` for public open-source development with an MIT license, contribution and conduct policies, private vulnerability reporting guidance, issue forms, pull-request guidance, and feature/support/release documentation.
+- Defined an explicit Cargo package allowlist, disabled crates.io publication, unified CLI and manifest version reporting, and documented source and GitHub-release installation.
+- Added pinned macOS 15 ARM64/Intel CI, stable-Rust compatibility testing, cargo-deny policy, Dependabot, and a fail-closed two-architecture prerelease workflow with checksums and artifact attestations.
+- Narrowed the supported Rust surface to an executable runtime facade plus a feature-gated benchmark seam; retained 175 all-target/all-feature tests, including a compile-fail check against former internal imports.
+- Replaced recoverable production panic paths with typed or degraded outcomes and documented the retained iterative-topology invariants.
+- Split topology, Git adapter, App, and tree-rendering responsibilities into private focused modules without changing the CLI, rendering, performance, or Git safety contracts.
+- Documented Graphite 1.8.6 compatibility stewardship, safe fallback behavior, package invariants, release procedures, and the complete user-facing feature set.
+
 ## 2026-07-19
 
 - Added persistent `n` stack naming keyed by stable stack identity. Names render as white, nonselectable rows directly above stack heads; the editor prefills existing text, Enter saves, empty Enter clears, Esc cancels, and trunks remain unnamed.

@@ -1,9 +1,10 @@
 ---
 title: "feat: Harden stackmap for an open-source prerelease"
 type: feat
-status: active
+status: complete
 date: 2026-07-19
 deepened: 2026-07-19
+completed: 2026-07-20
 ---
 
 # feat: Harden stackmap for an open-source prerelease
@@ -213,7 +214,7 @@ flowchart TB
     U11 --> U13
 ```
 
-- [ ] U1. **Stabilize the verified prototype into reviewable history**
+- [x] U1. **Stabilize the verified prototype into reviewable history**
 
 **Goal:** Turn the current large dirty worktree into a clean, traceable baseline before adding release policy or broad refactors.
 
@@ -247,7 +248,7 @@ flowchart TB
 
 ---
 
-- [ ] U2. **Define the prerelease, package, and install contract**
+- [x] U2. **Define the prerelease, package, and install contract**
 
 **Goal:** Make Cargo metadata, packaged contents, displayed version, and alpha installation guidance consistent and intentional.
 
@@ -287,7 +288,7 @@ flowchart TB
 
 ---
 
-- [ ] U3. **Add the legal, contribution, and security baseline**
+- [x] U3. **Add the legal, contribution, and security baseline**
 
 **Goal:** Give users and contributors explicit legal rights, contribution expectations, structured report paths, and a private security channel.
 
@@ -328,7 +329,7 @@ flowchart TB
 
 ---
 
-- [ ] U4. **Establish CI and the macOS support contract**
+- [x] U4. **Establish CI and the macOS support contract**
 
 **Goal:** Make every change prove the existing quality bar on the supported OS/architectures and document exactly what that evidence does and does not cover.
 
@@ -375,7 +376,7 @@ flowchart TB
 
 ---
 
-- [ ] U5. **Automate dependency, license, and advisory policy**
+- [x] U5. **Automate dependency, license, and advisory policy**
 
 **Goal:** Continuously detect vulnerable, disallowed, or drifting dependencies and GitHub Actions without hiding policy exceptions.
 
@@ -414,7 +415,7 @@ flowchart TB
 
 ---
 
-- [ ] U6. **Publish complete two-architecture GitHub prereleases**
+- [x] U6. **Publish complete two-architecture GitHub prereleases**
 
 **Goal:** Turn an approved prerelease tag into native, verifiable macOS artifacts without exposing a partial or mismatched release.
 
@@ -460,7 +461,7 @@ flowchart TB
 
 ---
 
-- [ ] U7. **Narrow the Rust API to the executable contract**
+- [x] U7. **Narrow the Rust API to the executable contract**
 
 **Goal:** Stop exposing internal modules as an accidental supported library while keeping the binary, integration tests, and benchmarks maintainable.
 
@@ -506,7 +507,7 @@ flowchart TB
 
 ---
 
-- [ ] U8. **Triage runtime-reachable invariant panics**
+- [x] U8. **Triage runtime-reachable invariant panics**
 
 **Goal:** Keep programmer invariants visible while preventing recoverable interactive, coordinator, or subprocess states from terminating the TUI.
 
@@ -554,7 +555,7 @@ flowchart TB
 
 ---
 
-- [ ] U10. **Formalize Graphite compatibility stewardship**
+- [x] U10. **Formalize Graphite compatibility stewardship**
 
 **Goal:** Make the private-schema/CLI maintenance risk explicit, testable, and repeatable without overstating compatibility.
 
@@ -599,7 +600,7 @@ flowchart TB
 
 ---
 
-- [ ] U11. **Separate topology indexing, projection policy, and iterative emission**
+- [x] U11. **Separate topology indexing, projection policy, and iterative emission**
 
 **Goal:** Make topology ownership understandable without reintroducing recursion, scans, or duplicate ordering policy.
 
@@ -632,7 +633,7 @@ flowchart TB
 
 ---
 
-- [ ] U12. **Separate Git reads and worktrees from guarded mutations**
+- [x] U12. **Separate Git reads and worktrees from guarded mutations**
 
 **Goal:** Make side-effect-free discovery and destructive mutation boundaries independently auditable.
 
@@ -667,7 +668,7 @@ flowchart TB
 
 ---
 
-- [ ] U9. **Extract App reducer and state responsibilities**
+- [x] U9. **Extract App reducer and state responsibilities**
 
 **Goal:** Turn `src/app.rs` into a clear reducer/orchestration entry without creating competing owners for interactive state.
 
@@ -703,7 +704,7 @@ flowchart TB
 
 ---
 
-- [ ] U13. **Separate tree composition, connector painting, and details**
+- [x] U13. **Separate tree composition, connector painting, and details**
 
 **Goal:** Make rendering responsibilities approachable while keeping geometry, theme, and viewport bounds authoritative.
 
