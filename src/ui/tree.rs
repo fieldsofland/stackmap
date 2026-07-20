@@ -1,12 +1,10 @@
-use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use chrono::{DateTime, Local};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use std::path::Path;
+use std::time::SystemTime;
 
 use crate::app::App;
 use crate::model::topology::{
@@ -16,6 +14,12 @@ use crate::model::{Branch, BranchId, ConfiguredUpstream, DiffState, RemoteRefEvi
 
 use super::layout::{ColumnRange, RenderGeometry, WidthMode};
 use super::theme::{current_background, selected_background, stack_color, trunk_color};
+
+mod connectors;
+mod details;
+
+use connectors::{paint_bits, paint_overflow_cue};
+pub use details::{detail, evidence_source_footer, local_detail, relative_time};
 
 const UP: u8 = 1;
 const DOWN: u8 = 2;
@@ -548,43 +552,6 @@ fn add_connector(
     }
 }
 
-fn paint_bits(cells: &mut [RenderCell], bits: &[u8], styles: &[Style], limit: usize) {
-    for x in 0..limit.min(cells.len()).min(bits.len()) {
-        if let Some(glyph) = bit_glyph(bits[x]) {
-            set_symbol(cells, x, glyph, styles[x]);
-        }
-    }
-}
-
-fn paint_overflow_cue(cells: &mut [RenderCell], geometry: RenderGeometry) {
-    set_symbol(
-        cells,
-        geometry.overflow_cue_x(),
-        "»",
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    );
-}
-
-fn bit_glyph(bits: u8) -> Option<&'static str> {
-    match bits & 15 {
-        0 => None,
-        15 => Some("┼"),
-        11 => Some("├"),
-        7 => Some("┤"),
-        14 => Some("┬"),
-        13 => Some("┴"),
-        10 => Some("┌"),
-        6 => Some("┐"),
-        9 => Some("└"),
-        5 => Some("┘"),
-        12 | 4 | 8 => Some("─"),
-        1..=3 => Some("│"),
-        _ => Some("┼"),
-    }
-}
-
 fn identity_style(app: &App, stack_id: &BranchId, is_trunk: bool, emphasis: Emphasis) -> Style {
     let repository_id = app
         .snapshot
@@ -739,37 +706,6 @@ fn compact_count(value: u64, width: usize) -> String {
     "?".into()
 }
 
-pub fn relative_time(timestamp: i64, now: SystemTime) -> String {
-    let now = now
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs() as i64;
-    let seconds = now - timestamp;
-    if seconds < -60 {
-        return "clock?".into();
-    }
-    if seconds < 60 {
-        "now".into()
-    } else if seconds < 3600 {
-        format!("{}m", seconds / 60)
-    } else if seconds < 172_800 {
-        format!("{}h", seconds / 3600)
-    } else {
-        format!("{}d", seconds / 86_400)
-    }
-}
-
-pub fn exact_time(timestamp: i64) -> String {
-    DateTime::from_timestamp(timestamp, 0)
-        .map(|value| {
-            value
-                .with_timezone(&Local)
-                .format("%Y-%m-%d %H:%M:%S %:z")
-                .to_string()
-        })
-        .unwrap_or_else(|| "unavailable".into())
-}
-
 fn truncate(value: &str, width: usize) -> String {
     let count = value.chars().count();
     if count <= width {
@@ -784,146 +720,4 @@ fn truncate(value: &str, width: usize) -> String {
     let mut output: String = value.chars().take(width - 1).collect();
     output.push('…');
     output
-}
-
-pub fn detail(branch: &Branch) -> String {
-    let pr = branch
-        .pr
-        .as_ref()
-        .map(|pr| format!("PR #{} {}", pr.number, pr.title))
-        .unwrap_or_else(|| "No matching open PR".into());
-    let worktree = branch
-        .worktree
-        .as_ref()
-        .map(|path| format!("Worktree: {}", path.display()))
-        .unwrap_or_else(|| "Worktree: not checked out".into());
-    format!(
-        "{}\nLast edited: {}\n{}\n{}",
-        branch.id,
-        exact_time(branch.committed_at),
-        worktree,
-        pr
-    )
-}
-
-pub fn local_detail(branch: &Branch) -> String {
-    let worktree = branch
-        .worktree
-        .as_ref()
-        .map(|path| format!("Worktree: {}", path.display()))
-        .unwrap_or_else(|| "Worktree: not checked out".into());
-    format!(
-        "{}\nLast edited: {}\n{}\n{}\n{}\nArchive view: local refs only · no fetch",
-        branch.id,
-        exact_time(branch.committed_at),
-        worktree,
-        upstream_detail(&branch.configured_upstream),
-        remote_detail(&branch.remote_ref),
-    )
-}
-
-pub fn evidence_source_footer(branch: &Branch) -> String {
-    match &branch.remote_ref {
-        RemoteRefEvidence::Contained {
-            source_token,
-            checked_at,
-            ..
-        }
-        | RemoteRefEvidence::LocalOnly {
-            source_token,
-            checked_at,
-        } => format!(
-            "local-ref token {:016x} @ {}",
-            source_token,
-            system_time(*checked_at)
-        ),
-        RemoteRefEvidence::Unavailable {
-            source_token,
-            checked_at,
-            ..
-        } => format!(
-            "local-ref token {} @ {}",
-            source_token
-                .map(|token| format!("{token:016x}"))
-                .unwrap_or_else(|| "unknown".into()),
-            system_time(*checked_at)
-        ),
-        RemoteRefEvidence::Checking => "local-ref evidence checking…".into(),
-        RemoteRefEvidence::NotRequested => "local-ref evidence not checked".into(),
-    }
-}
-
-fn upstream_detail(upstream: &ConfiguredUpstream) -> String {
-    match upstream {
-        ConfiguredUpstream::None => "Configured upstream: none".into(),
-        ConfiguredUpstream::Equal { reference } => {
-            format!("Configured upstream: {reference} (equal)")
-        }
-        ConfiguredUpstream::Ahead { reference, ahead } => {
-            format!("Configured upstream: {reference} (ahead {ahead})")
-        }
-        ConfiguredUpstream::Behind { reference, behind } => {
-            format!("Configured upstream: {reference} (behind {behind})")
-        }
-        ConfiguredUpstream::Diverged {
-            reference,
-            ahead,
-            behind,
-        } => format!("Configured upstream: {reference} (ahead {ahead}, behind {behind})"),
-        ConfiguredUpstream::Gone { reference } => {
-            format!("Configured upstream: {reference} (gone from local refs)")
-        }
-        ConfiguredUpstream::Unavailable { reference, reason } => format!(
-            "Configured upstream: {} (unavailable: {reason})",
-            reference.as_deref().unwrap_or("unknown")
-        ),
-    }
-}
-
-fn remote_detail(evidence: &RemoteRefEvidence) -> String {
-    match evidence {
-        RemoteRefEvidence::NotRequested => "Remote-ref evidence: not checked".into(),
-        RemoteRefEvidence::Checking => "Remote-ref evidence: checking local refs…".into(),
-        RemoteRefEvidence::Contained {
-            reference,
-            source_token,
-            checked_at,
-        } => format!(
-            "Remote-ref evidence: contained in {reference}; source {:016x} @ {}",
-            source_token,
-            system_time(*checked_at)
-        ),
-        RemoteRefEvidence::LocalOnly {
-            source_token,
-            checked_at,
-        } => format!(
-            "Remote-ref evidence: local only; source {:016x} @ {}",
-            source_token,
-            system_time(*checked_at)
-        ),
-        RemoteRefEvidence::Unavailable {
-            reason,
-            source_token,
-            checked_at,
-        } => format!(
-            "Remote-ref evidence: unavailable ({reason}); source {} @ {}",
-            source_token
-                .map(|token| format!("{token:016x}"))
-                .unwrap_or_else(|| "unknown".into()),
-            system_time(*checked_at)
-        ),
-    }
-}
-
-fn system_time(time: SystemTime) -> String {
-    time.duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| DateTime::from_timestamp(duration.as_secs() as i64, 0))
-        .map(|value| {
-            value
-                .with_timezone(&Local)
-                .format("%Y-%m-%d %H:%M:%S %:z")
-                .to_string()
-        })
-        .unwrap_or_else(|| "unavailable".into())
 }

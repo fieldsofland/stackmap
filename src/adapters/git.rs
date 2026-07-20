@@ -6,51 +6,28 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use super::command::{CommandError, CommandOutput, run_bounded};
-use super::graphite::{raw_branch_metadata_has_child, raw_branch_metadata_presence, read_topology};
+#[cfg(test)]
+use super::command::CommandError;
+use super::command::{CommandOutput, run_bounded};
+#[cfg(test)]
+use super::graphite::raw_branch_metadata_presence;
+use super::graphite::{raw_branch_metadata_has_child, read_topology};
 use crate::model::{BranchId, ConfiguredUpstream, DiffStat, GraphiteProvenance, RepositoryState};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(3);
 const UPSTREAM_GIT_TIMEOUT: Duration = Duration::from_millis(250);
 const OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 const UPSTREAM_OUTPUT_LIMIT: usize = 256 * 1024;
-type DeleteContractCache = Arc<Mutex<Option<Result<(), Arc<str>>>>>;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DeleteRequest {
-    pub branch: BranchId,
-    pub expected_oid: Arc<str>,
-    pub expected_provenance: GraphiteProvenance,
-}
+mod inventory;
+mod mutation;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DeleteOutcome {
-    Deleted,
-    Unchanged,
-    Inconsistent,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GitBranch {
-    pub id: BranchId,
-    pub oid: Arc<str>,
-    pub committed_at: i64,
-    pub worktree: Option<PathBuf>,
-    pub configured_upstream: ConfiguredUpstream,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GitInventory {
-    pub root: PathBuf,
-    pub git_dir: PathBuf,
-    pub common_dir: PathBuf,
-    pub repository_id: Arc<str>,
-    pub branches: Vec<GitBranch>,
-    pub current: Option<BranchId>,
-    pub dirty: bool,
-    pub state: RepositoryState,
-    pub source_token: u64,
-}
+pub use inventory::{GitBranch, GitInventory};
+use mutation::{
+    DeleteCommandRunner, DeleteContractCache, DeletePostStateReader, SystemDeleteCommandRunner,
+    SystemDeletePostStateReader,
+};
+pub use mutation::{DeleteOutcome, DeleteRequest};
 
 #[derive(Clone, Debug)]
 pub struct GitAdapter {
@@ -59,53 +36,6 @@ pub struct GitAdapter {
     git_dir: PathBuf,
     common_dir: PathBuf,
     gt_delete_contract: DeleteContractCache,
-}
-
-trait DeleteCommandRunner {
-    fn run(
-        &self,
-        args: &[&OsStr],
-        cwd: &Path,
-        timeout: Duration,
-        output_limit: usize,
-    ) -> std::result::Result<CommandOutput, CommandError>;
-}
-
-struct SystemDeleteCommandRunner;
-
-trait DeletePostStateReader {
-    fn exact_local_ref(&self, adapter: &GitAdapter, branch: &BranchId) -> Result<Option<Arc<str>>>;
-    fn metadata_present(&self, common_dir: &Path, branch: &BranchId) -> Result<bool>;
-}
-
-struct SystemDeletePostStateReader;
-
-impl DeletePostStateReader for SystemDeletePostStateReader {
-    fn exact_local_ref(&self, adapter: &GitAdapter, branch: &BranchId) -> Result<Option<Arc<str>>> {
-        adapter.exact_local_ref(branch)
-    }
-
-    fn metadata_present(&self, common_dir: &Path, branch: &BranchId) -> Result<bool> {
-        raw_branch_metadata_presence(common_dir, branch)
-    }
-}
-
-impl DeleteCommandRunner for SystemDeleteCommandRunner {
-    fn run(
-        &self,
-        args: &[&OsStr],
-        cwd: &Path,
-        timeout: Duration,
-        output_limit: usize,
-    ) -> std::result::Result<CommandOutput, CommandError> {
-        run_bounded(
-            OsStr::new("gt"),
-            args.iter().copied(),
-            cwd,
-            timeout,
-            output_limit,
-        )
-    }
 }
 
 impl GitAdapter {
