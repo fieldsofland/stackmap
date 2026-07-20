@@ -1,10 +1,25 @@
 [package]
 name = "stackmap"
-version = "0.0.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 rust-version = "1.88"
 description = "A fast local-first Graphite stack map for the terminal"
 license = "MIT"
+repository = "https://github.com/fieldsofland/stackmap"
+readme = "README.md"
+keywords = ["git", "graphite", "terminal", "tui", "branches"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/rust-toolchain.toml",
+    "/README.md",
+    "/LICENSE",
+    "/src/**",
+    "/tests/**",
+    "/benches/**",
+]
 autobenches = false
 
 [dependencies]

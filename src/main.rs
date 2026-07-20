@@ -88,6 +88,17 @@ enum CliAction {
     },
 }
 
+fn help_text() -> String {
+    format!(
+        "stackmap {}\n\nUSAGE:\n    stackmap [--current] [REPOSITORY]\n\nRun a live local branch and Graphite stack map. Press ? in the TUI for keys.",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn version_text() -> String {
+    format!("stackmap {}", env!("CARGO_PKG_VERSION"))
+}
+
 fn parse_cli<I, S>(args: I) -> std::result::Result<CliAction, String>
 where
     I: IntoIterator<Item = S>,
@@ -146,13 +157,11 @@ fn run() -> Result<()> {
     let cli = parse_cli(std::env::args_os().skip(1)).map_err(anyhow::Error::msg)?;
     let (repository, current) = match cli {
         CliAction::Help => {
-            println!(
-                "stackmap 0.0.0\n\nUSAGE:\n    stackmap [--current] [REPOSITORY]\n\nRun a live local branch and Graphite stack map. Press ? in the TUI for keys."
-            );
+            println!("{}", help_text());
             return Ok(());
         }
         CliAction::Version => {
-            println!("stackmap {}", env!("CARGO_PKG_VERSION"));
+            println!("{}", version_text());
             return Ok(());
         }
         CliAction::Run {
@@ -725,5 +734,12 @@ mod tests {
         ] {
             assert!(parse_cli(args).is_err(), "accepted ambiguous args");
         }
+    }
+
+    #[test]
+    fn help_and_version_share_the_cargo_package_version() {
+        let expected = format!("stackmap {}", env!("CARGO_PKG_VERSION"));
+        assert!(help_text().starts_with(&expected));
+        assert_eq!(version_text(), expected);
     }
 }

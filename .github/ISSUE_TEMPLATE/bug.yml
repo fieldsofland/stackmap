@@ -1,0 +1,50 @@
+name: Bug report
+description: Report a reproducible Stackmap problem using sanitized details.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Never upload credentials, private branch or PR names, Git configuration,
+        repository contents, or Graphite databases. Use placeholders.
+  - type: input
+    id: version
+    attributes:
+      label: Stackmap version
+      placeholder: stackmap 0.1.0-alpha.1
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Sanitized environment
+      description: macOS version, architecture, terminal, Git, Graphite CLI, and gh versions.
+    validations:
+      required: true
+  - type: textarea
+    id: shape
+    attributes:
+      label: Repository shape
+      description: Describe only the sanitized number of trunks, stacks, branches, and linked worktrees.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction
+      description: List the minimal steps, expected behavior, and actual behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized output
+      render: shell
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed credentials and private repository metadata.
+          required: true

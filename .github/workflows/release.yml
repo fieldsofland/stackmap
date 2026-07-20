@@ -1,0 +1,130 @@
+name: Prerelease
+
+on:
+  push:
+    tags: ["v*-alpha.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Validate tag and release line
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | sed -n '1p')
+          test "${GITHUB_REF_NAME}" = "v${version}"
+          echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$'
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - run: cargo fetch --locked
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-targets --all-features
+      - run: scripts/check-package-contents.sh
+
+  policy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features
+
+  build:
+    needs: [verify, policy]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            arch: arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Build native archive and smoke test
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          root="stackmap-${version}-${{ matrix.arch }}"
+          mkdir "$root"
+          cp "target/${{ matrix.target }}/release/stackmap" "$root/stackmap"
+          cp README.md LICENSE "$root/"
+          chmod 755 "$root/stackmap"
+          "$root/stackmap" --version | grep -Fqx "stackmap $version"
+          test "$(uname -m)" = "${{ matrix.arch }}"
+          temp=$(mktemp -d)
+          git -C "$temp" init -b main
+          printf q | script -q /dev/null "$PWD/$root/stackmap" "$temp"
+          tar -czf "$root.tar.gz" "$root/stackmap" "$root/README.md" "$root/LICENSE"
+          scripts/verify-release-artifact.sh "$root.tar.gz" "$version" "${{ matrix.arch }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: stackmap-${{ matrix.arch }}
+          path: stackmap-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: macos-15
+    environment: prerelease
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: stackmap-*
+          path: dist
+          merge-multiple: true
+      - name: Validate complete aggregation
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          test "$(find dist -type f -name '*.tar.gz' | wc -l | tr -d ' ')" = 2
+          test -f "dist/stackmap-${version}-arm64.tar.gz"
+          test -f "dist/stackmap-${version}-x86_64.tar.gz"
+          scripts/verify-release-artifact.sh "dist/stackmap-${version}-arm64.tar.gz" "$version" arm64
+          scripts/verify-release-artifact.sh "dist/stackmap-${version}-x86_64.tar.gz" "$version" x86_64
+          (cd dist && shasum -a 256 stackmap-*.tar.gz > SHA256SUMS)
+          test "$(wc -l < dist/SHA256SUMS | tr -d ' ')" = 2
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release already exists: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            dist/stackmap-*.tar.gz
+            dist/SHA256SUMS
+      - name: Publish complete prerelease
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/stackmap-${version}-arm64.tar.gz" \
+            "dist/stackmap-${version}-x86_64.tar.gz" \
+            dist/SHA256SUMS \
+            --verify-tag --prerelease --generate-notes \
+            --title "stackmap $version"
+        env:
+          GH_TOKEN: ${{ github.token }}

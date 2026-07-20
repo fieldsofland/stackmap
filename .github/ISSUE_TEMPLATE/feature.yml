@@ -1,0 +1,26 @@
+name: Feature request
+description: Propose a focused improvement to Stackmap.
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow is difficult today?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe the user-visible result, not only an implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and compatibility impact
+      description: Note effects on Git mutation, configuration, keybindings, Graphite, terminal behavior, or resource bounds.
+    validations:
+      required: true

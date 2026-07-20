@@ -5,9 +5,9 @@ It keeps the full local branch topology open in a compact, searchable TUI,
 shows parent-relative diffstats, marks worktree safety state, refreshes after
 external Git changes, and optionally adds matching GitHub pull requests.
 
-This repository currently ships a `0.0.0` prototype for hands-on testing.
-The v0 platform target is macOS; terminal rendering and Git reads may work on
-other Unix systems, but open/copy integration is only supported on macOS.
+The current release is the unsigned, not-notarized `0.1.0-alpha.1` preview for
+macOS 15+ on Apple Silicon and Intel. See the [feature guide](docs/features.md),
+[support policy](docs/support.md), and [release verification guide](docs/releasing.md).
 
 ## Install
 
@@ -18,12 +18,17 @@ Requirements:
 - Graphite CLI metadata (optional)
 - GitHub CLI authenticated for the repository (optional)
 
-Build and install from this checkout:
+Download the matching `arm64` or `x86_64` archive from
+[GitHub Releases](https://github.com/fieldsofland/stackmap/releases), verify it
+using [the release guide](docs/releasing.md), or build from a tagged checkout:
 
 ```sh
 cargo test --locked
 cargo install --path . --locked
 ```
+
+Stackmap is not published to crates.io, so `cargo install stackmap` is not a
+supported installation path during the alpha.
 
 Then open any local repository:
 
@@ -42,7 +47,7 @@ stackmap --current /path/to/repository
 `--current` opens only the current branch's stack plus its shared ancestry and
 trunk. Without it, every configured Graphite trunk and its stacks are visible.
 
-## What the prototype shows
+## What Stackmap shows
 
 ```text
  stackmap  /repo                                      live
@@ -218,6 +223,7 @@ cargo fmt --all -- --check
 cargo clippy --locked --offline --all-targets --all-features -- -D warnings
 cargo test --locked --offline --all-targets --all-features
 cargo build --release --locked
+scripts/check-package-contents.sh
 ```
 
 The integration suite uses real temporary Git repositories for inventory,
@@ -225,3 +231,13 @@ refresh, and checkout protection. Other tests cover cycles and duplicate
 branches, Graphite schema degradation, fixed responsive fields, 500-branch
 reachability, bounded command output/cache size, stale GitHub responses, and
 release of obsolete snapshots across 100 refresh generations.
+
+## Project policies
+
+- [Feature guide](docs/features.md)
+- [Platform support](docs/support.md)
+- [Graphite compatibility](docs/graphite-compatibility.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security](SECURITY.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Release process](docs/releasing.md)
