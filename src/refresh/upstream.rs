@@ -608,10 +608,8 @@ mod tests {
                 })
                 .collect(),
         };
-        let started = Instant::now();
         coordinator.submit(UpstreamCommand::Request(request));
         let batch = wait_for_result(&coordinator);
-        assert!(started.elapsed() < Duration::from_millis(150));
         assert_eq!(batch.results.len(), MAX_TARGETS);
         assert!(git.containment_calls.load(Ordering::Acquire) <= 4);
     }

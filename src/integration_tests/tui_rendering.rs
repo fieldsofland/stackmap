@@ -181,7 +181,23 @@ fn trunk_uses_reserved_bold_hue_and_checked_out_marker() {
     assert_eq!(line.chars().next(), Some('◉'));
     assert_eq!(char_column(line, "main"), Some(2));
     let marker = &terminal.backend().buffer()[(0, y as u16)];
-    assert_eq!(marker.fg, trunk_color());
+    let accent = trunk_color();
+    assert_eq!(
+        marker.bg,
+        if accent == Color::Reset {
+            selected_background()
+        } else {
+            accent
+        }
+    );
+    assert_eq!(
+        marker.fg,
+        if accent == Color::Reset {
+            Color::Reset
+        } else {
+            Color::Black
+        }
+    );
     assert!(marker.modifier.contains(Modifier::BOLD));
 
     app.config
