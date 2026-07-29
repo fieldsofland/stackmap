@@ -2,7 +2,7 @@ use super::common;
 
 use std::sync::Arc;
 
-use crate::app::{Action, App, Overlay};
+use crate::app::{Action, App, ConfigTarget, Overlay};
 use crate::config::ArchiveMutation;
 use crate::events::Key;
 use crate::model::topology::{ArchiveMode, ProjectionEntry};
@@ -48,6 +48,62 @@ fn visible(app: &App) -> Vec<&str> {
             _ => None,
         })
         .collect()
+}
+
+#[test]
+fn filtered_floating_section_label_can_recolor_and_repairs_when_anchor_is_pruned() {
+    let mut app = App::default();
+    app.apply_snapshot(snapshot());
+    app.selected = Some(BranchId::new("alpha"));
+    assert!(matches!(
+        app.handle_key(Key::Character('i')),
+        Action::PersistConfig(_)
+    ));
+    app.handle_key(Key::Character('n'));
+    for character in "Alpha feature".chars() {
+        app.handle_key(Key::Character(character));
+    }
+    assert!(matches!(
+        app.handle_key(Key::Enter),
+        Action::PersistConfig(_)
+    ));
+    app.selected_label = None;
+    app.selected = Some(BranchId::new("alpha"));
+    assert!(matches!(
+        app.handle_key(Key::Character('x')),
+        Action::PersistConfig(_)
+    ));
+    app.selected_label = Some(ConfigTarget::VisualSection(BranchId::new("alpha")));
+    app.selected = Some(BranchId::new("alpha"));
+    assert!(
+        !app.projection
+            .branch_to_visual
+            .contains_key(&BranchId::new("alpha"))
+    );
+    assert!(app.projection.entries.iter().any(|entry| matches!(entry,
+        ProjectionEntry::VisualSectionLabel(label) if label.anchor == BranchId::new("alpha"))));
+    let Action::PersistConfig(recolor) = app.handle_key(Key::Character('c')) else {
+        panic!("floating label should remain a valid color target");
+    };
+    assert!(
+        recolor
+            .mutation
+            .visual_section_updates
+            .contains_key(&BranchId::new("alpha"))
+    );
+
+    let mut pruned = (*common::snapshot(vec![common::branch("main", None, "main", true)])).clone();
+    pruned.generation = 2;
+    app.apply_snapshot(Arc::new(pruned));
+    assert!(app.config.visual_section(&BranchId::new("alpha")).is_none());
+    assert!(app.selected_label.is_none());
+    let cleanup = app
+        .take_config_write_request()
+        .expect("pruning persists cleanup");
+    assert_eq!(
+        cleanup.mutation.visual_section_updates[&BranchId::new("alpha")],
+        None
+    );
 }
 
 #[test]

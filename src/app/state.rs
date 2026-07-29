@@ -103,6 +103,7 @@ pub struct DeleteConfirmation {
 pub enum MutationState {
     #[default]
     Idle,
+    ConfirmingCheckout(BranchId),
     CheckingOut(BranchId),
     ConfirmingDeletion(DeleteConfirmation),
     Deleting(DeleteConfirmation),
@@ -168,7 +169,7 @@ pub struct OrderPicker {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColorPicker {
-    pub target: BranchId,
+    pub target: ConfigTarget,
     pub original: Option<Arc<str>>,
     pub pending: Option<Arc<str>>,
     pub choice_index: usize,
@@ -176,8 +177,29 @@ pub struct ColorPicker {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StackNameEditor {
-    pub target: BranchId,
+    pub target: ConfigTarget,
     pub draft: String,
+    pub cursor: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConfigTarget {
+    Stack(BranchId),
+    VisualSection(BranchId),
+}
+
+impl ConfigTarget {
+    pub fn branch(&self) -> &BranchId {
+        match self {
+            Self::Stack(branch) | Self::VisualSection(branch) => branch,
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.branch().fmt(formatter)
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

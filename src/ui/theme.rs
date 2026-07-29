@@ -6,6 +6,32 @@ use crate::config::Config;
 use crate::model::BranchId;
 
 #[cfg(test)]
+thread_local! {
+    static TEST_NO_COLOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn no_color_requested() -> bool {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return true;
+    }
+    #[cfg(test)]
+    if TEST_NO_COLOR.with(std::cell::Cell::get) {
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+pub(crate) fn with_no_color<T>(operation: impl FnOnce() -> T) -> T {
+    TEST_NO_COLOR.with(|flag| {
+        let previous = flag.replace(true);
+        let result = operation();
+        flag.set(previous);
+        result
+    })
+}
+
+#[cfg(test)]
 pub const TRUNK_COLOR_HEX: &str = "#e0af68";
 const TRUNK_RGB: (u8, u8, u8) = (224, 175, 104);
 
@@ -21,7 +47,7 @@ const PALETTE: &[(u8, u8, u8)] = &[
 ];
 
 pub fn stack_color(repository_id: &str, root: &BranchId, config: &Config) -> Color {
-    if std::env::var_os("NO_COLOR").is_some() {
+    if no_color_requested() {
         return Color::Reset;
     }
     if let Some(value) = config.color(root).and_then(parse_hex)
@@ -37,7 +63,7 @@ pub fn stack_color(repository_id: &str, root: &BranchId, config: &Config) -> Col
 }
 
 pub fn trunk_color() -> Color {
-    if std::env::var_os("NO_COLOR").is_some() {
+    if no_color_requested() {
         Color::Reset
     } else {
         Color::Rgb(TRUNK_RGB.0, TRUNK_RGB.1, TRUNK_RGB.2)
@@ -48,8 +74,15 @@ pub fn selected_background() -> Color {
     Color::Rgb(52, 68, 92)
 }
 
-pub fn current_background() -> Color {
-    Color::Rgb(31, 38, 52)
+pub fn current_background(accent: Color) -> Color {
+    match accent {
+        Color::Rgb(red, green, blue) => Color::Rgb(
+            (red as f32 * 0.4).round() as u8,
+            (green as f32 * 0.4).round() as u8,
+            (blue as f32 * 0.4).round() as u8,
+        ),
+        _ => Color::Rgb(31, 38, 52),
+    }
 }
 
 fn parse_hex(value: &str) -> Option<Color> {
@@ -58,4 +91,12 @@ fn parse_hex(value: &str) -> Option<Color> {
         u8::from_str_radix(value.get(3..5)?, 16).ok()?,
         u8::from_str_radix(value.get(5..7)?, 16).ok()?,
     ))
+}
+
+pub fn visual_section_color(value: &str) -> Color {
+    if no_color_requested() {
+        Color::Reset
+    } else {
+        parse_hex(value).unwrap_or(Color::Reset)
+    }
 }

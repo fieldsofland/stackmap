@@ -84,7 +84,7 @@ fn linear_stack_is_bottom_up_with_trunk_at_section_bottom() {
 }
 
 #[test]
-fn stack_name_is_a_nonselectable_row_immediately_above_the_stack_head() {
+fn stack_name_has_a_dedicated_spacer_before_the_stack_head() {
     let snapshot = fork_snapshot();
     let projection = TopologyIndex::build(&snapshot).project(&ProjectionOptions {
         stack_names: HashMap::from([(BranchId::new("1"), Arc::<str>::from("Primary work"))]),
@@ -95,11 +95,15 @@ fn stack_name_is_a_nonselectable_row_immediately_above_the_stack_head() {
         .iter()
         .find(|head| head.stack_id == BranchId::new("1"))
         .expect("named stack head");
-    let label_row = head.visual_row.checked_sub(1).expect("label before head");
+    let label_row = head.visual_row.checked_sub(2).expect("label before spacer");
     assert!(matches!(
         &projection.entries[label_row],
         ProjectionEntry::StackLabel(label)
             if label.stack_id == BranchId::new("1") && label.text.as_ref() == "Primary work"
+    ));
+    assert!(matches!(
+        &projection.entries[label_row + 1],
+        ProjectionEntry::Divider(DividerRow::Spacer { .. })
     ));
     assert_eq!(
         projection.selectable.len(),
@@ -108,6 +112,154 @@ fn stack_name_is_a_nonselectable_row_immediately_above_the_stack_head() {
             .iter()
             .filter(|entry| matches!(entry, ProjectionEntry::Branch(_)))
             .count()
+    );
+    assert!(projection.navigation.iter().any(|target| matches!(
+        target,
+        crate::model::topology::SelectionTarget::StackLabel(stack)
+            if stack == &BranchId::new("1")
+    )));
+}
+
+#[test]
+fn named_stack_and_first_section_project_as_title_spacer_section_branch() {
+    let projection = TopologyIndex::build(&fork_snapshot()).project(&ProjectionOptions {
+        separators: false,
+        stack_names: HashMap::from([(BranchId::new("1"), Arc::<str>::from("Primary work"))]),
+        visual_sections: HashMap::from([(
+            BranchId::new("1"),
+            crate::model::topology::VisualSectionSpec {
+                color: Arc::from("#7aa2f7"),
+                name: Some(Arc::from("Foundation")),
+            },
+        )]),
+        ..ProjectionOptions::default()
+    });
+    let label = projection
+        .entries
+        .iter()
+        .position(|entry| matches!(entry, ProjectionEntry::StackLabel(_)))
+        .unwrap();
+
+    assert!(matches!(
+        projection.entries[label + 1],
+        ProjectionEntry::Divider(DividerRow::Spacer { .. })
+    ));
+    assert!(matches!(
+        projection.entries[label + 2],
+        ProjectionEntry::VisualSectionLabel(_)
+    ));
+    assert!(matches!(
+        projection.entries[label + 3],
+        ProjectionEntry::Branch(_)
+    ));
+    assert_eq!(
+        projection
+            .navigation
+            .iter()
+            .filter(|target| matches!(
+                target,
+                crate::model::topology::SelectionTarget::StackLabel(_)
+                    | crate::model::topology::SelectionTarget::VisualSectionLabel(_)
+            ))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn visual_sections_accumulate_text_depth_without_moving_topology_lanes() {
+    let mut snapshot = (*common::snapshot(vec![
+        tracked("main", None, "main", "main", 1),
+        tracked("root", None, "root", "main", 2),
+        tracked("middle", Some("root"), "root", "main", 3),
+        tracked("tip", Some("middle"), "root", "main", 4),
+    ]))
+    .clone();
+    snapshot.graphite_children = Arc::from([
+        (BranchId::new("main"), Arc::from([BranchId::new("root")])),
+        (BranchId::new("root"), Arc::from([BranchId::new("middle")])),
+        (BranchId::new("middle"), Arc::from([BranchId::new("tip")])),
+    ]);
+    let snapshot = Arc::new(snapshot);
+    let topology = TopologyIndex::build(&snapshot);
+    let baseline = topology.project(&ProjectionOptions::default());
+    let projection = topology.project(&ProjectionOptions {
+        visual_sections: HashMap::from([
+            (
+                BranchId::new("root"),
+                crate::model::topology::VisualSectionSpec {
+                    color: Arc::from("#7aa2f7"),
+                    name: Some(Arc::from("Foundation")),
+                },
+            ),
+            (
+                BranchId::new("middle"),
+                crate::model::topology::VisualSectionSpec {
+                    color: Arc::from("#7aa2f7"),
+                    name: Some(Arc::from("Follow-up")),
+                },
+            ),
+        ]),
+        ..ProjectionOptions::default()
+    });
+
+    for branch in ["root", "middle", "tip", "main"] {
+        assert_eq!(
+            projection.row_for(&BranchId::new(branch)).unwrap().lane,
+            baseline.row_for(&BranchId::new(branch)).unwrap().lane
+        );
+    }
+    assert_eq!(
+        projection
+            .row_for(&BranchId::new("root"))
+            .unwrap()
+            .manual_depth,
+        1
+    );
+    assert_ne!(
+        projection
+            .row_for(&BranchId::new("root"))
+            .unwrap()
+            .visual_color,
+        projection
+            .row_for(&BranchId::new("middle"))
+            .unwrap()
+            .visual_color,
+        "conflicting persisted colors resolve visibly without rewriting config"
+    );
+    let middle_effective = projection
+        .row_for(&BranchId::new("middle"))
+        .unwrap()
+        .visual_color
+        .clone()
+        .unwrap();
+    assert!(projection.entries.iter().any(|entry| matches!(entry,
+        ProjectionEntry::VisualSectionDivider(divider)
+            if divider.anchor == BranchId::new("middle") && divider.color == middle_effective)));
+    assert_eq!(
+        projection
+            .row_for(&BranchId::new("middle"))
+            .unwrap()
+            .manual_depth,
+        2
+    );
+    assert_eq!(
+        projection
+            .row_for(&BranchId::new("tip"))
+            .unwrap()
+            .manual_depth,
+        2
+    );
+    assert_eq!(
+        projection
+            .navigation
+            .iter()
+            .filter(|target| matches!(
+                target,
+                crate::model::topology::SelectionTarget::VisualSectionLabel(_)
+            ))
+            .count(),
+        2
     );
 }
 
@@ -143,6 +295,41 @@ fn first_child_stays_straight_and_side_stack_attaches_to_exact_parent() {
         .expect("side-stack connector");
     assert_eq!(connector.parent.as_ref(), Some(&BranchId::new("3")));
     assert_eq!((connector.from_lane, connector.to_lane), (2, 1));
+}
+
+#[test]
+fn stack_diff_endpoints_follow_each_real_displayed_group() {
+    let mut snapshot = (*fork_snapshot()).clone();
+    let mut branches = snapshot.branches.to_vec();
+    branches
+        .iter_mut()
+        .find(|branch| branch.id == BranchId::new("1"))
+        .unwrap()
+        .diff_parent = Some(BranchId::new("staging"));
+    snapshot.branch_index = crate::model::RepositorySnapshot::index_branches(&branches);
+    snapshot.branches = branches.into();
+
+    let endpoints: HashMap<_, _> = TopologyIndex::build(&snapshot)
+        .stack_diff_endpoints()
+        .into_iter()
+        .map(|value| (value.stack_id.clone(), value))
+        .collect();
+
+    let primary = &endpoints[&BranchId::new("1")];
+    assert_eq!(primary.bottom, BranchId::new("1"));
+    assert_eq!(primary.head, BranchId::new("4"));
+    assert_eq!(
+        snapshot.branch(&primary.bottom).unwrap().diff_parent,
+        Some(BranchId::new("staging"))
+    );
+
+    let side = &endpoints[&BranchId::new("3b")];
+    assert_eq!(side.bottom, BranchId::new("3b"));
+    assert_eq!(side.head, BranchId::new("3c"));
+    assert_eq!(
+        snapshot.branch(&side.bottom).unwrap().diff_parent,
+        Some(BranchId::new("3"))
+    );
 }
 
 #[test]

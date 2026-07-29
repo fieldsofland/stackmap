@@ -1,5 +1,52 @@
 # Changelog
 
+## 2026-07-29
+
+- Added a reviewed implementation plan for manual Stackmap-aware workflow preflight, dirty-safe committed-parent worktree routing, reversible local skill pilots, and color-coded main-row agent status beside the timestamp.
+- Rendered user-authored stack and visual-section titles in white across ordinary, selected, focused, and `NO_COLOR` states while branch names retain their stack/section identity colors and selected-row contrast.
+- [LEARN] “Names” in this UI refers to user-authored stack/section titles unless branch names are explicitly mentioned.
+- Expanded GitHub enrichment from open-only PRs to all states and added compact `Merged`, `Closed`, and `Approved` status labels, with the full status included in branch detail.
+- Added a right-side main-page remote safety column for pushed, ahead, behind, diverged, gone, no-remote, checking, and unavailable states; bounded no-fetch containment evidence now covers visible rows in Active and Archive views.
+- Verified formatting, 206 all-target/all-feature tests, benchmarks, strict offline Clippy, and the offline release build; installed the matching `stackmap 0.1.0-alpha.1` binary at `/Users/matt/.cargo/bin/stackmap` with SHA-256 `125d5706162938ad224e1bbe9fe94c134c5fb07026469374758e237850b50e02`.
+
+## 2026-07-28
+
+- Kept focused trunks pinned while making Shift+Down and `J` onto the trunk reposition the scrollable stack rows to their bottom-most viewport state.
+
+## 2026-07-27
+
+- Increased diff-column precision so compact values below ten thousand render one decimal digit, such as `4.3K`, while preserving aligned fixed-width metadata.
+- Extended downward stack navigation so Shift+Down and `J` move from the lowest stack to its configured trunk.
+- Added standard cursor-aware inline name editing with Left/Right, Home/End, insertion, Backspace, and forward Delete.
+- Added total owned branch counts to named stack rows.
+- Installed the verified lockfile-exact `stackmap 0.1.0-alpha.1` release at `/Users/matt/.cargo/bin/stackmap`; SHA-256 is `33e420645192bb2186a05da778ffef7331f35a45bdb0f3a141cc2620da5a3390`.
+- Added deferred roadmap notes for cross-host agent activity awareness and assisted Stackmap organization, with explicit boundaries around lifecycle reporting, inference confidence, terminal scraping, and Graphite-owned restacking.
+- Replaced the easy-to-miss footer-only branch checkout prompt with a centered confirmation popup that names the target and keeps Enter/Escape actions visible at the 40-column minimum.
+- Made structural branch-tip updates move the cursor to the newest changed branch visible in the current view, helping surface branches advanced by coding agents without reacting to enrichment-only refreshes.
+- Changed selected stack and visual-section labels to retain their identity-color highlight while rendering label and stack-summary diff text in white.
+- Bottom-aligned short focused sections above their pinned trunk row, removing the large empty gap previously left by top-aligned content.
+- Built the lockfile-exact offline release and installed the matching `stackmap 0.1.0-alpha.1` binary at `/Users/matt/.cargo/bin/stackmap`; SHA-256 is `c659871f5d0a386fd505344cd930dff066201541a9a64ab797b5e5a5492413bc`.
+
+## 2026-07-21
+
+- Added named-stack net diff summaries using each displayed topology group's validated base and real primary tip; branch rows remain parent-relative and side stacks keep independent endpoints.
+- Published branch/shared diff enrichment before aggregate-only summary work, retained four-worker/cache/cancellation bounds, and added 500/5,000-group scheduling characterization.
+- Added one dedicated nonselectable spacer below stack titles, kept section titles directly adjacent to their owned branches, and added a fixed diff-to-worktree metadata gutter.
+- Verified formatting, strict all-target/all-feature Clippy, 194 unit/binary tests, responsiveness benchmarks, 2 doctests, release build, and diff hygiene; installed the lockfile-exact release binary and passed disposable-repository startup/quit smoke testing.
+- Added a reviewed implementation plan for true cumulative stack-title diffs, clearer stack/section title hierarchy, and diff-to-worktree spacing, including fork/filter/archive correctness and an eager-enrichment performance gate.
+- Added explicit spacing between timestamp and diff columns and between the PR column and the terminal edge, with focused geometry/rendering coverage.
+- Added double-Enter branch checkout confirmation: the first Enter arms the exact selected branch, the second executes the existing protected checkout, and Escape or navigation cancels without invoking Git. Updated help/docs and installed the verified build.
+- Added a reviewed implementation plan for a versioned read-only agent status CLI, complete per-worktree dirty evidence, and `fm-mobile-review`/`worktree-rules` integration. Deferred JSONL watch, agent annotations, MCP, and mutations until one-shot usage demonstrates need.
+- Added persistent, purely visual feature sections: `i` creates/removes branch-anchored boundaries, section ranges accumulate name-only indentation, and Git/Graphite topology remains unchanged.
+- Added atomic section name/color persistence with coalesced-write, stale-completion, authoritative-pruning, deletion-cleanup, and cross-refresh protection.
+- Added adjacent-safe effective section colors, contextual `c`/`C`, colored dividers/labels/branch names, and non-color depth cues for 40-column layouts.
+- Made stack and section labels selectable and editable inline. `n` creates only missing labels; Enter edits selected labels; empty Enter removes a label; Escape cancels and restores selection.
+- Fixed name editing so printable navigation letters, key repeats, Backspace/Shift-Backspace, and ordinary text are consumed before global bindings; Ctrl-C cannot quit while editing.
+- Added dedicated topology, reducer, input, archive/filter, refresh/coalescing, rendering, `NO_COLOR`, and narrow-width coverage. Parent verification passes formatting, strict offline Clippy, 178 library tests, 8 binary tests, benchmark targets, 2 doctests, and the offline release build.
+- Installed the verified local test build at `/Users/matt/.cargo/bin/stackmap` and exercised section creation, inline `j/k/G/J` entry, persistence across restart, unchanged Git OID, and terminal restoration in a disposable repository.
+- Made the wide branch-detail sidebar hidden by default and session-toggleable with `d`, returning its width to the branch map when dismissed.
+- Improved row contrast: selected rows render branch names and all metadata in black over the full identity-color fill, while the unselected checked-out branch uses a 40% identity-color tint instead of a fixed dark background.
+
 ## 2026-07-20
 
 - Made monitoring non-interfering and event-driven: passive Git commands disable optional locks, relevant filesystem events debounce after a quiet period, noisy `.git` paths are ignored, and periodic reconciliation moved from 30 seconds to five minutes.

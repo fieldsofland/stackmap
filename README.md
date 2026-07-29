@@ -2,7 +2,7 @@
 
 `stackmap` is a local-first terminal map for Git branches and Graphite stacks.
 It keeps the full local branch topology open in a compact, searchable TUI,
-shows parent-relative diffstats, marks worktree safety state, refreshes after
+shows parent-relative branch diffstats and named-stack base-to-tip totals, marks worktree safety state, refreshes after
 external Git changes, and optionally adds matching GitHub pull requests.
 
 The current release is the unsigned, not-notarized `0.1.0-alpha.1` preview for
@@ -87,8 +87,19 @@ Markers are independent of color:
 
 Stack colors are deterministic. Yellow is reserved for PR data, while green
 and red represent insertions and deletions. Set `NO_COLOR=1` for non-color
-output. At 120 columns and wider, a detail pane shows the selected branch's
-exact local commit time and PR title.
+output. At 120 columns and wider, press `d` to show or hide a detail pane for
+the selected branch's exact local commit time and PR title. It starts hidden.
+
+Visual feature sections split a real stack into repository-local presentation
+ranges without changing Git or Graphite. Press `i` on a branch to start or
+remove a section. Successive sections indent branch-name text while leaving
+the real circles, rails, and connectors fixed. Custom stack and section titles
+remain white while branch names, dividers, and topology retain identity colors.
+
+A named stack gets its own title row, followed by one blank hierarchy row.
+That title shows the net diff from the validated parent of the stack's bottom
+branch to its real displayed tip; it is not a sum of branch rows. Named visual
+sections remain directly above the first visible branch they own.
 
 ## Keys
 
@@ -102,11 +113,13 @@ exact local commit time and PR title.
 | `h` | Focus the selected stack and shared ancestry; repeat to show all |
 | `H` | Focus the selected trunk (or Untrunked); repeat to show all |
 | `s` | Toggle blank rows between adjacent stacks (on by default) |
+| `d` | Show/hide the wide branch-detail sidebar (off by default) |
 | `+` / `-` / `0` | Increase / decrease lane pitch; reset to automatic width |
 | `/` | Filter by branch name; ancestors remain as dimmed context |
-| `Enter` | Ask Git to switch to the selected branch |
-| `c` / `C` | Cycle the selected stack color / open its color picker |
-| `n` | Name the selected stack; submit an empty name to clear it |
+| `Enter`, `Enter` | Arm and confirm switching the selected branch; one `Enter` edits a selected label |
+| `i` | Add/remove a purely visual section boundary on the selected branch |
+| `c` / `C` | Cycle/open color for the selected section boundary/label, otherwise its stack |
+| `n` | Create a missing stack/section label and edit it inline |
 | `x` | Archive/restore the selected branch and move focus to the nearest branch above |
 | `v`, arrows, `Enter` | Preview and apply a contiguous archive/restore range |
 | `a` | Toggle Active / Archive view |
@@ -117,7 +130,8 @@ exact local commit time and PR title.
 | `Esc` | Close help/message or cancel a filter edit |
 | `q`, `Ctrl-C` | Quit |
 
-Checkout is intentionally conservative. `stackmap` runs an exact `git switch
+Checkout is intentionally conservative. The first `Enter` arms the selected branch and the
+second confirms it; `Esc` or navigation cancels. `stackmap` then runs an exact `git switch
 -- <branch>` after re-reading live repository state. It never stashes, resets,
 cleans, deletes, or forces. Git's normal overwrite and worktree protections are
 preserved, and errors leave the current tree untouched.
@@ -136,12 +150,14 @@ blocks further deletion when the observed result is inconsistent.
 Archiving is the normal cleanup operation and never changes Git. Archived names
 persist in `<git-common-dir>/stackmap/config.toml`, are hidden from Active view,
 and can always be restored from Archive view. The current branch and trunks
-cannot be archived. Archive mode shows configured-upstream state plus whether
-the commit is contained by any locally available remote-tracking ref. Dim,
-nonselectable ancestry keeps each archived branch oriented in its stack. It never
-fetches: `local only` means no current local remote-tracking ref contains that
-commit, not that the commit is absent from the server. `remote ?` and
-`unavailable` are intentionally not treated as safe deletion evidence.
+cannot be archived. Active and Archive rows show compact configured-upstream
+and local remote-ref state in the right-side metadata: `✓ pushed`, `↑n ahead`,
+`↓n behind`, `↕n/n div`, `× gone`, `○ no remote`, or `? remote`. Dim,
+nonselectable ancestry keeps each archived branch oriented in its stack. This
+evidence never fetches: `○ no remote` means there is no configured upstream and
+no current local remote-tracking ref contains the commit, not that the commit
+is absent from the server. Unknown evidence is intentionally not treated as
+safe deletion evidence.
 
 ## Refresh and resource behavior
 
@@ -150,7 +166,9 @@ commit, not that the commit is absent from the server. `remote ?` and
   refresh queue. There is at most one active refresh and one pending request.
 - Structural snapshots publish immediately while an independent latest-state
   diff coordinator uses at most four workers and a 2,048-entry object-pair
-  cache. Older enriched snapshots cannot replace newer structure.
+  cache shared by branch and stack-title diffs. Older enriched snapshots cannot
+  replace newer structure. Branch/shared results publish before aggregate-only
+  stack work, so title summaries cannot delay ordinary branch evidence.
 - All inter-thread queues, subprocess output, and caches are bounded.
 - Immutable snapshots are replaced as a unit; stale diff snapshots are rejected
   by generation, while delayed PR results require a matching branch and object ID.
@@ -162,9 +180,9 @@ commit, not that the commit is absent from the server. `remote ?` and
 - The implementation contains no application `unsafe` blocks. Rust ownership,
   bounded queues/caches, subprocess timeouts, and snapshot-release tests protect
   the long-running process from retained generations and unbounded growth.
-- Archive-only remote-ref checks use one active/latest-pending coordinator,
-  bounded targets, output, result queue, deadline, and cache. Leaving Archive
-  cancels obsolete work; Active view never starts containment checks.
+- Visible-row remote-ref checks use one active/latest-pending coordinator with
+  bounded targets, output, result queue, deadline, and cache in both Active and
+  Archive views. View and scroll changes replace obsolete work.
 
 Run the deterministic 500-branch projection benchmark with:
 
@@ -197,7 +215,7 @@ state; every Git-local branch remains visible as an independent root. The tool
 never writes or migrates Graphite files.
 
 GitHub enrichment is optional. A single-flight, TTL-limited bounded `gh pr list`
-request retrieves open PRs, and results attach only when branch name and tip
+request retrieves PRs in all states, and results attach only when branch name and tip
 object ID still match. Missing auth, offline operation, timeout, or malformed
 JSON is shown as provider state and does not affect local navigation.
 

@@ -5,6 +5,7 @@ use anyhow::{Result, bail};
 
 use crate::adapters::git::GitAdapter;
 use crate::adapters::graphite::read_topology;
+use crate::model::topology::TopologyIndex;
 use crate::model::{Branch, BranchId, DiffState, RepositorySnapshot};
 
 pub struct SnapshotBuilder {
@@ -68,7 +69,7 @@ impl SnapshotBuilder {
             branches.sort_by(|left, right| left.id.cmp(&right.id));
             let mut graphite_children: Vec<_> = graphite.child_order.into_iter().collect();
             graphite_children.sort_by(|left, right| left.0.cmp(&right.0));
-            let snapshot = RepositorySnapshot {
+            let mut snapshot = RepositorySnapshot {
                 generation: self.generation,
                 root: inventory.root,
                 git_dir: inventory.git_dir,
@@ -80,11 +81,19 @@ impl SnapshotBuilder {
                 graphite_children: graphite_children.into(),
                 branch_index: RepositorySnapshot::index_branches(&branches),
                 branches: Arc::from(branches),
+                stack_diffs: Arc::new(HashMap::new()),
                 state: inventory.state,
                 graphite_status: graphite.status,
                 stale_error: None,
             };
             snapshot.validate()?;
+            snapshot.stack_diffs = Arc::new(
+                TopologyIndex::build(&snapshot)
+                    .stack_diff_endpoints()
+                    .into_iter()
+                    .map(|endpoints| (endpoints.stack_id, DiffState::Loading))
+                    .collect(),
+            );
             return Ok(Arc::new(snapshot));
         }
         bail!("repository changed during three snapshot attempts")

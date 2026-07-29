@@ -3,6 +3,12 @@ use std::sync::Arc;
 
 use super::super::BranchId;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VisualSectionSpec {
+    pub color: Arc<str>,
+    pub name: Option<Arc<str>>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OrderMode {
     Recent,
@@ -49,6 +55,8 @@ pub struct ProjectionOptions {
     pub archive_mode: ArchiveMode,
     pub archived: HashSet<BranchId>,
     pub stack_names: HashMap<BranchId, Arc<str>>,
+    pub stack_colors: HashMap<BranchId, Arc<str>>,
+    pub visual_sections: HashMap<BranchId, VisualSectionSpec>,
 }
 
 impl Default for ProjectionOptions {
@@ -61,6 +69,8 @@ impl Default for ProjectionOptions {
             archive_mode: ArchiveMode::Active,
             archived: HashSet::new(),
             stack_names: HashMap::new(),
+            stack_colors: HashMap::new(),
+            visual_sections: HashMap::new(),
         }
     }
 }
@@ -81,6 +91,9 @@ pub struct ProjectedRow {
     pub context_only: bool,
     pub is_trunk: bool,
     pub emphasis: Emphasis,
+    pub manual_depth: usize,
+    pub visual_section: Option<BranchId>,
+    pub visual_color: Option<Arc<str>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,6 +121,28 @@ pub struct StackLabelRow {
     pub stack_id: BranchId,
     pub lane: usize,
     pub text: Arc<str>,
+    pub branch_count: usize,
+    pub emphasis: Emphasis,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VisualSectionLabelRow {
+    pub anchor: BranchId,
+    pub stack_id: BranchId,
+    pub lane: usize,
+    pub manual_depth: usize,
+    pub text: Arc<str>,
+    pub color: Arc<str>,
+    pub emphasis: Emphasis,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VisualSectionDividerRow {
+    pub anchor: BranchId,
+    pub stack_id: BranchId,
+    pub lane: usize,
+    pub manual_depth: usize,
+    pub color: Arc<str>,
     pub emphasis: Emphasis,
 }
 
@@ -122,6 +157,8 @@ pub enum DividerRow {
 pub enum ProjectionEntry {
     Section(ProjectedSection),
     StackLabel(StackLabelRow),
+    VisualSectionLabel(VisualSectionLabelRow),
+    VisualSectionDivider(VisualSectionDividerRow),
     Branch(ProjectedRow),
     Divider(DividerRow),
 }
@@ -142,6 +179,13 @@ pub struct StackAnchor {
     pub visual_row: usize,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum SelectionTarget {
+    Branch(BranchId),
+    StackLabel(BranchId),
+    VisualSectionLabel(BranchId),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaneSpan {
     pub stack_id: BranchId,
@@ -155,6 +199,8 @@ pub struct TopologyProjection {
     pub entries: Vec<ProjectionEntry>,
     pub selectable: Vec<BranchId>,
     pub selectable_visual_rows: Vec<usize>,
+    pub navigation: Vec<SelectionTarget>,
+    pub navigation_visual_rows: Vec<usize>,
     pub branch_to_visual: HashMap<BranchId, usize>,
     pub branch_to_selectable: HashMap<BranchId, usize>,
     pub stack_heads: Vec<StackAnchor>,
