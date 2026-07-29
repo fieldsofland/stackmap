@@ -89,6 +89,26 @@ pub struct PullRequest {
     pub number: u64,
     pub title: Arc<str>,
     pub url: Arc<str>,
+    pub status: PullRequestStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PullRequestStatus {
+    Open,
+    Approved,
+    Closed,
+    Merged,
+}
+
+impl PullRequestStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::Approved => "Approved",
+            Self::Closed => "Closed",
+            Self::Merged => "Merged",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,6 +158,7 @@ pub struct RepositorySnapshot {
     pub graphite_children: Arc<[(BranchId, Arc<[BranchId]>)]>,
     pub branches: Arc<[Branch]>,
     pub branch_index: Arc<HashMap<BranchId, usize>>,
+    pub stack_diffs: Arc<HashMap<BranchId, DiffState>>,
     pub state: RepositoryState,
     pub graphite_status: Arc<str>,
     pub stale_error: Option<Arc<str>>,

@@ -8,9 +8,21 @@ mod index;
 mod projection;
 
 use emission::{EmitFrame, EmitPhase};
+
+type ManualSectionProjection = HashMap<BranchId, (usize, Option<(BranchId, Arc<str>)>)>;
+const VISUAL_SECTION_COLORS: [&str; 8] = [
+    "#7aa2f7", "#bb9af7", "#7dcfff", "#ff9e64", "#9ece6a", "#f7768e", "#2ac3de", "#c0caf5",
+];
 pub use index::TopologyIndex;
 use index::{Node, ProjectionGroupState, StackGroup};
 pub use projection::*;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StackDiffEndpoints {
+    pub stack_id: BranchId,
+    pub bottom: BranchId,
+    pub head: BranchId,
+}
 
 impl TopologyIndex {
     pub fn build(snapshot: &RepositorySnapshot) -> Self {
@@ -182,6 +194,19 @@ impl TopologyIndex {
         self.stack_by_branch.get(branch)
     }
 
+    pub fn stack_diff_endpoints(&self) -> Vec<StackDiffEndpoints> {
+        self.groups
+            .values()
+            .filter_map(|group| {
+                Some(StackDiffEndpoints {
+                    stack_id: group.id.clone(),
+                    bottom: group.branches.first()?.clone(),
+                    head: group.branches.last()?.clone(),
+                })
+            })
+            .collect()
+    }
+
     pub fn trunk_for(&self, branch: &BranchId) -> Option<&BranchId> {
         self.nodes.get(branch)?.trunk.as_ref()
     }
@@ -191,6 +216,32 @@ impl TopologyIndex {
     }
 
     pub fn project(&self, options: &ProjectionOptions) -> TopologyProjection {
+        // Manual section depth is derived from the complete stack, before any visibility
+        // projection, so filtering and archive views cannot make labels jump sideways.
+        let mut manual_sections = HashMap::new();
+        for group in self.groups.values() {
+            let mut depth = 0usize;
+            let mut active: Option<(BranchId, Arc<str>)> = None;
+            let mut lower_color = options.stack_colors.get(&group.id).cloned();
+            for branch in &group.branches {
+                if let Some(section) = options.visual_sections.get(branch) {
+                    depth += 1;
+                    let color = if lower_color.as_deref() == Some(section.color.as_ref()) {
+                        VISUAL_SECTION_COLORS
+                            .iter()
+                            .find(|candidate| Some(**candidate) != lower_color.as_deref())
+                            .copied()
+                            .map(Arc::from)
+                            .unwrap_or_else(|| section.color.clone())
+                    } else {
+                        section.color.clone()
+                    };
+                    lower_color = Some(color.clone());
+                    active = Some((branch.clone(), color));
+                }
+                manual_sections.insert(branch.clone(), (depth, active.clone()));
+            }
+        }
         let emphasis_by_branch = self.emphasis_for_scope(&options.scope);
         let needle = options.filter.to_lowercase();
         let filter_active = !needle.is_empty();
@@ -338,6 +389,7 @@ impl TopologyIndex {
                     &named_visible,
                     exact_matches.as_ref(),
                     &group_states,
+                    &manual_sections,
                     &mut projection,
                 ) else {
                     continue;
@@ -394,6 +446,9 @@ impl TopologyIndex {
                             .is_some_and(|matches| !matches.contains(trunk_id)),
                         is_trunk: true,
                         emphasis,
+                        manual_depth: 0,
+                        visual_section: None,
+                        visual_color: None,
                     },
                 );
             }
@@ -444,6 +499,24 @@ impl TopologyIndex {
                     .resize_with(span.lane + 1, Vec::new);
             }
             projection.lane_spans_by_lane[span.lane].push(span);
+        }
+        for (visual_row, entry) in projection.entries.iter().enumerate() {
+            let target = match entry {
+                ProjectionEntry::Branch(row) if !row.context_only => {
+                    Some(SelectionTarget::Branch(row.branch.clone()))
+                }
+                ProjectionEntry::StackLabel(label) => {
+                    Some(SelectionTarget::StackLabel(label.stack_id.clone()))
+                }
+                ProjectionEntry::VisualSectionLabel(label) => {
+                    Some(SelectionTarget::VisualSectionLabel(label.anchor.clone()))
+                }
+                _ => None,
+            };
+            if let Some(target) = target {
+                projection.navigation.push(target);
+                projection.navigation_visual_rows.push(visual_row);
+            }
         }
         projection
     }
@@ -605,6 +678,7 @@ impl TopologyIndex {
         named_visible: &HashSet<BranchId>,
         exact_matches: Option<&HashSet<BranchId>>,
         group_states: &[ProjectionGroupState],
+        manual_sections: &ManualSectionProjection,
         projection: &mut TopologyProjection,
     ) -> Option<usize> {
         let root = self.groups.get(stack)?;
@@ -614,6 +688,7 @@ impl TopologyIndex {
         }
 
         let mut started = HashSet::new();
+        let mut emitted_visual_section_labels = HashSet::new();
         started.insert(stack.clone());
         let mut frames = vec![EmitFrame {
             stack: stack.clone(),
@@ -786,6 +861,8 @@ impl TopologyIndex {
                                 .unwrap_or_default()
                         };
                         if all_named || named_visible.contains(&branch) {
+                            let (manual_depth, visual_section) =
+                                manual_sections.get(&branch).cloned().unwrap_or((0, None));
                             if frames.last().is_some_and(|frame| frame.head.is_none())
                                 && let Some(text) = options.stack_names.get(&stack_id).cloned()
                             {
@@ -798,6 +875,36 @@ impl TopologyIndex {
                                         stack_id: stack_id.clone(),
                                         lane,
                                         text,
+                                        branch_count: self.groups[&stack_id].branches.len(),
+                                        emphasis,
+                                    },
+                                ));
+                                let spacer_row = projection.entries.len();
+                                frame.last_row = Some(spacer_row);
+                                projection.entries.push(ProjectionEntry::Divider(
+                                    DividerRow::Spacer {
+                                        section: section.cloned(),
+                                    },
+                                ));
+                            }
+                            if let Some((anchor, color)) = &visual_section
+                                && let Some(section) = options.visual_sections.get(anchor)
+                                && section.name.is_some()
+                                && emitted_visual_section_labels.insert(anchor.clone())
+                            {
+                                let text = section.name.clone().expect("checked section name");
+                                let label_row = projection.entries.len();
+                                let frame = frames.last_mut().expect("emission frame");
+                                frame.first_row.get_or_insert(label_row);
+                                frame.last_row = Some(label_row);
+                                projection.entries.push(ProjectionEntry::VisualSectionLabel(
+                                    VisualSectionLabelRow {
+                                        anchor: anchor.clone(),
+                                        stack_id: stack_id.clone(),
+                                        lane,
+                                        manual_depth,
+                                        text,
+                                        color: color.clone(),
                                         emphasis,
                                     },
                                 ));
@@ -821,8 +928,38 @@ impl TopologyIndex {
                                         .is_some_and(|matches| !matches.contains(&branch)),
                                     is_trunk: false,
                                     emphasis,
+                                    manual_depth,
+                                    visual_section: visual_section
+                                        .as_ref()
+                                        .map(|(anchor, _)| anchor.clone()),
+                                    visual_color: visual_section
+                                        .as_ref()
+                                        .map(|(_, color)| color.clone()),
                                 },
                             );
+                            if let Some(section) = options.visual_sections.get(&branch) {
+                                let effective_color = visual_section
+                                    .as_ref()
+                                    .filter(|(anchor, _)| anchor == &branch)
+                                    .map(|(_, color)| color.clone())
+                                    .unwrap_or_else(|| section.color.clone());
+                                projection
+                                    .entries
+                                    .push(ProjectionEntry::VisualSectionDivider(
+                                        VisualSectionDividerRow {
+                                            anchor: branch.clone(),
+                                            stack_id: frames
+                                                .last()
+                                                .expect("emission frame")
+                                                .stack
+                                                .clone(),
+                                            lane,
+                                            manual_depth,
+                                            color: effective_color,
+                                            emphasis,
+                                        },
+                                    ));
+                            }
                         } else {
                             let visual_row = projection.entries.len();
                             let frame = frames.last_mut().expect("emission frame");

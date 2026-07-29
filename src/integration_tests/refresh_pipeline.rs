@@ -4,8 +4,9 @@ use std::sync::Arc;
 use std::{fs, path::PathBuf};
 
 use crate::adapters::git::GitAdapter;
-use crate::app::App;
+use crate::app::{Action, App};
 use crate::config::config_path;
+use crate::events::Key;
 use crate::model::BranchId;
 use crate::model::RemoteRefEvidence;
 use crate::refresh::builder::SnapshotBuilder;
@@ -40,6 +41,66 @@ fn reducer_does_not_retain_obsolete_snapshot_generations() {
     assert!(
         weak.upgrade().is_none(),
         "obsolete immutable snapshot was retained"
+    );
+}
+
+#[test]
+fn pending_visual_section_mutations_coalesce_and_stale_completion_cannot_restore_removed_data() {
+    let mut app = App::default();
+    let mut root = common::branch("feature", None, "feature", false);
+    root.trunk = Some(BranchId::new("main"));
+    root.graphite = crate::model::GraphiteProvenance::Tracked;
+    let mut main = common::branch("main", None, "main", true);
+    main.trunk = Some(BranchId::new("main"));
+    main.graphite = crate::model::GraphiteProvenance::Tracked;
+    let mut snapshot = (*common::snapshot(vec![main, root])).clone();
+    snapshot.configured_trunks = Arc::from([BranchId::new("main")]);
+    snapshot.trunks = snapshot.configured_trunks.clone();
+    snapshot.graphite_children =
+        Arc::from([(BranchId::new("main"), Arc::from([BranchId::new("feature")]))]);
+    app.apply_snapshot(Arc::new(snapshot.clone()));
+    app.selected = Some(BranchId::new("feature"));
+
+    let Action::PersistConfig(created) = app.handle_key(Key::Character('i')) else {
+        panic!("create");
+    };
+    let Action::PersistConfig(recolored) = app.handle_key(Key::Character('c')) else {
+        panic!("recolor");
+    };
+    app.handle_key(Key::Character('n'));
+    for character in "Named".chars() {
+        app.handle_key(Key::Character(character));
+    }
+    let Action::PersistConfig(named) = app.handle_key(Key::Enter) else {
+        panic!("name");
+    };
+    app.selected_label = None;
+    app.selected = Some(BranchId::new("feature"));
+    let Action::PersistConfig(removed) = app.handle_key(Key::Character('i')) else {
+        panic!("remove");
+    };
+    assert_eq!(
+        removed.mutation.visual_section_updates[&BranchId::new("feature")],
+        None
+    );
+
+    app.finish_config_persistence(created.sequence, Ok(()));
+    app.finish_config_persistence(recolored.sequence, Ok(()));
+    app.finish_config_persistence(named.sequence, Ok(()));
+    let pending = app
+        .prepare_pending_config_persistence(removed.clone())
+        .expect("latest removal remains pending after older completions");
+    assert_eq!(
+        pending.mutation.visual_section_updates[&BranchId::new("feature")],
+        None
+    );
+
+    snapshot.generation = 2;
+    app.apply_snapshot(Arc::new(snapshot));
+    assert!(
+        app.config
+            .visual_section(&BranchId::new("feature"))
+            .is_none()
     );
 }
 
@@ -109,6 +170,90 @@ fn delayed_diff_enrichment_does_not_clear_structural_failure() {
 }
 
 #[test]
+fn structural_tip_change_moves_selection_to_changed_branch() {
+    let initial = common::snapshot(vec![
+        common::branch("main", None, "main", true),
+        common::branch("agent-work", None, "agent-work", false),
+        common::branch("other", None, "other", false),
+    ]);
+    let mut app = App::default();
+    app.apply_snapshot(initial.clone());
+    app.selected = Some(BranchId::new("other"));
+
+    let mut changed = (*initial).clone();
+    changed.generation = 2;
+    let branch = Arc::make_mut(&mut changed.branches)
+        .iter_mut()
+        .find(|branch| branch.id == BranchId::new("agent-work"))
+        .unwrap();
+    branch.oid = Arc::from("oid-agent-work-updated");
+    branch.committed_at += 10;
+    app.apply_snapshot(Arc::new(changed));
+
+    assert_eq!(app.selected, Some(BranchId::new("agent-work")));
+    assert!(app.selected_label.is_none());
+}
+
+#[test]
+fn newest_selectable_tip_change_wins_and_hidden_changes_do_not_move_selection() {
+    let initial = common::snapshot(vec![
+        common::branch("main", None, "main", true),
+        common::branch("older", None, "older", false),
+        common::branch("newer", None, "newer", false),
+    ]);
+    let mut app = App::default();
+    app.apply_snapshot(initial.clone());
+    app.selected = Some(BranchId::new("main"));
+
+    let mut changed = (*initial).clone();
+    changed.generation = 2;
+    for branch in Arc::make_mut(&mut changed.branches) {
+        if branch.id == BranchId::new("older") {
+            branch.oid = Arc::from("oid-older-updated");
+            branch.committed_at += 10;
+        } else if branch.id == BranchId::new("newer") {
+            branch.oid = Arc::from("oid-newer-updated");
+            branch.committed_at += 20;
+        }
+    }
+    app.apply_snapshot(Arc::new(changed.clone()));
+    assert_eq!(app.selected, Some(BranchId::new("newer")));
+
+    app.filter = "main".into();
+    app.selected = Some(BranchId::new("main"));
+    changed.generation = 3;
+    Arc::make_mut(&mut changed.branches)
+        .iter_mut()
+        .find(|branch| branch.id == BranchId::new("older"))
+        .unwrap()
+        .oid = Arc::from("oid-older-updated-again");
+    app.apply_snapshot(Arc::new(changed));
+    assert_eq!(app.selected, Some(BranchId::new("main")));
+}
+
+#[test]
+fn enrichment_tip_change_does_not_move_selection() {
+    let initial = common::snapshot(vec![
+        common::branch("main", None, "main", true),
+        common::branch("agent-work", None, "agent-work", false),
+    ]);
+    let mut app = App::default();
+    app.apply_snapshot(initial.clone());
+    app.selected = Some(BranchId::new("main"));
+
+    let mut enriched = (*initial).clone();
+    enriched.generation = 2;
+    Arc::make_mut(&mut enriched.branches)
+        .iter_mut()
+        .find(|branch| branch.id == BranchId::new("agent-work"))
+        .unwrap()
+        .oid = Arc::from("oid-agent-work-updated");
+    app.apply_enriched_snapshot(Arc::new(enriched));
+
+    assert_eq!(app.selected, Some(BranchId::new("main")));
+}
+
+#[test]
 fn invalid_config_keeps_last_valid_in_memory_values() {
     let directory = tempfile::tempdir().unwrap();
     let path = config_path(directory.path());
@@ -130,14 +275,17 @@ fn invalid_config_keeps_last_valid_in_memory_values() {
 }
 
 #[test]
-fn active_view_never_requests_upstream_and_archive_targets_only_hidden_rows() {
+fn active_and_archive_views_request_remote_evidence_for_visible_rows() {
     let mut app = App::default();
     app.apply_snapshot(common::snapshot(vec![
         common::branch("main", None, "main", true),
         common::branch("hidden", None, "hidden", false),
         common::branch("visible", None, "visible", false),
     ]));
-    assert!(app.take_upstream_command().is_none());
+    let Some(UpstreamCommand::Request(active)) = app.take_upstream_command() else {
+        panic!("active view should request visible remote evidence");
+    };
+    assert_eq!(active.targets.len(), 3);
     app.config
         .set_archived_in_memory(&BranchId::new("hidden"), true);
 
@@ -159,7 +307,10 @@ fn active_view_never_requests_upstream_and_archive_targets_only_hidden_rows() {
     assert!(app.take_upstream_command().is_none());
 
     app.handle_key(crate::events::Key::Character('a'));
-    assert_eq!(app.take_upstream_command(), Some(UpstreamCommand::Cancel));
+    let Some(UpstreamCommand::Request(active_again)) = app.take_upstream_command() else {
+        panic!("returning to Active should request visible remote evidence");
+    };
+    assert_eq!(active_again.targets.len(), 2);
     assert!(app.take_upstream_command().is_none());
 }
 

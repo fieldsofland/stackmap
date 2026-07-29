@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -52,6 +53,7 @@ fn snapshot(count: usize, stack_size: usize) -> RepositorySnapshot {
         graphite_children: Arc::from([]),
         branches: Arc::from(branches),
         branch_index,
+        stack_diffs: Arc::new(HashMap::new()),
         state: RepositoryState::Ready,
         graphite_status: Arc::from("bench"),
         stale_error: None,

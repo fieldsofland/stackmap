@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -73,6 +74,7 @@ pub fn snapshot(branches: Vec<Branch>) -> Arc<RepositorySnapshot> {
         graphite_children: Arc::from([]),
         branches: Arc::from(branches),
         branch_index,
+        stack_diffs: Arc::new(HashMap::new()),
         state: RepositoryState::Ready,
         graphite_status: Arc::from("fixture"),
         stale_error: None,

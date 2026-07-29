@@ -27,6 +27,7 @@ pub struct RenderGeometry {
     pub time: Option<ColumnRange>,
     pub diff: ColumnRange,
     pub worktree: ColumnRange,
+    pub remote: Option<ColumnRange>,
     pub pr: Option<ColumnRange>,
 }
 
@@ -35,12 +36,24 @@ impl RenderGeometry {
         let width = width as usize;
         let wide_worktree = mode != WidthMode::Narrow;
         let show_time = width >= 56;
+        let show_remote = width >= 72;
         let show_pr = width >= 72;
         let time_width = usize::from(show_time) * 6;
-        let diff_width = 9;
+        let time_diff_gap = usize::from(show_time);
+        let diff_width = 10;
+        let diff_worktree_gap = 1;
         let worktree_width = if wide_worktree { 18 } else { 2 };
+        let remote_width = usize::from(show_remote) * 11;
         let pr_width = usize::from(show_pr) * 8;
-        let metadata_width = time_width + diff_width + worktree_width + pr_width;
+        let pr_edge_gap = usize::from(show_pr);
+        let metadata_width = time_width
+            + time_diff_gap
+            + diff_width
+            + diff_worktree_gap
+            + worktree_width
+            + remote_width
+            + pr_width
+            + pr_edge_gap;
         let metadata_start = width.saturating_sub(metadata_width);
         let mut cursor = metadata_start;
         let time = show_time.then(|| {
@@ -48,19 +61,27 @@ impl RenderGeometry {
                 x: cursor,
                 width: time_width,
             };
-            cursor += time_width;
+            cursor += time_width + time_diff_gap;
             range
         });
         let diff = ColumnRange {
             x: cursor,
             width: diff_width,
         };
-        cursor += diff_width;
+        cursor += diff_width + diff_worktree_gap;
         let worktree = ColumnRange {
             x: cursor,
             width: worktree_width,
         };
         cursor += worktree_width;
+        let remote = show_remote.then(|| {
+            let range = ColumnRange {
+                x: cursor,
+                width: remote_width,
+            };
+            cursor += remote_width;
+            range
+        });
         let pr = show_pr.then_some(ColumnRange {
             x: cursor,
             width: pr_width,
@@ -99,6 +120,7 @@ impl RenderGeometry {
             time,
             diff,
             worktree,
+            remote,
             pr,
         }
     }
@@ -149,7 +171,7 @@ pub fn width_mode(width: u16) -> WidthMode {
     }
 }
 
-pub fn areas(area: Rect) -> Areas {
+pub fn areas(area: Rect, show_detail: bool) -> Areas {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -159,7 +181,7 @@ pub fn areas(area: Rect) -> Areas {
         ])
         .split(area);
     let mode = width_mode(area.width);
-    let (body, detail) = if mode == WidthMode::Wide {
+    let (body, detail) = if mode == WidthMode::Wide && show_detail {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])

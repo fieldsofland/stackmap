@@ -6,14 +6,17 @@ use ratatui::widgets::Paragraph;
 use std::path::Path;
 use std::time::SystemTime;
 
-use crate::app::App;
+use crate::app::{App, ConfigTarget, Overlay};
 use crate::model::topology::{
     ArchiveMode, ConnectorRow, DividerRow, Emphasis, ProjectedRow, ProjectionEntry, StackLabelRow,
+    VisualSectionDividerRow, VisualSectionLabelRow,
 };
 use crate::model::{Branch, BranchId, ConfiguredUpstream, DiffState, RemoteRefEvidence};
 
 use super::layout::{ColumnRange, RenderGeometry, WidthMode};
-use super::theme::{current_background, selected_background, stack_color, trunk_color};
+use super::theme::{
+    current_background, selected_background, stack_color, trunk_color, visual_section_color,
+};
 
 mod connectors;
 mod details;
@@ -108,6 +111,12 @@ pub fn render_with_mode(
             ProjectionEntry::StackLabel(label) => {
                 stack_label_line(app, visual_row, label, geometry)
             }
+            ProjectionEntry::VisualSectionLabel(label) => {
+                visual_section_label_line(app, visual_row, label, geometry)
+            }
+            ProjectionEntry::VisualSectionDivider(divider) => {
+                visual_section_divider_line(app, visual_row, divider, geometry)
+            }
             ProjectionEntry::Divider(divider) => divider_line(app, visual_row, divider, geometry),
             ProjectionEntry::Branch(row) => {
                 let Some(branch) = snapshot.branch(&row.branch) else {
@@ -118,9 +127,15 @@ pub fn render_with_mode(
         };
         lines.push(line);
     }
+    let rendered_height = lines.len() as u16;
+    let content_y = if sticky.is_some() && focused_bounds.is_some() {
+        area.y + scroll_height.saturating_sub(rendered_height)
+    } else {
+        area.y
+    };
     frame.render_widget(
         Paragraph::new(lines),
-        Rect::new(area.x, area.y, area.width, scroll_height),
+        Rect::new(area.x, content_y, area.width, rendered_height),
     );
 
     if let Some(sticky_row) = sticky
@@ -153,6 +168,105 @@ pub fn render_with_mode(
     }
 }
 
+fn visual_section_label_line(
+    app: &App,
+    visual_row: usize,
+    label: &VisualSectionLabelRow,
+    geometry: RenderGeometry,
+) -> Line<'static> {
+    let mut cells = blank_cells(geometry.width);
+    let (bits, styles) = rail_bits(app, visual_row, geometry);
+    paint_bits(&mut cells, &bits, &styles, geometry.metadata_start);
+    let desired_x = geometry
+        .name_x(label.lane)
+        .saturating_add(label.manual_depth.saturating_mul(2));
+    let x = desired_x.min(geometry.metadata_start.saturating_sub(2));
+    let text = if x < desired_x {
+        format!("{} {}", label.manual_depth, label.text)
+    } else {
+        label.text.to_string()
+    };
+    let width = geometry.metadata_start.saturating_sub(x + 1);
+    let cursor = match &app.overlay {
+        Overlay::StackNameEditor(editor)
+            if editor.target == ConfigTarget::VisualSection(label.anchor.clone()) =>
+        {
+            Some(editor.cursor)
+        }
+        _ => None,
+    };
+    let text = inline_editor_text(&text, width, cursor);
+    put_text(
+        &mut cells,
+        x,
+        width,
+        &text,
+        emphasized(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+            label.emphasis,
+        ),
+    );
+    let selected = app.selected_label.as_ref()
+        == Some(&crate::app::ConfigTarget::VisualSection(
+            label.anchor.clone(),
+        ));
+    if selected {
+        set_symbol(
+            &mut cells,
+            1,
+            "›",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        );
+        for cell in &mut cells {
+            cell.style = cell.style.fg(Color::White);
+        }
+    }
+    let selected_background = selected.then(|| {
+        let color = visual_section_color(&label.color);
+        if color == Color::Reset {
+            selected_background()
+        } else {
+            color
+        }
+    });
+    cells_to_line(cells, selected_background)
+}
+
+fn visual_section_divider_line(
+    app: &App,
+    visual_row: usize,
+    divider: &VisualSectionDividerRow,
+    geometry: RenderGeometry,
+) -> Line<'static> {
+    let mut cells = blank_cells(geometry.width);
+    let (bits, styles) = rail_bits(app, visual_row, geometry);
+    paint_bits(&mut cells, &bits, &styles, geometry.metadata_start);
+    let desired_x = geometry
+        .name_x(divider.lane)
+        .saturating_add(divider.manual_depth.saturating_mul(2));
+    let x = desired_x.min(geometry.metadata_start.saturating_sub(2));
+    let divider_text = if x < desired_x {
+        format!("{}─", divider.manual_depth)
+    } else {
+        "────────".to_owned()
+    };
+    put_text(
+        &mut cells,
+        x,
+        geometry.metadata_start.saturating_sub(x + 1),
+        &divider_text,
+        emphasized(
+            Style::default().fg(visual_section_color(&divider.color)),
+            divider.emphasis,
+        ),
+    );
+    cells_to_line(cells, None)
+}
+
 fn section_line(title: &str, geometry: RenderGeometry) -> Line<'static> {
     let mut cells = blank_cells(geometry.width);
     put_text(
@@ -179,11 +293,34 @@ fn stack_label_line(
     if geometry.lane_overflows(label.lane) {
         paint_overflow_cue(&mut cells, geometry);
     }
+    let width = geometry.name_width(label.lane);
+    let cursor = match &app.overlay {
+        Overlay::StackNameEditor(editor)
+            if editor.target == ConfigTarget::Stack(label.stack_id.clone()) =>
+        {
+            Some(editor.cursor)
+        }
+        _ => None,
+    };
+    let count = format!(
+        " · {} {}",
+        label.branch_count,
+        if label.branch_count == 1 {
+            "branch"
+        } else {
+            "branches"
+        }
+    );
+    let name_width = width.saturating_sub(count.chars().count());
+    let text = format!(
+        "{}{count}",
+        inline_editor_text(&label.text, name_width, cursor)
+    );
     put_text(
         &mut cells,
         geometry.name_x(label.lane),
-        geometry.name_width(label.lane),
-        &label.text,
+        width,
+        &text,
         emphasized(
             Style::default()
                 .fg(Color::White)
@@ -191,7 +328,41 @@ fn stack_label_line(
             label.emphasis,
         ),
     );
-    cells_to_line(cells, None)
+    if let Some(diff) = app
+        .snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.stack_diffs.get(&label.stack_id))
+    {
+        paint_diff(&mut cells, geometry.diff, diff, label.emphasis);
+    }
+    let selected = app.selected_label.as_ref()
+        == Some(&crate::app::ConfigTarget::Stack(label.stack_id.clone()));
+    if selected {
+        set_symbol(
+            &mut cells,
+            1,
+            "›",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        );
+        for cell in &mut cells {
+            cell.style = cell.style.fg(Color::White);
+        }
+    }
+    let selected_background = selected.then(|| {
+        let color = app
+            .snapshot
+            .as_ref()
+            .map(|snapshot| stack_color(&snapshot.repository_id, &label.stack_id, &app.config))
+            .unwrap_or(Color::Reset);
+        if color == Color::Reset {
+            selected_background()
+        } else {
+            color
+        }
+    });
+    cells_to_line(cells, selected_background)
 }
 
 fn divider_line(
@@ -249,7 +420,7 @@ fn branch_line(
     now: SystemTime,
     geometry: RenderGeometry,
 ) -> Line<'static> {
-    let selected = app.selected.as_ref() == Some(&branch.id);
+    let selected = app.selected_label.is_none() && app.selected.as_ref() == Some(&branch.id);
     let background = if selected {
         let accent = if row.is_trunk {
             trunk_color()
@@ -267,7 +438,17 @@ fn branch_line(
             accent
         })
     } else if branch.current {
-        Some(current_background())
+        let accent = if row.is_trunk {
+            trunk_color()
+        } else {
+            let repository_id = app
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.repository_id.as_ref())
+                .unwrap_or_default();
+            stack_color(repository_id, &row.stack_id, &app.config)
+        };
+        Some(current_background(accent))
     } else {
         None
     };
@@ -320,15 +501,34 @@ fn branch_line(
         );
     }
 
-    let name_x = geometry.name_x(row.lane);
-    let name_width = geometry.name_width(row.lane);
+    let desired_name_x = geometry
+        .name_x(row.lane)
+        .saturating_add(row.manual_depth.saturating_mul(2));
+    let name_x = desired_name_x.min(geometry.metadata_start.saturating_sub(2));
+    let name_width = geometry
+        .metadata_start
+        .saturating_sub(name_x.saturating_add(1));
     let dirty = if branch.dirty { "*" } else { "" };
+    let branch_name = if name_x < desired_name_x {
+        format!("{} {}{dirty}", row.manual_depth, branch.id)
+    } else {
+        format!("{}{dirty}", branch.id)
+    };
     put_text(
         &mut cells,
         name_x,
         name_width,
-        &format!("{}{dirty}", branch.id),
-        identity,
+        &branch_name,
+        if selected {
+            identity
+        } else if let Some(color) = &row.visual_color {
+            emphasized(
+                Style::default().fg(visual_section_color(color)),
+                row.emphasis,
+            )
+        } else {
+            identity
+        },
     );
 
     let metadata_emphasis = row.emphasis;
@@ -350,15 +550,28 @@ fn branch_line(
             branch.worktree.as_deref(),
             metadata_emphasis,
         );
+        if let Some(range) = geometry.remote {
+            paint_remote_status(&mut cells, branch, range, metadata_emphasis);
+        }
         if let Some(range) = geometry.pr
             && let Some(pr) = &branch.pr
         {
             put_right(
                 &mut cells,
                 range,
-                &format!("#{}", pr.number),
+                match pr.status {
+                    crate::model::PullRequestStatus::Open => format!("#{}", pr.number),
+                    status => status.label().to_owned(),
+                }
+                .as_str(),
                 emphasized(Style::default().fg(Color::Yellow), metadata_emphasis),
             );
+        }
+    }
+
+    if selected {
+        for cell in &mut cells {
+            cell.style = cell.style.fg(Color::Black);
         }
     }
 
@@ -376,7 +589,7 @@ fn paint_archive_evidence(
         width: geometry.width.saturating_sub(geometry.metadata_start),
     };
     let compact = range.width < 20;
-    let mut badges = Vec::with_capacity(3);
+    let mut badges = Vec::with_capacity(2);
     if let Some(path) = branch.worktree.as_deref() {
         badges.push(if compact {
             "⎇".to_owned()
@@ -389,18 +602,9 @@ fn paint_archive_evidence(
             format!("⎇ {}", truncate(basename, 10))
         });
     }
-    if let Some(upstream) = upstream_badge(&branch.configured_upstream, compact) {
-        badges.push(upstream);
-    }
-    badges.push(remote_badge(&branch.remote_ref, compact));
+    let (remote, color) = remote_status(branch, compact);
+    badges.push(remote);
     let label = truncate(&badges.join(" "), range.width);
-    let color = match branch.remote_ref {
-        RemoteRefEvidence::Contained { .. } => Color::Green,
-        RemoteRefEvidence::LocalOnly { .. } => Color::Yellow,
-        RemoteRefEvidence::Checking
-        | RemoteRefEvidence::NotRequested
-        | RemoteRefEvidence::Unavailable { .. } => Color::DarkGray,
-    };
     put_text(
         cells,
         range.x,
@@ -410,86 +614,108 @@ fn paint_archive_evidence(
     );
 }
 
-fn upstream_badge(upstream: &ConfiguredUpstream, compact: bool) -> Option<String> {
-    Some(match upstream {
-        ConfiguredUpstream::None => return None,
+fn paint_remote_status(
+    cells: &mut [RenderCell],
+    branch: &Branch,
+    range: ColumnRange,
+    emphasis: Emphasis,
+) {
+    let (label, color) = remote_status(branch, range.width < 10);
+    put_right(
+        cells,
+        range,
+        &truncate(&label, range.width),
+        emphasized(Style::default().fg(color), emphasis),
+    );
+}
+
+fn remote_status(branch: &Branch, compact: bool) -> (String, Color) {
+    let label = match &branch.configured_upstream {
+        ConfiguredUpstream::None => match &branch.remote_ref {
+            RemoteRefEvidence::Contained { .. } => {
+                if compact {
+                    "✓".into()
+                } else {
+                    "✓ pushed".into()
+                }
+            }
+            RemoteRefEvidence::Checking => {
+                if compact {
+                    "…".into()
+                } else {
+                    "… checking".into()
+                }
+            }
+            RemoteRefEvidence::LocalOnly { .. } | RemoteRefEvidence::NotRequested => {
+                if compact {
+                    "○".into()
+                } else {
+                    "○ no remote".into()
+                }
+            }
+            RemoteRefEvidence::Unavailable { .. } => {
+                if compact {
+                    "?".into()
+                } else {
+                    "? remote".into()
+                }
+            }
+        },
         ConfiguredUpstream::Equal { .. } => {
             if compact {
-                "=".into()
+                "✓".into()
             } else {
-                "up =".into()
+                "✓ pushed".into()
             }
         }
         ConfiguredUpstream::Ahead { ahead, .. } => {
             if compact {
                 format!("↑{ahead}")
             } else {
-                format!("up ↑{ahead}")
+                format!("↑{ahead} ahead")
             }
         }
         ConfiguredUpstream::Behind { behind, .. } => {
             if compact {
                 format!("↓{behind}")
             } else {
-                format!("up ↓{behind}")
+                format!("↓{behind} behind")
             }
         }
         ConfiguredUpstream::Diverged { ahead, behind, .. } => {
             if compact {
-                format!("↑{ahead}↓{behind}")
+                format!("↕{ahead}/{behind}")
             } else {
-                format!("up ↑{ahead}↓{behind}")
+                format!("↕{ahead}/{behind} div")
             }
         }
         ConfiguredUpstream::Gone { .. } => {
             if compact {
-                "gone".into()
+                "×".into()
             } else {
-                "up gone".into()
+                "× gone".into()
             }
         }
         ConfiguredUpstream::Unavailable { .. } => {
             if compact {
-                "up?".into()
+                "?".into()
             } else {
-                "upstream ?".into()
+                "? remote".into()
             }
         }
-    })
-}
-
-fn remote_badge(evidence: &RemoteRefEvidence, compact: bool) -> String {
-    match evidence {
-        RemoteRefEvidence::Contained { .. } => {
-            if compact {
-                "r✓"
-            } else {
-                "remote-ref ✓"
-            }
-        }
-        RemoteRefEvidence::LocalOnly { .. } => {
-            if compact {
-                "local"
-            } else {
-                "local only"
-            }
-        }
-        RemoteRefEvidence::Checking => {
-            if compact {
-                "…"
-            } else {
-                "checking…"
-            }
-        }
-        RemoteRefEvidence::NotRequested | RemoteRefEvidence::Unavailable { .. } => {
-            if compact {
-                "r?"
-            } else {
-                "remote ?"
-            }
-        }
-    }
-    .into()
+    };
+    let color = match &branch.configured_upstream {
+        ConfiguredUpstream::Equal { .. } => Color::Green,
+        ConfiguredUpstream::Ahead { .. } | ConfiguredUpstream::None => match &branch.remote_ref {
+            RemoteRefEvidence::Contained { .. } => Color::Green,
+            RemoteRefEvidence::Checking | RemoteRefEvidence::Unavailable { .. } => Color::DarkGray,
+            _ => Color::Yellow,
+        },
+        ConfiguredUpstream::Behind { .. } => Color::Cyan,
+        ConfiguredUpstream::Diverged { .. } | ConfiguredUpstream::Gone { .. } => Color::Red,
+        ConfiguredUpstream::Unavailable { .. } => Color::DarkGray,
+    };
+    (label, color)
 }
 
 fn rail_bits(app: &App, visual_row: usize, geometry: RenderGeometry) -> (Vec<u8>, Vec<Style>) {
@@ -692,16 +918,26 @@ fn cells_to_line(cells: Vec<RenderCell>, background: Option<Color>) -> Line<'sta
 
 fn compact_count(value: u64, width: usize) -> String {
     let raw = value.to_string();
-    if raw.len() <= width {
+    if value < 1_000 && raw.len() <= width {
         return raw;
     }
     for (divisor, suffix) in [(1_000_000_000, "G"), (1_000_000, "M"), (1_000, "K")] {
         if value >= divisor {
+            if value < divisor * 10 {
+                let decimal = (value % divisor) / (divisor / 10);
+                let compact = format!("{}.{decimal}{suffix}", value / divisor);
+                if compact.len() <= width {
+                    return compact;
+                }
+            }
             let compact = format!("{}{suffix}", value / divisor);
             if compact.len() <= width {
                 return compact;
             }
         }
+    }
+    if raw.len() <= width {
+        return raw;
     }
     "?".into()
 }
@@ -720,4 +956,25 @@ fn truncate(value: &str, width: usize) -> String {
     let mut output: String = value.chars().take(width - 1).collect();
     output.push('…');
     output
+}
+
+fn inline_editor_text(value: &str, width: usize, cursor: Option<usize>) -> String {
+    let Some(cursor) = cursor else {
+        return truncate(value, width);
+    };
+    if width == 0 {
+        return String::new();
+    }
+    let characters = value.chars().collect::<Vec<_>>();
+    let cursor = cursor.min(characters.len());
+    let available = width.saturating_sub(1);
+    let start = cursor.saturating_sub(available);
+    let mut visible = characters[start..cursor].iter().collect::<String>();
+    visible.push('▏');
+    visible.extend(
+        characters[cursor..]
+            .iter()
+            .take(width.saturating_sub(visible.chars().count())),
+    );
+    visible
 }

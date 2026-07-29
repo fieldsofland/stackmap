@@ -46,9 +46,10 @@ pub fn header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 pub fn footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let position = app
-        .selected
-        .as_ref()
-        .and_then(|selected| app.projection.branch_to_selectable.get(selected).copied())
+        .projection
+        .navigation_visual_rows
+        .iter()
+        .position(|row| Some(*row) == app.selected_visual_row_for_ui())
         .map(|index| index + 1)
         .unwrap_or(0);
     let progress = app.mutation_progress();
@@ -58,11 +59,8 @@ pub fn footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         || app.refresh_error.is_some();
     let mut state = if app.overlay == Overlay::Search {
         format!(" /{}", app.filter)
-    } else if let Overlay::StackNameEditor(editor) = &app.overlay {
-        format!(
-            " NAME {}: {}  Enter save · empty clears · Esc cancel",
-            editor.target, editor.draft
-        )
+    } else if let Overlay::StackNameEditor(_) = &app.overlay {
+        " NAME  Enter save · empty clears · Esc cancel".to_owned()
     } else if let Overlay::ArchiveRange(range) = &app.overlay {
         format!(
             " RANGE {} {} branches  {} → {}  ↑↓ resize  Enter {}  Esc cancel",
@@ -115,7 +113,7 @@ pub fn footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             format!(
                 " {position}/{}  {order}  {}  {pitch}  a View {archive_target}  x {archive_action}  v range  X delete  ↑↓ {stack_navigation} ? help",
-                app.projection.selectable.len(),
+                app.projection.navigation.len(),
                 app.scope_label(),
             )
         }
@@ -186,7 +184,7 @@ pub fn help(frame: &mut Frame<'_>, app: &App) {
         GitHubState::Unavailable(error) => format!("unavailable: {error}"),
     };
     let text = format!(
-        "Markers: › selected  ○ branch  ● current  ◉ trunk\n         ■ range  * dirty  ⎇ worktree\n\n↑/↓ or j/k          previous/next branch\nShift/Cmd+↑/↓ J/K  adjacent stack head, otherwise ±10 rows\nAlt+↑/↓ g/G         top/bottom branch of current section\nt / T               Recent/Graphite toggle / order picker\n+ / - / 0           adjust / reset lane pitch\nh                   focus selected stack; repeat exits\nH                   focus trunk or all Untrunked; repeat exits\ns                   toggle stack spacing\na                   toggle Active / Archive view\nv + arrows          preview contiguous archive/restore range\n/                   filter branch names\nEnter               protected git switch\nc / C               cycle color / color picker\nn                   name / clear selected stack\nx                   archive / restore selected local branch\nX                   guarded delete exact local branch\nr                   full reconciliation\no / y               open / copy PR URL\nEsc                 close message/help\nq or Ctrl-C         quit\n\nLowercase x/v change local config only; uppercase X can delete one exact local ref after confirmation. No remote changes or fetch.\nArchive view shows dim, nonselectable ancestry for stack context.\nFocused sections pin their trunk/bottom row.\nArchive evidence uses local remote-tracking refs only; no fetch.\nColors: stack identity; yellow PR; green/red diff\nActive: {} / {} / {}\n\nGraphite: {graphite}\nGitHub: {github}",
+        "Markers: › selected  ○ branch  ● current  ◉ trunk\n         ■ range  * dirty  ⎇ worktree\nRemote:  ✓ pushed  ↑ ahead  ↓ behind  ↕ diverged\n         × gone  ○ no remote  ? unknown\n\n↑/↓ or j/k          previous/next branch\nShift/Cmd+↑/↓ J/K  adjacent stack head, otherwise ±10 rows\nAlt+↑/↓ g/G         top/bottom branch of current section\nt / T               Recent/Graphite toggle / order picker\n+ / - / 0           adjust / reset lane pitch\nh                   focus selected stack; repeat exits\nH                   focus trunk or all Untrunked; repeat exits\ns                   toggle stack spacing\na                   toggle Active / Archive view\nv + arrows          preview contiguous archive/restore range\n/                   filter branch names\nEnter ×2            arm / confirm protected git switch\nc / C               cycle color / color picker\nn                   name / clear selected stack\nx                   archive / restore selected local branch\nX                   guarded delete exact local branch\nr                   full reconciliation\no / y               open / copy PR URL\nEsc                 close message/help\nq or Ctrl-C         quit\n\nLowercase x/v change local config only; uppercase X can delete one exact local ref after confirmation. No remote changes or fetch.\nArchive view shows dim, nonselectable ancestry for stack context.\nFocused sections pin their trunk/bottom row.\nRemote evidence uses local remote-tracking refs only; no fetch.\nColors: stack identity; yellow PR; green/red diff\nActive: {} / {} / {}\n\nGraphite: {graphite}\nGitHub: {github}",
         match app.order_mode {
             OrderMode::Recent => "recent order",
             OrderMode::Alphabetical => "alphabetical order",
@@ -199,6 +197,10 @@ pub fn help(frame: &mut Frame<'_>, app: &App) {
         } else {
             "separators off"
         }
+    );
+    let text = text.replace(
+        "Enter ×2            arm / confirm protected git switch\nc / C               cycle color / color picker\nn                   name / clear selected stack",
+        "Enter ×2 / Enter    git switch / edit selected label\nc / C               contextual color / color picker\nd                   toggle wide detail sidebar\ni                   toggle visual section boundary\nn                   create missing stack/section label",
     );
     frame.render_widget(
         Paragraph::new(text)
@@ -264,6 +266,26 @@ pub fn color_picker(frame: &mut Frame<'_>, app: &App) {
         .block(
             Block::default()
                 .title(" Stack color ")
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
+}
+
+pub fn checkout_confirmation(frame: &mut Frame<'_>, app: &App) {
+    let MutationState::ConfirmingCheckout(target) = &app.mutation else {
+        return;
+    };
+    let area = centered(frame.area(), 64, 9);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Switch to this branch?\n\n{target}\n\nEnter switch · Esc cancel"
+        ))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title(" Confirm switch ")
                 .borders(Borders::ALL),
         ),
         area,

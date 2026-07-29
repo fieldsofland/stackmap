@@ -182,8 +182,17 @@ impl RefreshHandle {
                             };
                             snapshot
                         };
-                        if let Some(enriched) =
-                            diffstats::enrich(snapshot, &adapter, &mut cache, 4, &latest_generation)
+                        let publish_partial = |partial| {
+                            push_event(&events, RefreshEvent::Enriched(partial));
+                        };
+                        if let Some(enriched) = diffstats::enrich(
+                            snapshot,
+                            &adapter,
+                            &mut cache,
+                            4,
+                            &latest_generation,
+                            &publish_partial,
+                        )
                         {
                             push_event(&events, RefreshEvent::Enriched(enriched));
                         }

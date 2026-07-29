@@ -39,19 +39,21 @@ pub fn detail(branch: &Branch) -> String {
     let pr = branch
         .pr
         .as_ref()
-        .map(|pr| format!("PR #{} {}", pr.number, pr.title))
-        .unwrap_or_else(|| "No matching open PR".into());
+        .map(|pr| format!("PR #{} · {} · {}", pr.number, pr.status.label(), pr.title))
+        .unwrap_or_else(|| "No matching PR".into());
     let worktree = branch
         .worktree
         .as_ref()
         .map(|path| format!("Worktree: {}", path.display()))
         .unwrap_or_else(|| "Worktree: not checked out".into());
     format!(
-        "{}\nLast edited: {}\n{}\n{}",
+        "{}\nLast edited: {}\n{}\n{}\n{}\n{}\nRemote evidence uses local refs only · no fetch",
         branch.id,
         exact_time(branch.committed_at),
         worktree,
-        pr
+        pr,
+        upstream_detail(&branch.configured_upstream),
+        remote_detail(&branch.remote_ref),
     )
 }
 

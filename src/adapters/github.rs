@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::command::{CommandError, CommandOutput, run_bounded};
-use crate::model::{BranchId, PullRequest};
+use crate::model::{BranchId, PullRequest, PullRequestStatus};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -16,6 +16,8 @@ struct GhPullRequest {
     url: String,
     head_ref_name: String,
     head_ref_oid: Option<String>,
+    state: String,
+    review_decision: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,11 +75,11 @@ pub fn fetch(cwd: &Path) -> Result<Vec<PrMatch>, GitHubError> {
         "pr",
         "list",
         "--state",
-        "open",
+        "all",
         "--limit",
         "1000",
         "--json",
-        "number,title,url,headRefName,headRefOid",
+        "number,title,url,headRefName,headRefOid,state,reviewDecision",
     ];
     let output = run_bounded(
         OsStr::new("gh"),
@@ -115,6 +117,14 @@ pub fn parse_json(bytes: &[u8]) -> Result<Vec<PrMatch>, GitHubError> {
                     number: value.number,
                     title: Arc::from(value.title),
                     url: Arc::from(value.url),
+                    status: match value.state.as_str() {
+                        "MERGED" => PullRequestStatus::Merged,
+                        "CLOSED" => PullRequestStatus::Closed,
+                        _ if value.review_decision.as_deref() == Some("APPROVED") => {
+                            PullRequestStatus::Approved
+                        }
+                        _ => PullRequestStatus::Open,
+                    },
                 },
             })
         })

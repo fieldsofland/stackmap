@@ -550,6 +550,7 @@ fn restore_terminal(writer: &mut impl Write, keyboard_enhanced: bool) -> io::Res
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -605,6 +606,7 @@ mod tests {
             )]),
             branch_index: RepositorySnapshot::index_branches(&branches),
             branches: branches.into(),
+            stack_diffs: Arc::new(HashMap::new()),
             state: RepositoryState::Ready,
             graphite_status: Arc::from("fixture"),
             stale_error: None,

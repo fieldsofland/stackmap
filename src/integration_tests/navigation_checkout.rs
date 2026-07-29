@@ -8,7 +8,7 @@ use crate::adapters::git::GitAdapter;
 use crate::app::{
     Action, App, LanePitch, MutationState, Overlay, ReconciliationOperation, ViewScope,
 };
-use crate::config::{ArchiveMutation, Config, ConfigMutation, config_path};
+use crate::config::{ArchiveMutation, Config, ConfigMutation, VisualSection, config_path};
 use crate::events::{Input, Key};
 use crate::model::BranchId;
 use crate::model::topology::{OrderMode, ProjectionEntry};
@@ -175,6 +175,7 @@ fn color_picker_previews_rolls_back_and_commits_one_write() {
         Some(&Some(Arc::from("#7aa2f7")))
     );
     assert_eq!(app.overlay, Overlay::None);
+    assert_eq!(app.handle_key(Key::Enter), Action::None);
     assert_eq!(
         app.handle_key(Key::Enter),
         Action::Checkout(BranchId::new("alpha"))
@@ -242,8 +243,11 @@ fn stack_name_editor_prefills_saves_clears_cancels_and_refuses_trunks() {
     }));
 
     app.handle_key(Key::Character('n'));
+    assert_eq!(app.overlay, Overlay::None);
+    assert!(app.message.as_deref().unwrap().contains("Enter"));
+    app.handle_key(Key::Enter);
     let Overlay::StackNameEditor(editor) = &app.overlay else {
-        panic!("name editor should reopen");
+        panic!("Enter on the selected label should reopen the editor");
     };
     assert_eq!(editor.draft, "Release train");
     app.handle_key(Key::Escape);
@@ -252,7 +256,7 @@ fn stack_name_editor_prefills_saves_clears_cancels_and_refuses_trunks() {
         Some("Release train")
     );
 
-    app.handle_key(Key::Character('n'));
+    app.handle_key(Key::Enter);
     for _ in 0.."Release train".chars().count() {
         app.handle_key(Key::Backspace);
     }
@@ -272,6 +276,131 @@ fn stack_name_editor_prefills_saves_clears_cancels_and_refuses_trunks() {
     app.handle_key(Key::Character('n'));
     assert_eq!(app.overlay, Overlay::None);
     assert!(app.message.as_deref().unwrap().contains("trunk"));
+}
+
+#[test]
+fn stack_name_editor_supports_cursor_insertion_and_forward_delete() {
+    let mut app = App::default();
+    app.apply_snapshot(view_snapshot());
+    app.selected = Some(BranchId::new("alpha"));
+    app.handle_key(Key::Character('n'));
+    app.handle_key(Key::Character('a'));
+    app.handle_key(Key::Character('c'));
+    app.handle_key(Key::Left);
+    app.handle_key(Key::Character('b'));
+    let Overlay::StackNameEditor(editor) = &app.overlay else {
+        panic!("name editor");
+    };
+    assert_eq!(editor.draft, "abc");
+    assert_eq!(editor.cursor, 2);
+
+    app.handle_key(Key::Home);
+    app.handle_key(Key::Right);
+    app.handle_key(Key::Delete);
+    app.handle_key(Key::End);
+    app.handle_key(Key::Backspace);
+    let Overlay::StackNameEditor(editor) = &app.overlay else {
+        panic!("name editor");
+    };
+    assert_eq!(editor.draft, "a");
+    assert_eq!(editor.cursor, 1);
+}
+
+#[test]
+fn visual_section_toggle_names_inline_and_keeps_git_actions_off_labels() {
+    let mut app = App::default();
+    app.apply_snapshot(view_snapshot());
+    app.selected = Some(BranchId::new("alpha"));
+
+    let Action::PersistConfig(create) = app.handle_key(Key::Character('i')) else {
+        panic!("creating a visual section should persist");
+    };
+    let section = create.mutation.visual_section_updates[&BranchId::new("alpha")]
+        .as_ref()
+        .unwrap();
+    assert!(section.name.is_none());
+    assert!(
+        app.projection
+            .row_for(&BranchId::new("alpha"))
+            .unwrap()
+            .manual_depth
+            > 0
+    );
+
+    app.handle_key(Key::Character('n'));
+    for character in "jkgGJK section".chars() {
+        app.handle_key(Key::Character(character));
+    }
+    assert!(matches!(app.handle_key(Key::Quit), Action::None));
+    let Action::PersistConfig(named) = app.handle_key(Key::Enter) else {
+        panic!("section name should persist");
+    };
+    assert_eq!(
+        named.mutation.visual_section_updates[&BranchId::new("alpha")]
+            .as_ref()
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("jkgGJK section")
+    );
+    assert!(
+        app.selected_branch().is_none(),
+        "a selected label must not masquerade as a branch"
+    );
+    assert!(matches!(app.handle_key(Key::Enter), Action::None));
+    app.handle_key(Key::Escape);
+
+    app.selected_label = None;
+    app.selected = Some(BranchId::new("alpha"));
+    let Action::PersistConfig(remove) = app.handle_key(Key::Character('i')) else {
+        panic!("removing a visual section should persist");
+    };
+    assert_eq!(
+        remove.mutation.visual_section_updates[&BranchId::new("alpha")],
+        None
+    );
+}
+
+#[test]
+fn section_recolor_avoids_effective_neighbors_after_legacy_color_conflicts() {
+    let mut app = App::default();
+    app.apply_snapshot(view_snapshot());
+    for anchor in ["alpha", "alpha-tip"] {
+        app.config
+            .set_visual_section_in_memory(
+                &BranchId::new(anchor),
+                Some(VisualSection {
+                    color: "#7aa2f7".into(),
+                    name: None,
+                }),
+            )
+            .unwrap();
+    }
+    app.handle_key(Key::Character('t'));
+    let lower_effective = app
+        .projection
+        .row_for(&BranchId::new("alpha"))
+        .unwrap()
+        .visual_color
+        .clone()
+        .unwrap();
+    let upper_effective = app
+        .projection
+        .row_for(&BranchId::new("alpha-tip"))
+        .unwrap()
+        .visual_color
+        .clone()
+        .unwrap();
+    assert_ne!(lower_effective, upper_effective);
+
+    app.selected = Some(BranchId::new("alpha-tip"));
+    let Action::PersistConfig(request) = app.handle_key(Key::Character('c')) else {
+        panic!("recolor should remain available after conflict resolution");
+    };
+    let saved = request.mutation.visual_section_updates[&BranchId::new("alpha-tip")]
+        .as_ref()
+        .unwrap();
+    assert_ne!(saved.color, lower_effective.as_ref());
 }
 
 #[test]
@@ -372,6 +501,59 @@ fn stack_keys_jump_true_stacks_but_move_ten_rows_from_trunks_and_one_offs() {
     app.selected = Some(non_head);
     app.handle_key(Key::StackUp);
     assert_eq!(app.selected, Some(expected_other_stack));
+}
+
+#[test]
+fn stack_down_from_lowest_stack_lands_on_its_trunk() {
+    let mut app = App::default();
+    app.apply_snapshot(view_snapshot());
+    let lowest_stack = app
+        .projection
+        .stack_heads
+        .iter()
+        .filter(|head| app.projection.is_true_stack(&head.branch))
+        .max_by_key(|head| head.visual_row)
+        .unwrap()
+        .branch
+        .clone();
+    app.selected = Some(lowest_stack);
+
+    app.handle_key(Key::StackDown);
+
+    assert_eq!(app.selected, Some(BranchId::new("main")));
+}
+
+#[test]
+fn stack_down_to_sticky_trunk_scrolls_focused_stacks_to_the_bottom() {
+    let mut app = App::default();
+    app.apply_snapshot(view_snapshot());
+    app.selected = Some(BranchId::new("alpha"));
+    app.handle_key(Key::Character('H'));
+    app.set_viewport_height(3);
+
+    let sticky = app
+        .sticky_visual_row()
+        .expect("focused trunk should be sticky");
+    let start = app.focused_section_bounds().expect("focused section").0;
+    let lowest_stack = app
+        .projection
+        .stack_heads
+        .iter()
+        .filter(|head| app.projection.is_true_stack(&head.branch))
+        .max_by_key(|head| head.visual_row)
+        .expect("true stack")
+        .branch
+        .clone();
+    app.selected = Some(lowest_stack);
+    app.scroll = start;
+
+    app.handle_key(Key::StackDown);
+
+    assert_eq!(app.selected, Some(BranchId::new("main")));
+    assert_eq!(
+        app.scroll,
+        sticky.saturating_sub(app.viewport_height).max(start)
+    );
 }
 
 #[test]
@@ -573,11 +755,35 @@ fn enter_emits_one_checkout_while_checkout_is_running() {
         common::branch("feature", None, "feature", false),
     ]));
     app.selected = Some(BranchId::new("feature"));
+    assert_eq!(app.handle_key(Key::Enter), Action::None);
+    assert!(matches!(
+        app.mutation,
+        MutationState::ConfirmingCheckout(ref target) if target == &BranchId::new("feature")
+    ));
     assert_eq!(
         app.handle_key(Key::Enter),
         Action::Checkout(BranchId::new("feature"))
     );
     assert_eq!(app.handle_key(Key::Enter), Action::None);
+}
+
+#[test]
+fn checkout_confirmation_cancels_on_escape_or_navigation() {
+    let mut app = App::default();
+    app.apply_snapshot(common::snapshot(vec![
+        common::branch("main", None, "main", true),
+        common::branch("feature", None, "feature", false),
+    ]));
+    app.selected = Some(BranchId::new("feature"));
+
+    assert_eq!(app.handle_key(Key::Enter), Action::None);
+    assert_eq!(app.handle_key(Key::Escape), Action::None);
+    assert!(matches!(app.mutation, MutationState::Idle));
+
+    assert_eq!(app.handle_key(Key::Enter), Action::None);
+    assert_eq!(app.handle_key(Key::Up), Action::None);
+    assert!(matches!(app.mutation, MutationState::Idle));
+    assert_eq!(app.selected, Some(BranchId::new("main")));
 }
 
 #[test]
@@ -816,6 +1022,7 @@ fn checkout_reconciliation_ignores_a_pre_mutation_refresh_that_arrives_late() {
     let mut app = App::with_mutation_timing(Duration::from_secs(10), Duration::from_secs(2));
     app.apply_snapshot(with_generation(&snapshot, 5));
     app.selected = Some(BranchId::new("feature"));
+    assert_eq!(app.handle_key(Key::Enter), Action::None);
     assert!(matches!(app.handle_key(Key::Enter), Action::Checkout(_)));
     app.finish_checkout_at(Ok(()), 42, now);
     app.apply_structural_snapshot_at(with_generation(&snapshot, 6), 41, now);
@@ -854,6 +1061,7 @@ fn causal_checkout_mismatch_unlocks_with_targeted_refresh_guidance() {
     let mut app = App::with_mutation_timing(Duration::from_secs(10), Duration::from_secs(5));
     app.apply_snapshot(with_generation(&snapshot, 5));
     app.selected = Some(BranchId::new("feature"));
+    assert_eq!(app.handle_key(Key::Enter), Action::None);
     assert_eq!(
         app.handle_key(Key::Enter),
         Action::Checkout(BranchId::new("feature"))
@@ -880,6 +1088,7 @@ fn checkout_reconciliation_deadline_unlocks_and_expires_deterministically() {
     let mut app = App::with_mutation_timing(Duration::from_secs(3), Duration::from_secs(2));
     app.apply_snapshot(snapshot);
     app.selected = Some(BranchId::new("feature"));
+    assert_eq!(app.handle_key(Key::Enter), Action::None);
     assert!(matches!(app.handle_key(Key::Enter), Action::Checkout(_)));
     app.finish_checkout_at(Ok(()), 9, now);
     app.mark_stale(Arc::from("refresh failed"));

@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::adapters::git::{DeleteOutcome, DeleteRequest};
 use crate::adapters::github::{GitHubError, PrMatch};
-use crate::config::{ArchiveMutation, Config, ConfigMutation, MAX_STACK_NAME_CHARS};
+use crate::config::{ArchiveMutation, Config, ConfigMutation, MAX_STACK_NAME_CHARS, VisualSection};
 use crate::events::{Input, Key, KeyPhase};
 use crate::model::topology::{
     ArchiveMode, Emphasis, OrderMode, ProjectionOptions, ProjectionScope, TopologyIndex,
@@ -40,6 +41,24 @@ const ORDER_OPTIONS: &[OrderMode] = &[
 ];
 type UpstreamWorkingSet = (u64, Vec<(BranchId, Arc<str>)>);
 
+fn changed_branch_candidates(
+    current: &RepositorySnapshot,
+    next: &RepositorySnapshot,
+) -> Vec<BranchId> {
+    let mut changed = next
+        .branches
+        .iter()
+        .filter(|branch| {
+            current
+                .branch(&branch.id)
+                .is_some_and(|previous| previous.oid != branch.oid)
+        })
+        .map(|branch| (branch.committed_at, branch.id.clone()))
+        .collect::<Vec<_>>();
+    changed.sort_by(|left, right| right.cmp(left));
+    changed.into_iter().map(|(_, branch)| branch).collect()
+}
+
 mod archive;
 mod mutation;
 mod overlays;
@@ -49,9 +68,9 @@ use archive::archive_range_slice;
 use mutation::{confirmation_is_valid, deletion_refusal, stale_deletion_refusal};
 use overlays::order_option_index;
 pub use state::{
-    Action, ArchiveRange, ColorPicker, ConfigWriteRequest, DeleteConfirmation, DeletionResult,
-    GitHubState, LanePitch, MutationState, OrderPicker, Overlay, ReconciliationOperation,
-    StackNameEditor, ViewScope,
+    Action, ArchiveRange, ColorPicker, ConfigTarget, ConfigWriteRequest, DeleteConfirmation,
+    DeletionResult, GitHubState, LanePitch, MutationState, OrderPicker, Overlay,
+    ReconciliationOperation, StackNameEditor, ViewScope,
 };
 use state::{AllViewState, TransientNotice};
 
@@ -60,6 +79,7 @@ pub struct App {
     pub projection: TopologyProjection,
     topology: Option<TopologyIndex>,
     pub selected: Option<BranchId>,
+    pub selected_label: Option<ConfigTarget>,
     pub scroll: usize,
     pub viewport_height: usize,
     pub filter: String,
@@ -75,6 +95,7 @@ pub struct App {
     pub lane_pitch: LanePitch,
     pub scope: ViewScope,
     pub separators: bool,
+    pub detail_sidebar: bool,
     pub archive_mode: ArchiveMode,
     restore_selection: Option<BranchId>,
     all_view_state: Option<AllViewState>,
@@ -86,6 +107,7 @@ pub struct App {
     pending_colors: HashMap<BranchId, (u64, Option<Arc<str>>)>,
     pending_archives: HashMap<BranchId, (u64, ArchiveMutation)>,
     pending_stack_names: HashMap<BranchId, (u64, Option<Arc<str>>)>,
+    pending_visual_sections: HashMap<BranchId, (u64, Option<VisualSection>)>,
     queued_config_write: Option<ConfigWriteRequest>,
     active_view_state: Option<AllViewState>,
     notice: Option<TransientNotice>,
@@ -104,6 +126,7 @@ impl Default for App {
             projection: TopologyProjection::default(),
             topology: None,
             selected: None,
+            selected_label: None,
             scroll: 0,
             viewport_height: 12,
             filter: String::new(),
@@ -119,6 +142,7 @@ impl Default for App {
             lane_pitch: LanePitch::Auto,
             scope: ViewScope::All,
             separators: true,
+            detail_sidebar: false,
             archive_mode: ArchiveMode::Active,
             restore_selection: None,
             all_view_state: None,
@@ -130,6 +154,7 @@ impl Default for App {
             pending_colors: HashMap::new(),
             pending_archives: HashMap::new(),
             pending_stack_names: HashMap::new(),
+            pending_visual_sections: HashMap::new(),
             queued_config_write: None,
             active_view_state: None,
             notice: None,
@@ -194,6 +219,14 @@ impl App {
         {
             return;
         }
+        let changed_branches = if structural {
+            self.snapshot
+                .as_deref()
+                .map(|current| changed_branch_candidates(current, &snapshot))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         if let Some(current) = &self.snapshot {
             let current_prs: std::collections::HashMap<_, _> = current
                 .branches
@@ -263,6 +296,15 @@ impl App {
                             )));
                         }
                     }
+                    for (anchor, (_, section)) in &self.pending_visual_sections {
+                        if let Err(error) =
+                            config.set_visual_section_in_memory(anchor, section.clone())
+                        {
+                            self.message = Some(Arc::from(format!(
+                                "pending visual section ignored after validation changed: {error}"
+                            )));
+                        }
+                    }
                     self.config = config;
                 }
                 Err(error) => {
@@ -275,6 +317,9 @@ impl App {
         let projection_changed = structural || self.topology.is_none();
         if projection_changed {
             self.topology = Some(TopologyIndex::build(&snapshot));
+        }
+        if structural {
+            self.prune_invalid_visual_sections();
         }
         let protected_deletion_target = structural
             .then(|| self.deletion_target_in_flight())
@@ -338,9 +383,20 @@ impl App {
         if projection_changed {
             self.reproject();
         }
-        if let Some(selection_after) = deletion_selection_after {
+        let recovered_deleted_selection = if let Some(selection_after) = deletion_selection_after {
             self.selected = selection_after
                 .filter(|branch| self.projection.branch_to_selectable.contains_key(branch));
+            true
+        } else {
+            false
+        };
+        if !recovered_deleted_selection
+            && let Some(changed) = changed_branches
+                .into_iter()
+                .find(|branch| self.projection.branch_to_selectable.contains_key(branch))
+        {
+            self.selected = Some(changed);
+            self.selected_label = None;
         }
         self.reconcile_selection();
         self.revalidate_overlay();
@@ -348,15 +404,12 @@ impl App {
             self.startup_current_pending = false;
             self.apply_current_startup();
         }
-        if structural && matches!(self.archive_mode, ArchiveMode::Archive) {
+        if structural {
             self.upstream_request_pending = true;
         }
     }
 
     pub fn apply_upstream_batch(&mut self, batch: UpstreamBatch) {
-        if !matches!(self.archive_mode, ArchiveMode::Archive) {
-            return;
-        }
         let Some(snapshot) = self.snapshot.as_mut() else {
             return;
         };
@@ -395,7 +448,7 @@ impl App {
             self.upstream_request_pending = false;
             return Some(UpstreamCommand::Cancel);
         }
-        if !self.upstream_request_pending || !matches!(self.archive_mode, ArchiveMode::Archive) {
+        if !self.upstream_request_pending {
             return None;
         }
         self.upstream_request_pending = false;
@@ -421,9 +474,6 @@ impl App {
             let Some(branch) = snapshot.branches.get(index) else {
                 continue;
             };
-            if !self.config.is_archived(&branch.id) {
-                continue;
-            }
             targets.push(UpstreamTarget {
                 branch: branch.id.clone(),
                 oid: branch.oid.clone(),
@@ -514,7 +564,7 @@ impl App {
         } else {
             self.keep_selected_visible();
         }
-        if previous != self.viewport_height && matches!(self.archive_mode, ArchiveMode::Archive) {
+        if previous != self.viewport_height {
             self.upstream_request_pending = true;
         }
     }
@@ -566,11 +616,17 @@ impl App {
     }
 
     pub fn selected_branch(&self) -> Option<&Branch> {
+        if self.selected_label.is_some() {
+            return None;
+        }
         let selected = self.selected.as_ref()?;
         self.snapshot.as_ref()?.branch(selected)
     }
 
     pub fn handle_input(&mut self, input: Input) -> Action {
+        if matches!(self.overlay, Overlay::StackNameEditor(_)) {
+            return self.handle_stack_name_editor_key(input.key);
+        }
         if input.phase == KeyPhase::Repeat && !input.key.allows_repeat() {
             return Action::None;
         }
@@ -589,6 +645,9 @@ impl App {
         if matches!(self.mutation, MutationState::ConfirmingDeletion(_)) {
             return self.handle_delete_confirmation(key);
         }
+        if matches!(self.mutation, MutationState::ConfirmingCheckout(_)) {
+            return self.handle_checkout_confirmation(key);
+        }
         match &self.overlay {
             Overlay::Search => return self.handle_search_key(key),
             Overlay::Help => {
@@ -602,7 +661,7 @@ impl App {
             }
             Overlay::OrderPicker(_) => return self.handle_order_picker_key(key),
             Overlay::ColorPicker(_) => return self.handle_color_picker_key(key),
-            Overlay::StackNameEditor(_) => return self.handle_stack_name_editor_key(key),
+            Overlay::StackNameEditor(_) => unreachable!("name editor handled before global keys"),
             Overlay::ArchiveRange(_) => return self.handle_archive_range_key(key),
             Overlay::None => {}
         }
@@ -695,6 +754,15 @@ impl App {
                 self.reproject();
                 Action::None
             }
+            Key::Character('d') => {
+                self.detail_sidebar = !self.detail_sidebar;
+                self.message = Some(Arc::from(if self.detail_sidebar {
+                    "detail sidebar enabled"
+                } else {
+                    "detail sidebar hidden"
+                }));
+                Action::None
+            }
             Key::Character('a') => {
                 self.toggle_archive_mode();
                 Action::None
@@ -721,6 +789,7 @@ impl App {
                 self.open_stack_name_editor();
                 Action::None
             }
+            Key::Character('i') => self.toggle_visual_section(),
             Key::Character('o') => self
                 .selected_url()
                 .map(Action::OpenUrl)
@@ -730,12 +799,15 @@ impl App {
                 .map(Action::CopyUrl)
                 .unwrap_or(Action::None),
             Key::Enter if matches!(self.mutation, MutationState::Idle) => {
-                if let Some(reason) = self.checkout_disabled_reason() {
+                if let Some(target) = self.selected_label.clone() {
+                    self.open_name_editor_for_target(target);
+                    Action::None
+                } else if let Some(reason) = self.checkout_disabled_reason() {
                     self.message = Some(Arc::from(reason));
                     Action::None
                 } else if let Some(branch) = self.selected.clone() {
-                    self.mutation = MutationState::CheckingOut(branch.clone());
-                    Action::Checkout(branch)
+                    self.mutation = MutationState::ConfirmingCheckout(branch);
+                    Action::None
                 } else {
                     Action::None
                 }
@@ -756,28 +828,36 @@ impl App {
         let Some(selected) = self.selected.as_ref() else {
             return Action::None;
         };
-        let Some(row) = self.projection.row_for(selected) else {
-            return Action::None;
+        let target = if let Some(target) = self.selected_label.clone() {
+            target
+        } else {
+            let Some(row) = self.projection.row_for(selected) else {
+                return Action::None;
+            };
+            if row.is_trunk {
+                self.message = Some(Arc::from("trunk rows do not have a stack color"));
+                return Action::None;
+            }
+            if self.config.visual_section(selected).is_some() {
+                ConfigTarget::VisualSection(selected.clone())
+            } else {
+                ConfigTarget::Stack(row.stack_id.clone())
+            }
         };
-        if row.is_trunk {
-            self.message = Some(Arc::from("trunk rows do not have a stack color"));
-            return Action::None;
-        }
-        let root = row.stack_id.clone();
         let common_dir = snapshot.common_dir.clone();
-        let next = match self.config.color(&root) {
-            None => COLOR_OPTIONS[1].1,
-            Some(current) => COLOR_OPTIONS
-                .iter()
-                .position(|(_, value)| *value == Some(current))
-                .and_then(|index| COLOR_OPTIONS.get(index + 1))
-                .and_then(|(_, value)| *value),
-        };
-        if let Err(error) = self.config.set_color_in_memory(&root, next) {
+        let current_index = COLOR_OPTIONS
+            .iter()
+            .position(|(_, value)| *value == self.target_color(&target))
+            .unwrap_or(0);
+        let next = (1..=COLOR_OPTIONS.len())
+            .map(|offset| COLOR_OPTIONS[(current_index + offset) % COLOR_OPTIONS.len()].1)
+            .find(|value| self.valid_color_choice(&target, *value))
+            .flatten();
+        if let Err(error) = self.set_target_color_in_memory(&target, next) {
             self.message = Some(Arc::from(format!("stack color was not changed: {error}")));
             return Action::None;
         }
-        self.persist_color(root, next.map(Arc::from), common_dir)
+        self.persist_target_color(target, next.map(Arc::from), common_dir)
     }
 
     fn persist_color(
@@ -795,6 +875,31 @@ impl App {
         Action::PersistConfig(self.register_config_mutation(mutation, common_dir))
     }
 
+    fn persist_target_color(
+        &mut self,
+        target: ConfigTarget,
+        value: Option<Arc<str>>,
+        common_dir: PathBuf,
+    ) -> Action {
+        match target {
+            ConfigTarget::Stack(stack) => self.persist_color(stack, value, common_dir),
+            ConfigTarget::VisualSection(anchor) => {
+                let Some(mut section) = self.config.visual_section(&anchor).cloned() else {
+                    return Action::None;
+                };
+                let Some(value) = value else {
+                    self.message = Some(Arc::from("visual sections require a concrete color"));
+                    return Action::None;
+                };
+                section.color = value.to_string();
+                let mut mutation = ConfigMutation::default();
+                mutation.set_visual_section(anchor, Some(section));
+                self.message = Some(Arc::from("section color changed; saving"));
+                Action::PersistConfig(self.register_config_mutation(mutation, common_dir))
+            }
+        }
+    }
+
     fn adjust_lane_pitch(&mut self, delta: i16) {
         let next = self.lane_pitch.adjust(delta);
         if next == self.lane_pitch {
@@ -804,6 +909,71 @@ impl App {
         if let LanePitch::Fixed(value) = next {
             self.message = Some(Arc::from(format!("lane pitch: {value}")));
         }
+    }
+
+    fn toggle_visual_section(&mut self) -> Action {
+        if self.selected_label.is_some() {
+            self.message = Some(Arc::from(
+                "visual section boundaries can only be toggled on branches",
+            ));
+            return Action::None;
+        }
+        let Some(anchor) = self.selected.clone() else {
+            return Action::None;
+        };
+        let Some(row) = self.projection.row_for(&anchor) else {
+            return Action::None;
+        };
+        if row.is_trunk {
+            self.message = Some(Arc::from("trunk rows cannot start visual sections"));
+            return Action::None;
+        }
+        let Some(common_dir) = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.common_dir.clone())
+        else {
+            return Action::None;
+        };
+        let mut mutation = ConfigMutation::default();
+        if self.config.visual_section(&anchor).is_some() {
+            if let Err(error) = self.config.set_visual_section_in_memory(&anchor, None) {
+                self.message = Some(Arc::from(format!("section was not removed: {error}")));
+                return Action::None;
+            }
+            mutation.set_visual_section(anchor, None);
+            self.message = Some(Arc::from("visual section removed; saving"));
+        } else {
+            let used = self.adjacent_section_colors(&anchor, &row.stack_id);
+            let choices: Vec<_> = COLOR_OPTIONS
+                .iter()
+                .filter_map(|(_, value)| *value)
+                .collect();
+            let start = anchor
+                .0
+                .bytes()
+                .fold(0usize, |sum, byte| sum.wrapping_add(byte as usize))
+                % choices.len();
+            let color = (0..choices.len())
+                .map(|offset| choices[(start + offset) % choices.len()])
+                .find(|color| !used.iter().any(|used| used == color))
+                .unwrap_or(choices[start]);
+            let section = VisualSection {
+                color: color.to_owned(),
+                name: None,
+            };
+            if let Err(error) = self
+                .config
+                .set_visual_section_in_memory(&anchor, Some(section.clone()))
+            {
+                self.message = Some(Arc::from(format!("section was not created: {error}")));
+                return Action::None;
+            }
+            mutation.set_visual_section(anchor, Some(section));
+            self.message = Some(Arc::from("visual section created; saving"));
+        }
+        self.reproject();
+        Action::PersistConfig(self.register_config_mutation(mutation, common_dir))
     }
 
     fn handle_order_picker_key(&mut self, key: Key) -> Action {
@@ -838,15 +1008,23 @@ impl App {
         let Some(selected) = self.selected.as_ref() else {
             return;
         };
-        let Some(row) = self.projection.row_for(selected) else {
-            return;
+        let target = if let Some(target) = self.selected_label.clone() {
+            target
+        } else {
+            let Some(row) = self.projection.row_for(selected) else {
+                return;
+            };
+            if row.is_trunk {
+                self.message = Some(Arc::from("trunk rows do not have a stack color"));
+                return;
+            }
+            if self.config.visual_section(selected).is_some() {
+                ConfigTarget::VisualSection(selected.clone())
+            } else {
+                ConfigTarget::Stack(row.stack_id.clone())
+            }
         };
-        if row.is_trunk {
-            self.message = Some(Arc::from("trunk rows do not have a stack color"));
-            return;
-        }
-        let target = row.stack_id.clone();
-        let original = self.config.color(&target).map(Arc::from);
+        let original = self.target_color(&target).map(Arc::from);
         let choice_index = COLOR_OPTIONS
             .iter()
             .position(|(_, value)| *value == original.as_deref())
@@ -865,15 +1043,32 @@ impl App {
         };
         match key {
             Key::Up | Key::Down => {
-                picker.choice_index = if key == Key::Up {
-                    picker.choice_index.saturating_sub(1)
-                } else {
-                    (picker.choice_index + 1).min(COLOR_OPTIONS.len() - 1)
-                };
+                let direction = if key == Key::Up { -1 } else { 1 };
+                let original_index = picker.choice_index;
+                for _ in 0..COLOR_OPTIONS.len() {
+                    picker.choice_index = picker
+                        .choice_index
+                        .saturating_add_signed(direction)
+                        .min(COLOR_OPTIONS.len() - 1);
+                    if self.valid_color_choice(&picker.target, COLOR_OPTIONS[picker.choice_index].1)
+                    {
+                        break;
+                    }
+                    if picker.choice_index == 0 && direction < 0
+                        || picker.choice_index + 1 == COLOR_OPTIONS.len() && direction > 0
+                    {
+                        if !self.valid_color_choice(
+                            &picker.target,
+                            COLOR_OPTIONS[picker.choice_index].1,
+                        ) {
+                            picker.choice_index = original_index;
+                        }
+                        break;
+                    }
+                }
                 picker.pending = COLOR_OPTIONS[picker.choice_index].1.map(Arc::from);
-                if let Err(error) = self
-                    .config
-                    .set_color_in_memory(&picker.target, picker.pending.as_deref())
+                if let Err(error) =
+                    self.set_target_color_in_memory(&picker.target, picker.pending.as_deref())
                 {
                     self.overlay = Overlay::None;
                     self.message = Some(Arc::from(format!(
@@ -881,11 +1076,12 @@ impl App {
                     )));
                     return Action::None;
                 }
+                self.reproject();
                 self.overlay = Overlay::ColorPicker(picker);
                 Action::None
             }
             Key::Enter => {
-                if !self.stack_target_is_valid(&picker.target) {
+                if !self.config_target_is_valid(&picker.target) {
                     self.close_invalid_color_picker(&picker);
                     return Action::None;
                 }
@@ -898,18 +1094,18 @@ impl App {
                     return Action::None;
                 };
                 self.overlay = Overlay::None;
-                self.persist_color(picker.target, picker.pending, common_dir)
+                self.persist_target_color(picker.target, picker.pending, common_dir)
             }
             Key::Escape => {
-                if let Err(error) = self
-                    .config
-                    .set_color_in_memory(&picker.target, picker.original.as_deref())
+                if let Err(error) =
+                    self.set_target_color_in_memory(&picker.target, picker.original.as_deref())
                 {
                     self.message = Some(Arc::from(format!(
                         "color preview could not be restored: {error}"
                     )));
                 }
                 self.overlay = Overlay::None;
+                self.reproject();
                 Action::None
             }
             _ => Action::None,
@@ -917,6 +1113,10 @@ impl App {
     }
 
     fn open_stack_name_editor(&mut self) {
+        if self.selected_label.is_some() {
+            self.message = Some(Arc::from("press Enter to edit the selected name"));
+            return;
+        }
         let Some(selected) = self.selected.as_ref() else {
             return;
         };
@@ -927,13 +1127,60 @@ impl App {
             self.message = Some(Arc::from("trunk rows cannot be named as stacks"));
             return;
         }
-        let target = row.stack_id.clone();
-        let draft = self
-            .config
-            .stack_name(&target)
-            .unwrap_or_default()
-            .to_owned();
-        self.overlay = Overlay::StackNameEditor(StackNameEditor { target, draft });
+        let target = if let Some(section) = self.config.visual_section(selected) {
+            if section.name.is_some() {
+                self.message = Some(Arc::from("select the section name and press Enter to edit"));
+                return;
+            }
+            ConfigTarget::VisualSection(selected.clone())
+        } else {
+            let stack = row.stack_id.clone();
+            if self.config.stack_name(&stack).is_some() {
+                self.message = Some(Arc::from("select the stack name and press Enter to edit"));
+                return;
+            }
+            ConfigTarget::Stack(stack)
+        };
+        let draft = match &target {
+            ConfigTarget::Stack(stack) => self.config.stack_name(stack),
+            ConfigTarget::VisualSection(anchor) => self
+                .config
+                .visual_section(anchor)
+                .and_then(|section| section.name.as_deref()),
+        }
+        .unwrap_or_default()
+        .to_owned();
+        let cursor = draft.chars().count();
+        self.overlay = Overlay::StackNameEditor(StackNameEditor {
+            target: target.clone(),
+            draft,
+            cursor,
+        });
+        self.selected_label = Some(target.clone());
+        self.reproject();
+    }
+
+    fn open_name_editor_for_target(&mut self, target: ConfigTarget) {
+        if !self.config_target_is_valid(&target) {
+            return;
+        }
+        let draft = match &target {
+            ConfigTarget::Stack(stack) => self.config.stack_name(stack),
+            ConfigTarget::VisualSection(anchor) => self
+                .config
+                .visual_section(anchor)
+                .and_then(|section| section.name.as_deref()),
+        }
+        .unwrap_or_default()
+        .to_owned();
+        let cursor = draft.chars().count();
+        self.overlay = Overlay::StackNameEditor(StackNameEditor {
+            target: target.clone(),
+            draft,
+            cursor,
+        });
+        self.selected_label = Some(target);
+        self.reproject();
     }
 
     fn handle_stack_name_editor_key(&mut self, key: Key) -> Action {
@@ -942,24 +1189,80 @@ impl App {
         };
         match key {
             Key::Escape => {
+                let existed = match &editor.target {
+                    ConfigTarget::Stack(stack) => self.config.stack_name(stack).is_some(),
+                    ConfigTarget::VisualSection(anchor) => self
+                        .config
+                        .visual_section(anchor)
+                        .is_some_and(|section| section.name.is_some()),
+                };
                 self.overlay = Overlay::None;
+                if !existed {
+                    self.selected = Some(editor.target.branch().clone());
+                    self.selected_label = None;
+                }
+                self.reproject();
                 Action::None
             }
             Key::Backspace => {
-                editor.draft.pop();
+                if editor.cursor > 0 {
+                    let mut characters = editor.draft.chars().collect::<Vec<_>>();
+                    characters.remove(editor.cursor - 1);
+                    editor.cursor -= 1;
+                    editor.draft = characters.into_iter().collect();
+                }
                 self.overlay = Overlay::StackNameEditor(editor);
+                self.reproject();
+                Action::None
+            }
+            Key::Delete => {
+                let mut characters = editor.draft.chars().collect::<Vec<_>>();
+                if editor.cursor < characters.len() {
+                    characters.remove(editor.cursor);
+                    editor.draft = characters.into_iter().collect();
+                }
+                self.overlay = Overlay::StackNameEditor(editor);
+                self.reproject();
+                Action::None
+            }
+            Key::Left => {
+                editor.cursor = editor.cursor.saturating_sub(1);
+                self.overlay = Overlay::StackNameEditor(editor);
+                self.reproject();
+                Action::None
+            }
+            Key::Right => {
+                editor.cursor = (editor.cursor + 1).min(editor.draft.chars().count());
+                self.overlay = Overlay::StackNameEditor(editor);
+                self.reproject();
+                Action::None
+            }
+            Key::Home => {
+                editor.cursor = 0;
+                self.overlay = Overlay::StackNameEditor(editor);
+                self.reproject();
+                Action::None
+            }
+            Key::End => {
+                editor.cursor = editor.draft.chars().count();
+                self.overlay = Overlay::StackNameEditor(editor);
+                self.reproject();
                 Action::None
             }
             Key::Character(character)
                 if !character.is_control()
                     && editor.draft.chars().count() < MAX_STACK_NAME_CHARS =>
             {
-                editor.draft.push(character);
+                let mut characters = editor.draft.chars().collect::<Vec<_>>();
+                characters.insert(editor.cursor, character);
+                editor.cursor += 1;
+                editor.draft = characters.into_iter().collect();
                 self.overlay = Overlay::StackNameEditor(editor);
+                self.reproject();
                 Action::None
             }
             Key::Enter => {
-                if !self.stack_target_is_valid(&editor.target) {
+                if !self.config_target_is_valid(&editor.target) {
                     self.close_invalid_stack_name_editor();
                     return Action::None;
                 }
@@ -975,20 +1278,35 @@ impl App {
                     self.close_invalid_stack_name_editor();
                     return Action::None;
                 };
-                if let Err(error) = self
-                    .config
-                    .set_stack_name_in_memory(&editor.target, value.as_deref())
-                {
+                let update = self.set_target_name_in_memory(&editor.target, value.as_deref());
+                if let Err(error) = update {
                     self.overlay = Overlay::None;
                     self.message = Some(Arc::from(format!("stack name was not changed: {error}")));
                     return Action::None;
                 }
                 let mut mutation = ConfigMutation::default();
-                mutation.set_stack_name(editor.target.clone(), value.clone());
+                match &editor.target {
+                    ConfigTarget::Stack(stack) => {
+                        mutation.set_stack_name(stack.clone(), value.clone())
+                    }
+                    ConfigTarget::VisualSection(anchor) => {
+                        let mut section = self
+                            .config
+                            .visual_section(anchor)
+                            .cloned()
+                            .expect("valid section editor target");
+                        section.name = value.as_deref().map(str::to_owned);
+                        mutation.set_visual_section(anchor.clone(), Some(section));
+                    }
+                }
                 self.overlay = Overlay::None;
+                if value.is_none() {
+                    self.selected = Some(editor.target.branch().clone());
+                    self.selected_label = None;
+                }
                 self.message = Some(Arc::from(match value {
-                    Some(name) => format!("stack named {name}; saving"),
-                    None => "stack name cleared; saving".to_owned(),
+                    Some(name) => format!("name set to {name}; saving"),
+                    None => "name cleared; saving".to_owned(),
                 }));
                 self.reproject();
                 Action::PersistConfig(self.register_config_mutation(mutation, common_dir))
@@ -1000,10 +1318,9 @@ impl App {
     fn revalidate_overlay(&mut self) {
         match self.overlay.clone() {
             Overlay::ColorPicker(picker) => {
-                if self.stack_target_is_valid(&picker.target) {
-                    if let Err(error) = self
-                        .config
-                        .set_color_in_memory(&picker.target, picker.pending.as_deref())
+                if self.config_target_is_valid(&picker.target) {
+                    if let Err(error) =
+                        self.set_target_color_in_memory(&picker.target, picker.pending.as_deref())
                     {
                         self.overlay = Overlay::None;
                         self.message = Some(Arc::from(format!(
@@ -1015,7 +1332,7 @@ impl App {
                 }
             }
             Overlay::StackNameEditor(editor) => {
-                if !self.stack_target_is_valid(&editor.target) {
+                if !self.config_target_is_valid(&editor.target) {
                     self.close_invalid_stack_name_editor();
                 }
             }
@@ -1036,10 +1353,164 @@ impl App {
             })
     }
 
+    fn config_target_is_valid(&self, target: &ConfigTarget) -> bool {
+        match target {
+            ConfigTarget::Stack(stack) => self.stack_target_is_valid(stack),
+            ConfigTarget::VisualSection(anchor) => {
+                self.config.visual_section(anchor).is_some()
+                    && self
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.branch(anchor).is_some())
+                    && self
+                        .topology
+                        .as_ref()
+                        .is_some_and(|topology| !topology.is_trunk(anchor))
+            }
+        }
+    }
+
+    fn target_color<'a>(&'a self, target: &'a ConfigTarget) -> Option<&'a str> {
+        match target {
+            ConfigTarget::Stack(stack) => self.config.color(stack),
+            ConfigTarget::VisualSection(anchor) => self
+                .config
+                .visual_section(anchor)
+                .map(|section| section.color.as_str()),
+        }
+    }
+
+    fn valid_color_choice(&self, target: &ConfigTarget, value: Option<&str>) -> bool {
+        match target {
+            ConfigTarget::Stack(stack) => value.is_none_or(|color| {
+                !self
+                    .adjacent_section_colors(stack, stack)
+                    .iter()
+                    .any(|used| used == color)
+            }),
+            ConfigTarget::VisualSection(anchor) => value.is_some_and(|color| {
+                let stack = self
+                    .topology
+                    .as_ref()
+                    .and_then(|topology| topology.stack_for(anchor))
+                    .unwrap_or(anchor);
+                !self
+                    .adjacent_section_colors(anchor, stack)
+                    .iter()
+                    .any(|used| used == color)
+            }),
+        }
+    }
+
+    fn adjacent_section_colors(&self, anchor: &BranchId, stack: &BranchId) -> Vec<String> {
+        let mut boundaries: Vec<_> = self
+            .projection
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let boundary = row.visual_section.as_ref()?;
+                let color = row.visual_color.as_ref()?;
+                (row.stack_id == *stack)
+                    .then(|| (row.manual_depth, boundary.clone(), color.to_string()))
+            })
+            .collect();
+        boundaries.sort_by_key(|(depth, _, _)| *depth);
+        boundaries.dedup_by(|left, right| left.1 == right.1);
+        if anchor == stack {
+            return boundaries
+                .first()
+                .map(|(_, _, color)| vec![color.clone()])
+                .unwrap_or_default();
+        }
+        let anchor_depth = boundaries
+            .iter()
+            .find(|(_, boundary, _)| boundary == anchor)
+            .map(|(depth, _, _)| *depth)
+            .or_else(|| {
+                self.projection
+                    .row_for(anchor)
+                    .map(|row| row.manual_depth.saturating_add(1))
+            })
+            .unwrap_or(1);
+        let mut colors = Vec::with_capacity(2);
+        if let Some((_, _, color)) = boundaries.iter().find(|(depth, boundary, _)| {
+            *depth == anchor_depth.saturating_add(1) && boundary != anchor
+        }) {
+            colors.push(color.clone());
+        }
+        if let Some((_, _, color)) = boundaries
+            .iter()
+            .find(|(depth, boundary, _)| *depth + 1 == anchor_depth && boundary != anchor)
+        {
+            colors.push(color.clone());
+        } else {
+            colors.push(self.stack_color_hex(stack).to_owned());
+        }
+        colors
+    }
+
+    fn stack_color_hex<'a>(&'a self, stack: &'a BranchId) -> &'a str {
+        if let Some(color) = self.config.color(stack) {
+            return color;
+        }
+        const COLORS: [&str; 8] = [
+            "#7aa2f7", "#bb9af7", "#7dcfff", "#ff9e64", "#9ece6a", "#f7768e", "#2ac3de", "#c0caf5",
+        ];
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.repository_id.as_ref())
+            .unwrap_or_default()
+            .hash(&mut hasher);
+        stack.hash(&mut hasher);
+        COLORS[hasher.finish() as usize % COLORS.len()]
+    }
+
+    fn set_target_color_in_memory(
+        &mut self,
+        target: &ConfigTarget,
+        color: Option<&str>,
+    ) -> anyhow::Result<()> {
+        match target {
+            ConfigTarget::Stack(stack) => self.config.set_color_in_memory(stack, color),
+            ConfigTarget::VisualSection(anchor) => {
+                let mut section = self
+                    .config
+                    .visual_section(anchor)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("visual section no longer exists"))?;
+                let color = color
+                    .ok_or_else(|| anyhow::anyhow!("visual sections require a concrete color"))?;
+                section.color = color.to_owned();
+                self.config
+                    .set_visual_section_in_memory(anchor, Some(section))
+            }
+        }
+    }
+
+    fn set_target_name_in_memory(
+        &mut self,
+        target: &ConfigTarget,
+        name: Option<&str>,
+    ) -> anyhow::Result<()> {
+        match target {
+            ConfigTarget::Stack(stack) => self.config.set_stack_name_in_memory(stack, name),
+            ConfigTarget::VisualSection(anchor) => {
+                let mut section = self
+                    .config
+                    .visual_section(anchor)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("visual section no longer exists"))?;
+                section.name = name.map(str::to_owned);
+                self.config
+                    .set_visual_section_in_memory(anchor, Some(section))
+            }
+        }
+    }
+
     fn close_invalid_color_picker(&mut self, picker: &ColorPicker) {
-        if let Err(error) = self
-            .config
-            .set_color_in_memory(&picker.target, picker.original.as_deref())
+        if let Err(error) =
+            self.set_target_color_in_memory(&picker.target, picker.original.as_deref())
         {
             self.message = Some(Arc::from(format!(
                 "color preview could not be restored: {error}"
@@ -1065,6 +1536,8 @@ impl App {
             self.pending_archives
                 .retain(|_, (pending_sequence, _)| *pending_sequence > sequence);
             self.pending_stack_names
+                .retain(|_, (pending_sequence, _)| *pending_sequence > sequence);
+            self.pending_visual_sections
                 .retain(|_, (pending_sequence, _)| *pending_sequence > sequence);
         }
         if sequence != self.latest_config_sequence {
@@ -1120,6 +1593,10 @@ impl App {
         for (stack, name) in mutation.stack_name_updates {
             self.pending_stack_names.insert(stack, (sequence, name));
         }
+        for (anchor, section) in mutation.visual_section_updates {
+            self.pending_visual_sections
+                .insert(anchor, (sequence, section));
+        }
         ConfigWriteRequest {
             sequence,
             common_dir,
@@ -1145,6 +1622,11 @@ impl App {
                 .iter()
                 .map(|(stack, (_, name))| (stack.clone(), name.clone()))
                 .collect(),
+            visual_section_updates: self
+                .pending_visual_sections
+                .iter()
+                .map(|(anchor, (_, section))| (anchor.clone(), section.clone()))
+                .collect(),
         }
     }
 
@@ -1166,7 +1648,8 @@ impl App {
             }
             ArchiveMode::Archive => {
                 self.archive_mode = ArchiveMode::Active;
-                self.upstream_cancel_pending = true;
+                self.upstream_request_pending = true;
+                self.upstream_cancel_pending = false;
                 self.last_upstream_working_set = None;
                 self.reproject();
                 if let Some(state) = self.active_view_state.take() {
@@ -1187,6 +1670,10 @@ impl App {
     }
 
     fn toggle_selected_archive(&mut self) -> Action {
+        if self.selected_label.is_some() {
+            self.message = Some(Arc::from("labels cannot be archived"));
+            return Action::None;
+        }
         let Some(branch_id) = self.selected.clone() else {
             return Action::None;
         };
@@ -1224,9 +1711,7 @@ impl App {
         }));
         self.selected = selection_after;
         self.reproject();
-        if matches!(self.archive_mode, ArchiveMode::Archive) {
-            self.upstream_request_pending = true;
-        }
+        self.upstream_request_pending = true;
         Action::PersistConfig(self.register_config_mutation(mutation, common_dir))
     }
 
@@ -1250,6 +1735,10 @@ impl App {
     }
 
     fn begin_archive_range(&mut self) {
+        if self.selected_label.is_some() {
+            self.message = Some(Arc::from("archive ranges must start on a branch"));
+            return;
+        }
         let Some(anchor) = self.selected.clone() else {
             return;
         };
@@ -1406,6 +1895,7 @@ impl App {
                 ..
             } => Some(request.branch.clone()),
             MutationState::Idle
+            | MutationState::ConfirmingCheckout(_)
             | MutationState::CheckingOut(_)
             | MutationState::Reconciling { .. }
             | MutationState::DeletionBlocked(_) => None,
@@ -1426,6 +1916,9 @@ impl App {
         }
         if self.config.stack_name(target).is_some() {
             mutation.set_stack_name(target.clone(), None);
+        }
+        if self.config.visual_section(target).is_some() {
+            mutation.set_visual_section(target.clone(), None);
         }
         if mutation.is_empty() {
             return;
@@ -1489,6 +1982,39 @@ impl App {
         self.queued_config_write = Some(self.register_config_mutation(mutation, common_dir));
     }
 
+    fn prune_invalid_visual_sections(&mut self) {
+        let (Some(snapshot), Some(topology)) = (self.snapshot.as_ref(), self.topology.as_ref())
+        else {
+            return;
+        };
+        let invalid: Vec<_> = self
+            .config
+            .visual_sections
+            .keys()
+            .map(|anchor| BranchId::new(anchor.clone()))
+            .filter(|anchor| {
+                snapshot.branch(anchor).is_none()
+                    || topology.is_trunk(anchor)
+                    || topology.stack_for(anchor).is_none()
+            })
+            .collect();
+        if invalid.is_empty() {
+            return;
+        }
+        let common_dir = snapshot.common_dir.clone();
+        let mut mutation = ConfigMutation::default();
+        for anchor in invalid {
+            mutation.set_visual_section(anchor, None);
+        }
+        if let Err(error) = self.config.apply_mutation_in_memory(&mutation) {
+            self.message = Some(Arc::from(format!(
+                "invalid visual sections could not be pruned: {error}"
+            )));
+            return;
+        }
+        self.queued_config_write = Some(self.register_config_mutation(mutation, common_dir));
+    }
+
     fn nearby_selection_after(&self, target: &BranchId) -> Option<BranchId> {
         if self.selected.as_ref() != Some(target) {
             return None;
@@ -1527,6 +2053,36 @@ impl App {
         Action::None
     }
 
+    fn handle_checkout_confirmation(&mut self, key: Key) -> Action {
+        let MutationState::ConfirmingCheckout(target) = &self.mutation else {
+            return Action::None;
+        };
+        let target = target.clone();
+        match key {
+            Key::Enter
+                if self.selected.as_ref() == Some(&target) && self.selected_label.is_none() =>
+            {
+                if let Some(reason) = self.checkout_disabled_reason() {
+                    self.mutation = MutationState::Idle;
+                    self.message = Some(Arc::from(reason));
+                    Action::None
+                } else {
+                    self.mutation = MutationState::CheckingOut(target.clone());
+                    Action::Checkout(target)
+                }
+            }
+            Key::Enter | Key::Escape => {
+                self.mutation = MutationState::Idle;
+                self.message = Some(Arc::from("checkout cancelled"));
+                Action::None
+            }
+            _ => {
+                self.mutation = MutationState::Idle;
+                self.handle_normal_key(key)
+            }
+        }
+    }
+
     fn selected_url(&self) -> Option<Arc<str>> {
         if matches!(self.archive_mode, ArchiveMode::Archive) {
             return None;
@@ -1535,6 +2091,10 @@ impl App {
     }
 
     pub fn begin_delete_confirmation(&mut self) {
+        if self.selected_label.is_some() {
+            self.message = Some(Arc::from("labels cannot be deleted"));
+            return;
+        }
         if !matches!(self.mutation, MutationState::Idle) {
             self.message = Some(Arc::from("another repository mutation is active"));
             return;
@@ -1656,6 +2216,9 @@ impl App {
 
     pub fn mutation_progress(&self) -> Option<String> {
         match &self.mutation {
+            MutationState::ConfirmingCheckout(target) => {
+                Some(format!("checkout {target}? Enter confirm · Esc cancel"))
+            }
             MutationState::CheckingOut(target) => Some(format!("switching to {target}…")),
             MutationState::Deleting(confirmation) => {
                 Some(format!("deleting {} locally…", confirmation.request.branch))
@@ -1750,6 +2313,46 @@ impl App {
                 return;
             };
             let scope = self.resolved_scope();
+            let mut stack_names: HashMap<BranchId, Arc<str>> = self
+                .config
+                .stack_names
+                .iter()
+                .map(|(stack, name)| (BranchId::new(stack.clone()), Arc::from(name.as_str())))
+                .collect();
+            let mut visual_sections: HashMap<BranchId, crate::model::topology::VisualSectionSpec> =
+                self.config
+                    .visual_sections
+                    .iter()
+                    .map(|(anchor, section)| {
+                        (
+                            BranchId::new(anchor.clone()),
+                            crate::model::topology::VisualSectionSpec {
+                                color: Arc::from(section.color.as_str()),
+                                name: section.name.as_deref().map(Arc::from),
+                            },
+                        )
+                    })
+                    .collect();
+            if let Overlay::StackNameEditor(editor) = &self.overlay {
+                match &editor.target {
+                    ConfigTarget::Stack(stack) => {
+                        stack_names.insert(stack.clone(), Arc::from(editor.draft.as_str()));
+                    }
+                    ConfigTarget::VisualSection(anchor) => {
+                        if let Some(section) = visual_sections.get_mut(anchor) {
+                            section.name = Some(Arc::from(editor.draft.as_str()));
+                        }
+                    }
+                }
+            }
+            let stack_colors = visual_sections
+                .keys()
+                .filter_map(|anchor| topology.stack_for(anchor).cloned())
+                .map(|stack| {
+                    let color = Arc::from(self.stack_color_hex(&stack));
+                    (stack, color)
+                })
+                .collect();
             self.projection = topology.project(&ProjectionOptions {
                 order: self.order_mode,
                 scope,
@@ -1763,12 +2366,9 @@ impl App {
                     .cloned()
                     .map(BranchId::new)
                     .collect(),
-                stack_names: self
-                    .config
-                    .stack_names
-                    .iter()
-                    .map(|(stack, name)| (BranchId::new(stack.clone()), Arc::from(name.as_str())))
-                    .collect(),
+                stack_names,
+                stack_colors,
+                visual_sections,
             });
             if matches!(self.scope, ViewScope::Untrunked) {
                 self.restrict_projection_to_untrunked();
@@ -1864,6 +2464,10 @@ impl App {
     }
 
     fn toggle_stack_scope(&mut self) {
+        if self.selected_label.is_some() {
+            self.message = Some(Arc::from("select a branch to focus its stack"));
+            return;
+        }
         let Some(selected) = self.selected.clone() else {
             return;
         };
@@ -1884,6 +2488,10 @@ impl App {
     }
 
     fn toggle_trunk_scope(&mut self) {
+        if self.selected_label.is_some() {
+            self.message = Some(Arc::from("select a branch to focus its trunk"));
+            return;
+        }
         let Some(selected) = self.selected.clone() else {
             return;
         };
@@ -1969,6 +2577,8 @@ impl App {
         else {
             self.projection.selectable.clear();
             self.projection.selectable_visual_rows.clear();
+            self.projection.navigation.clear();
+            self.projection.navigation_visual_rows.clear();
             self.projection.branch_to_selectable.clear();
             self.projection.branch_to_visual.clear();
             self.projection.stack_heads.clear();
@@ -1996,6 +2606,22 @@ impl App {
         }
         self.projection.selectable = selectable;
         self.projection.selectable_visual_rows = selectable_rows;
+        let mut navigation = Vec::new();
+        let mut navigation_rows = Vec::new();
+        for (target, row) in self
+            .projection
+            .navigation
+            .iter()
+            .cloned()
+            .zip(self.projection.navigation_visual_rows.iter().copied())
+        {
+            if row >= range.start && row <= range.end {
+                navigation.push(target);
+                navigation_rows.push(row);
+            }
+        }
+        self.projection.navigation = navigation;
+        self.projection.navigation_visual_rows = navigation_rows;
         self.projection.branch_to_selectable = self
             .projection
             .selectable
@@ -2073,6 +2699,27 @@ impl App {
     }
 
     fn reconcile_selection(&mut self) {
+        if let Some(label) = &self.selected_label {
+            let visible = self
+                .projection
+                .navigation
+                .iter()
+                .any(|target| match (target, label) {
+                    (
+                        crate::model::topology::SelectionTarget::StackLabel(left),
+                        ConfigTarget::Stack(right),
+                    ) => left == right,
+                    (
+                        crate::model::topology::SelectionTarget::VisualSectionLabel(left),
+                        ConfigTarget::VisualSection(right),
+                    ) => left == right,
+                    _ => false,
+                });
+            if !visible {
+                self.selected = Some(label.branch().clone());
+                self.selected_label = None;
+            }
+        }
         if self.selected.is_none() {
             self.selected = self.snapshot.as_ref().and_then(|snapshot| {
                 snapshot
@@ -2095,18 +2742,43 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if self.projection.selectable.is_empty() {
+        if self.projection.navigation.is_empty() {
             return;
         }
         let current = self
-            .selected
-            .as_ref()
-            .and_then(|selected| self.projection.branch_to_selectable.get(selected).copied())
+            .projection
+            .navigation
+            .iter()
+            .position(|target| match target {
+                crate::model::topology::SelectionTarget::Branch(branch) => {
+                    self.selected_label.is_none() && self.selected.as_ref() == Some(branch)
+                }
+                crate::model::topology::SelectionTarget::StackLabel(stack) => {
+                    self.selected_label.as_ref() == Some(&ConfigTarget::Stack(stack.clone()))
+                }
+                crate::model::topology::SelectionTarget::VisualSectionLabel(anchor) => {
+                    self.selected_label.as_ref()
+                        == Some(&ConfigTarget::VisualSection(anchor.clone()))
+                }
+            })
             .unwrap_or(0);
         let next = current
             .saturating_add_signed(delta)
-            .min(self.projection.selectable.len() - 1);
-        self.selected = Some(self.projection.selectable[next].clone());
+            .min(self.projection.navigation.len() - 1);
+        match self.projection.navigation[next].clone() {
+            crate::model::topology::SelectionTarget::Branch(branch) => {
+                self.selected = Some(branch);
+                self.selected_label = None;
+            }
+            crate::model::topology::SelectionTarget::StackLabel(stack) => {
+                self.selected = Some(stack.clone());
+                self.selected_label = Some(ConfigTarget::Stack(stack));
+            }
+            crate::model::topology::SelectionTarget::VisualSectionLabel(anchor) => {
+                self.selected = Some(anchor.clone());
+                self.selected_label = Some(ConfigTarget::VisualSection(anchor));
+            }
+        }
         self.keep_selected_visible();
     }
 
@@ -2137,17 +2809,44 @@ impl App {
                 .iter()
                 .rev()
                 .find(|head| head.visual_row < current_row && head.stack_id != current_stack)
+                .map(|head| head.branch.clone())
         } else {
-            self.projection
-                .stack_heads
+            let section = self
+                .projection
+                .section_ranges
                 .iter()
-                .find(|head| head.visual_row > current_row && head.stack_id != current_stack)
+                .find(|range| current_row >= range.start && current_row <= range.end);
+            let next_stack = self.projection.stack_heads.iter().find(|head| {
+                head.visual_row > current_row
+                    && head.stack_id != current_stack
+                    && section.is_none_or(|range| head.visual_row <= range.end)
+                    && section
+                        .and_then(|range| range.trunk_row)
+                        .is_none_or(|trunk_row| head.visual_row < trunk_row)
+            });
+            next_stack.map(|head| head.branch.clone()).or_else(|| {
+                section
+                    .and_then(|range| range.trunk_row)
+                    .filter(|trunk_row| *trunk_row > current_row)
+                    .and_then(|trunk_row| self.projection.entries.get(trunk_row))
+                    .and_then(|entry| match entry {
+                        crate::model::topology::ProjectionEntry::Branch(row) => {
+                            Some(row.branch.clone())
+                        }
+                        _ => None,
+                    })
+            })
         };
         let Some(target) = target else {
             return;
         };
-        self.selected = Some(target.branch.clone());
-        self.keep_selected_visible();
+        self.selected = Some(target);
+        self.selected_label = None;
+        if self.selected_visual_row() == self.sticky_visual_row() {
+            self.align_focused_bottom();
+        } else {
+            self.keep_selected_visible();
+        }
     }
 
     fn move_section(&mut self, delta: isize) {
@@ -2185,23 +2884,20 @@ impl App {
             return;
         };
         self.selected = Some(branch.clone());
+        self.selected_label = None;
         self.keep_selected_visible();
     }
 
     fn keep_selected_visible(&mut self) {
         let previous_scroll = self.scroll;
         self.keep_selected_visible_inner();
-        if self.scroll != previous_scroll && matches!(self.archive_mode, ArchiveMode::Archive) {
+        if self.scroll != previous_scroll {
             self.upstream_request_pending = true;
         }
     }
 
     fn keep_selected_visible_inner(&mut self) {
-        let Some(index) = self
-            .selected
-            .as_ref()
-            .and_then(|selected| self.projection.branch_to_visual.get(selected).copied())
-        else {
+        let Some(index) = self.selected_visual_row() else {
             self.scroll = 0;
             return;
         };
@@ -2232,6 +2928,34 @@ impl App {
                 .len()
                 .saturating_sub(self.viewport_height),
         );
+    }
+
+    fn selected_visual_row(&self) -> Option<usize> {
+        if let Some(label) = &self.selected_label {
+            return self
+                .projection
+                .navigation
+                .iter()
+                .zip(&self.projection.navigation_visual_rows)
+                .find_map(|(target, row)| match (target, label) {
+                    (
+                        crate::model::topology::SelectionTarget::StackLabel(left),
+                        ConfigTarget::Stack(right),
+                    ) if left == right => Some(*row),
+                    (
+                        crate::model::topology::SelectionTarget::VisualSectionLabel(left),
+                        ConfigTarget::VisualSection(right),
+                    ) if left == right => Some(*row),
+                    _ => None,
+                });
+        }
+        self.selected
+            .as_ref()
+            .and_then(|selected| self.projection.branch_to_visual.get(selected).copied())
+    }
+
+    pub fn selected_visual_row_for_ui(&self) -> Option<usize> {
+        self.selected_visual_row()
     }
 
     fn align_focused_bottom(&mut self) {

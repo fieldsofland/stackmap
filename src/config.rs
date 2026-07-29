@@ -13,6 +13,13 @@ use crate::model::BranchId;
 
 pub const MAX_STACK_NAME_CHARS: usize = 80;
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VisualSection {
+    pub color: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Config {
     #[serde(default)]
@@ -21,6 +28,8 @@ pub struct Config {
     pub archived: BTreeSet<String>,
     #[serde(default)]
     pub stack_names: BTreeMap<String, String>,
+    #[serde(default)]
+    pub visual_sections: BTreeMap<String, VisualSection>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,6 +43,7 @@ pub struct ConfigMutation {
     pub color_updates: BTreeMap<BranchId, Option<Arc<str>>>,
     pub archive_updates: BTreeMap<BranchId, ArchiveMutation>,
     pub stack_name_updates: BTreeMap<BranchId, Option<Arc<str>>>,
+    pub visual_section_updates: BTreeMap<BranchId, Option<VisualSection>>,
 }
 
 impl ConfigMutation {
@@ -50,6 +60,10 @@ impl ConfigMutation {
         self.stack_name_updates.insert(stack, name);
     }
 
+    pub fn set_visual_section(&mut self, anchor: BranchId, section: Option<VisualSection>) {
+        self.visual_section_updates.insert(anchor, section);
+    }
+
     pub fn prune_archived(&mut self, branches: impl IntoIterator<Item = BranchId>) {
         self.archive_updates.extend(
             branches
@@ -62,12 +76,15 @@ impl ConfigMutation {
         self.color_updates.extend(newer.color_updates);
         self.archive_updates.extend(newer.archive_updates);
         self.stack_name_updates.extend(newer.stack_name_updates);
+        self.visual_section_updates
+            .extend(newer.visual_section_updates);
     }
 
     pub fn is_empty(&self) -> bool {
         self.color_updates.is_empty()
             && self.archive_updates.is_empty()
             && self.stack_name_updates.is_empty()
+            && self.visual_section_updates.is_empty()
     }
 }
 
@@ -84,6 +101,12 @@ impl Config {
         for name in config.stack_names.values() {
             validate_stack_name(name)?;
         }
+        for section in config.visual_sections.values() {
+            validate_color(&section.color)?;
+            if let Some(name) = &section.name {
+                validate_stack_name(name)?;
+            }
+        }
         Ok(config)
     }
 
@@ -97,6 +120,27 @@ impl Config {
 
     pub fn stack_name(&self, stack: &BranchId) -> Option<&str> {
         self.stack_names.get(stack.0.as_ref()).map(String::as_str)
+    }
+
+    pub fn visual_section(&self, anchor: &BranchId) -> Option<&VisualSection> {
+        self.visual_sections.get(anchor.0.as_ref())
+    }
+
+    pub fn set_visual_section_in_memory(
+        &mut self,
+        anchor: &BranchId,
+        section: Option<VisualSection>,
+    ) -> Result<()> {
+        if let Some(section) = section {
+            validate_color(&section.color)?;
+            if let Some(name) = &section.name {
+                validate_stack_name(name)?;
+            }
+            self.visual_sections.insert(anchor.0.to_string(), section);
+        } else {
+            self.visual_sections.remove(anchor.0.as_ref());
+        }
+        Ok(())
     }
 
     pub fn set_stack_name_in_memory(&mut self, stack: &BranchId, name: Option<&str>) -> Result<()> {
@@ -172,6 +216,7 @@ impl Config {
             color_updates: updates.clone(),
             archive_updates: BTreeMap::new(),
             stack_name_updates: BTreeMap::new(),
+            visual_section_updates: BTreeMap::new(),
         };
         Self::persist_mutation(common_dir, &mutation, fallback)
     }
@@ -208,6 +253,12 @@ impl Config {
         for name in mutation.stack_name_updates.values().flatten() {
             validate_stack_name(name)?;
         }
+        for section in mutation.visual_section_updates.values().flatten() {
+            validate_color(&section.color)?;
+            if let Some(name) = &section.name {
+                validate_stack_name(name)?;
+            }
+        }
         for (root, color) in &mutation.color_updates {
             if let Some(color) = color {
                 self.colors.insert(root.0.to_string(), color.to_string());
@@ -227,6 +278,9 @@ impl Config {
         }
         for (stack, name) in &mutation.stack_name_updates {
             self.set_stack_name_in_memory(stack, name.as_deref())?;
+        }
+        for (anchor, section) in &mutation.visual_section_updates {
+            self.set_visual_section_in_memory(anchor, section.clone())?;
         }
         Ok(())
     }
@@ -445,6 +499,63 @@ mod tests {
     }
 
     #[test]
+    fn visual_sections_round_trip_and_are_removed_atomically() {
+        let directory = tempdir().unwrap();
+        let anchor = BranchId::new("feature-two");
+        let section = VisualSection {
+            color: "#7dcfff".to_owned(),
+            name: Some("Payments".to_owned()),
+        };
+        let mut create = ConfigMutation::default();
+        create.set_visual_section(anchor.clone(), Some(section.clone()));
+        Config::persist_mutation(directory.path(), &create, &Config::default()).unwrap();
+        assert_eq!(
+            Config::load(directory.path())
+                .unwrap()
+                .visual_section(&anchor),
+            Some(&section)
+        );
+
+        let mut remove = ConfigMutation::default();
+        remove.set_visual_section(anchor.clone(), None);
+        Config::persist_mutation(directory.path(), &remove, &Config::default()).unwrap();
+        assert_eq!(
+            Config::load(directory.path())
+                .unwrap()
+                .visual_section(&anchor),
+            None
+        );
+    }
+
+    #[test]
+    fn visual_section_names_and_colors_are_validated() {
+        let mut config = Config::default();
+        let anchor = BranchId::new("feature-two");
+        assert!(
+            config
+                .set_visual_section_in_memory(
+                    &anchor,
+                    Some(VisualSection {
+                        color: "red".to_owned(),
+                        name: None,
+                    })
+                )
+                .is_err()
+        );
+        assert!(
+            config
+                .set_visual_section_in_memory(
+                    &anchor,
+                    Some(VisualSection {
+                        color: "#7dcfff".to_owned(),
+                        name: Some("bad\nname".to_owned()),
+                    })
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
     fn concurrent_archive_mutations_retain_both_memberships() {
         let directory = tempdir().unwrap();
         let barrier = Arc::new(Barrier::new(3));
@@ -479,6 +590,7 @@ mod tests {
             colors: BTreeMap::from([("colored".to_owned(), "#7aa2f7".to_owned())]),
             archived: BTreeSet::from(["gone".to_owned(), "kept".to_owned(), "restored".to_owned()]),
             stack_names: BTreeMap::from([("named".to_owned(), "Keep me".to_owned())]),
+            visual_sections: BTreeMap::new(),
         };
         fallback.save(directory.path()).unwrap();
         let mut mutation = ConfigMutation::default();

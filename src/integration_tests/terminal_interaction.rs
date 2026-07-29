@@ -33,11 +33,27 @@ fn key_events_preserve_phase_and_normalize_portable_navigation_fallbacks() {
     );
     assert_eq!(
         Input::from_event(event(
+            KeyCode::Left,
+            KeyModifiers::NONE,
+            KeyEventKind::Press
+        )),
+        Some(Input::press(Key::Left))
+    );
+    assert_eq!(
+        Input::from_event(event(
+            KeyCode::Delete,
+            KeyModifiers::NONE,
+            KeyEventKind::Press
+        )),
+        Some(Input::press(Key::Delete))
+    );
+    assert_eq!(
+        Input::from_event(event(
             KeyCode::Char('K'),
             KeyModifiers::SHIFT,
             KeyEventKind::Press
         )),
-        Some(Input::press(Key::StackUp))
+        Some(Input::press(Key::Character('K')))
     );
     assert_eq!(
         Input::from_event(event(
@@ -45,7 +61,7 @@ fn key_events_preserve_phase_and_normalize_portable_navigation_fallbacks() {
             KeyModifiers::NONE,
             KeyEventKind::Press
         )),
-        Some(Input::press(Key::StackDown))
+        Some(Input::press(Key::Character('J')))
     );
     assert_eq!(
         Input::from_event(event(
@@ -53,7 +69,7 @@ fn key_events_preserve_phase_and_normalize_portable_navigation_fallbacks() {
             KeyModifiers::NONE,
             KeyEventKind::Press
         )),
-        Some(Input::press(Key::SectionUp))
+        Some(Input::press(Key::Character('g')))
     );
     assert_eq!(
         Input::from_event(event(
@@ -61,7 +77,7 @@ fn key_events_preserve_phase_and_normalize_portable_navigation_fallbacks() {
             KeyModifiers::SHIFT,
             KeyEventKind::Press
         )),
-        Some(Input::press(Key::SectionDown))
+        Some(Input::press(Key::Character('G')))
     );
 }
 
