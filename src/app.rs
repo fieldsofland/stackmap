@@ -12,7 +12,7 @@ use crate::model::topology::{
     ArchiveMode, Emphasis, OrderMode, ProjectionOptions, ProjectionScope, TopologyIndex,
     TopologyProjection,
 };
-use crate::model::{Branch, BranchId, RepositorySnapshot};
+use crate::model::{Branch, BranchId, PullRequest, PullRequestStatus, RepositorySnapshot};
 use crate::refresh::upstream::{
     MAX_TARGETS, UpstreamBatch, UpstreamCommand, UpstreamRequest, UpstreamTarget,
 };
@@ -228,14 +228,14 @@ impl App {
             Vec::new()
         };
         if let Some(current) = &self.snapshot {
-            let current_prs: std::collections::HashMap<_, _> = current
+            let current_prs: HashMap<BranchId, PullRequest> = current
                 .branches
                 .iter()
                 .filter_map(|branch| {
                     branch
                         .pr
                         .clone()
-                        .map(|pr| ((branch.id.clone(), branch.oid.clone()), pr))
+                        .map(|pull_request| (branch.id.clone(), pull_request))
                 })
                 .collect();
             if !current_prs.is_empty() {
@@ -243,9 +243,7 @@ impl App {
                 let branches = Arc::make_mut(&mut snapshot.branches);
                 for branch in branches {
                     if branch.pr.is_none() {
-                        branch.pr = current_prs
-                            .get(&(branch.id.clone(), branch.oid.clone()))
-                            .cloned();
+                        branch.pr = current_prs.get(&branch.id).cloned();
                     }
                 }
             }
@@ -526,15 +524,7 @@ impl App {
         };
         let mut branches = snapshot.branches.to_vec();
         for branch in &mut branches {
-            branch.pr = None;
-        }
-        for result in matches {
-            if let Some(branch) = branches
-                .iter_mut()
-                .find(|branch| branch.id == result.branch && branch.oid == result.oid)
-            {
-                branch.pr = Some(result.pull_request);
-            }
+            branch.pr = pick_best_pull_request(&matches, branch);
         }
         self.snapshot = Some(Arc::new(RepositorySnapshot {
             branches: Arc::from(branches),
@@ -793,6 +783,10 @@ impl App {
             Key::Character('o') => self
                 .selected_url()
                 .map(Action::OpenUrl)
+                .unwrap_or(Action::None),
+            Key::Character('O') => self
+                .stack_pr_urls()
+                .map(Action::OpenUrls)
                 .unwrap_or(Action::None),
             Key::Character('y') => self
                 .selected_url()
@@ -2090,6 +2084,32 @@ impl App {
         self.selected_branch()?.pr.as_ref().map(|pr| pr.url.clone())
     }
 
+    fn stack_pr_urls(&self) -> Option<Vec<Arc<str>>> {
+        if matches!(self.archive_mode, ArchiveMode::Archive) || self.selected_label.is_some() {
+            return None;
+        }
+        let (selected, snapshot, topology) = match (&self.selected, &self.snapshot, &self.topology)
+        {
+            (Some(selected), Some(snapshot), Some(topology)) => (selected, snapshot, topology),
+            _ => return None,
+        };
+        let stack_branches = topology.stack_branches(selected)?;
+        let mut urls = Vec::new();
+        let mut seen = HashSet::new();
+        for branch_id in stack_branches {
+            let Some(pull_request) = snapshot
+                .branch(branch_id)
+                .and_then(|branch| branch.pr.as_ref())
+            else {
+                continue;
+            };
+            if seen.insert(Arc::clone(&pull_request.url)) {
+                urls.push(Arc::clone(&pull_request.url));
+            }
+        }
+        if urls.is_empty() { None } else { Some(urls) }
+    }
+
     pub fn begin_delete_confirmation(&mut self) {
         if self.selected_label.is_some() {
             self.message = Some(Arc::from("labels cannot be deleted"));
@@ -3059,5 +3079,29 @@ fn reconciliation_notice(
                 )),
             }
         }
+    }
+}
+
+fn pick_best_pull_request(matches: &[PrMatch], branch: &Branch) -> Option<PullRequest> {
+    matches
+        .iter()
+        .filter(|candidate| candidate.branch == branch.id)
+        .max_by_key(|candidate| pull_request_match_score(candidate, &branch.oid))
+        .map(|matched| matched.pull_request.clone())
+}
+
+fn pull_request_match_score(pr_match: &PrMatch, branch_oid: &str) -> (u8, bool, u64) {
+    (
+        pull_request_status_rank(pr_match.pull_request.status),
+        pr_match.oid.as_ref() == branch_oid,
+        pr_match.pull_request.number,
+    )
+}
+
+fn pull_request_status_rank(status: PullRequestStatus) -> u8 {
+    match status {
+        PullRequestStatus::Open | PullRequestStatus::Approved => 2,
+        PullRequestStatus::Closed => 1,
+        PullRequestStatus::Merged => 0,
     }
 }

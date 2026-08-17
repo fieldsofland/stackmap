@@ -10,7 +10,7 @@ use crate::model::{
     BranchId, ConfiguredUpstream, DiffStat, DiffState, PullRequest, PullRequestStatus,
     RemoteRefEvidence,
 };
-use crate::ui::layout::{RenderGeometry, WidthMode, areas};
+use crate::ui::layout::{ColumnRange, RenderGeometry, WidthMode, areas};
 use crate::ui::theme::{
     TRUNK_COLOR_HEX, current_background, selected_background, stack_color, trunk_color,
 };
@@ -458,12 +458,91 @@ fn selected_rows_use_dark_content_and_current_rows_use_tinted_stack_fill() {
     );
 }
 
+fn sample_pull_request(status: PullRequestStatus) -> PullRequest {
+    PullRequest {
+        number: 42,
+        title: Arc::from("Feature"),
+        url: Arc::from("https://example.invalid/42"),
+        status,
+    }
+}
+
+fn render_branch_pull_request(
+    branch_name: &str,
+    status: PullRequestStatus,
+    sibling_names: &[&str],
+    selected_name: Option<&str>,
+) -> Terminal<TestBackend> {
+    let mut primary = common::branch(branch_name, None, branch_name, false);
+    primary.pr = Some(sample_pull_request(status));
+    let mut branches = vec![primary];
+    for sibling_name in sibling_names {
+        branches.push(common::branch(sibling_name, None, sibling_name, false));
+    }
+    let mut app = App::default();
+    app.apply_snapshot(common::snapshot(branches));
+    if let Some(name) = selected_name {
+        app.selected = Some(BranchId::new(name));
+    }
+    let mut terminal = Terminal::new(TestBackend::new(100, 8)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    terminal
+}
+
+#[test]
+fn approved_pull_request_checkmark_uses_green() {
+    let terminal =
+        render_branch_pull_request("feature-approved", PullRequestStatus::Approved, &[], None);
+    let check = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .find(|cell| cell.symbol() == "✓")
+        .expect("approved checkmark");
+    assert_eq!(check.fg, Color::Green);
+}
+
+#[test]
+fn open_pull_request_has_no_green_checkmark() {
+    let terminal = render_branch_pull_request("feature-open", PullRequestStatus::Open, &[], None);
+    let rendered = rendered_lines(&terminal).join("\n");
+    assert!(rendered.contains("#42"), "{rendered}");
+    assert!(
+        !terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .any(|cell| cell.symbol() == "✓" && cell.fg == Color::Green)
+    );
+}
+
+#[test]
+fn approved_pull_request_checkmark_stays_green_when_selected() {
+    let terminal = render_branch_pull_request(
+        "approved",
+        PullRequestStatus::Approved,
+        &["selected"],
+        Some("approved"),
+    );
+    let lines = rendered_lines(&terminal);
+    let (approved_y, _) = line_with(&lines, "approved");
+    let check = (0..100)
+        .map(|x| &terminal.backend().buffer()[(x, approved_y as u16)])
+        .find(|cell| cell.symbol() == "✓")
+        .expect("approved checkmark on selected row");
+    assert_eq!(check.fg, Color::Green);
+}
+
 #[test]
 fn pull_request_status_replaces_the_number_for_terminal_states_and_approval() {
     for (status, expected) in [
-        (PullRequestStatus::Approved, "Approved"),
-        (PullRequestStatus::Closed, "Closed"),
-        (PullRequestStatus::Merged, "Merged"),
+        (PullRequestStatus::Approved, "✓#42"),
+        (PullRequestStatus::Closed, "Clsd"),
+        (PullRequestStatus::Merged, "Mrgd"),
     ] {
         let mut branch = common::branch("feature", None, "feature", false);
         branch.pr = Some(PullRequest {
@@ -484,6 +563,44 @@ fn pull_request_status_replaces_the_number_for_terminal_states_and_approval() {
                 .any(|line| line.contains(expected))
         );
     }
+}
+
+#[test]
+fn diverged_remote_and_approved_pr_stay_in_separate_metadata_columns() {
+    let mut branch = common::branch("feature-x", None, "feature-x", false);
+    branch.configured_upstream = ConfiguredUpstream::Diverged {
+        reference: Arc::from("origin/feature-x"),
+        ahead: 95,
+        behind: 2,
+    };
+    branch.pr = Some(PullRequest {
+        number: 4593,
+        title: Arc::from("Feature"),
+        url: Arc::from("https://example.invalid/4593"),
+        status: PullRequestStatus::Approved,
+    });
+    let mut app = App::default();
+    app.apply_snapshot(common::snapshot(vec![branch]));
+    let mut terminal = Terminal::new(TestBackend::new(100, 8)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let geometry = RenderGeometry::new(100, WidthMode::Medium, LanePitch::Auto, 1);
+    let remote = geometry.remote.expect("remote column");
+    let pull_request = geometry.pr.expect("PR column");
+    let lines = rendered_lines(&terminal);
+    let (_, branch_line) = line_with(&lines, "feature-x");
+    let remote_text = metadata_column_text(branch_line, remote);
+    let pull_request_text = metadata_column_text(branch_line, pull_request);
+    assert!(remote_text.contains("div"));
+    assert!(pull_request_text.contains("✓#4593"));
+    assert!(!pull_request_text.contains("div"));
+    assert!(!branch_line.contains("divApproved"));
+    assert!(!branch_line.contains("div✓"));
+}
+
+fn metadata_column_text(line: &str, range: ColumnRange) -> String {
+    line.chars().skip(range.x).take(range.width).collect()
 }
 
 #[test]
@@ -1054,7 +1171,7 @@ fn metadata_columns_leave_time_diff_and_pr_edge_gutters() {
         geometry.diff.x + geometry.diff.width + 1
     );
     assert_eq!(remote.x, geometry.worktree.x + geometry.worktree.width);
-    assert_eq!(pr.x, remote.x + remote.width);
+    assert_eq!(pr.x, remote.x + remote.width + 1);
     assert_eq!(pr.x + pr.width + 1, geometry.width);
 }
 
@@ -1568,23 +1685,20 @@ fn help_documents_archive_range_and_picker_keys() {
         "main", None, "main", true,
     )]));
     app.overlay = crate::app::Overlay::Help;
-    let backend = TestBackend::new(90, 28);
+    let backend = TestBackend::new(90, 48);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
-    let rendered: String = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect();
+    let rendered = rendered_lines(&terminal).join("\n");
     assert!(rendered.contains("archive / restore selected local branch"));
     assert!(rendered.contains("guarded delete exact local branch"));
     assert!(rendered.contains("preview contiguous archive/restore range"));
     assert!(rendered.contains("order picker"));
     assert!(rendered.contains("color picker"));
+    assert!(rendered.contains("open selected PR / all stack PRs / copy URL"));
+    assert!(rendered.contains("GitHub:"));
+    assert!(rendered.contains("Graphite:"));
     assert!(rendered.contains("› selected"));
     assert!(rendered.contains("○ branch"));
     assert!(rendered.contains("● current"));
@@ -1592,6 +1706,50 @@ fn help_documents_archive_range_and_picker_keys() {
     assert!(rendered.contains("■ range"));
     assert!(rendered.contains("* dirty"));
     assert!(rendered.contains("⎇ worktree"));
+}
+
+#[test]
+fn help_shows_open_pr_keys_and_github_status_on_short_terminal() {
+    let mut app = App::default();
+    app.apply_snapshot(common::snapshot(vec![common::branch(
+        "main", None, "main", true,
+    )]));
+    app.overlay = Overlay::Help;
+    let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let rendered = rendered_lines(&terminal).join("\n");
+    assert!(rendered.contains("open selected PR / all stack PRs / copy URL"));
+    assert!(rendered.contains("GitHub:"));
+}
+
+#[test]
+fn footer_shows_open_pr_keys_when_selected_branch_has_pull_request() {
+    let mut app = App::default();
+    let snapshot = common::snapshot(vec![common::branch(
+        "feature/stack-map",
+        None,
+        "feature/stack-map",
+        true,
+    )]);
+    app.apply_snapshot(snapshot);
+    app.apply_prs(vec![crate::adapters::github::PrMatch {
+        branch: BranchId::new("feature/stack-map"),
+        oid: Arc::from("remote-oid"),
+        pull_request: PullRequest {
+            number: 42,
+            title: Arc::from("PR"),
+            url: Arc::from("https://example.invalid/pr/42"),
+            status: PullRequestStatus::Open,
+        },
+    }]);
+    let mut terminal = Terminal::new(TestBackend::new(160, 10)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let rendered = rendered_lines(&terminal).join("\n");
+    assert!(rendered.contains("o/O/y PR"));
 }
 
 #[test]

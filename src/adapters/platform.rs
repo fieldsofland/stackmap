@@ -9,10 +9,18 @@ const PLATFORM_TIMEOUT: Duration = Duration::from_secs(3);
 const OUTPUT_LIMIT: usize = 64 * 1024;
 
 pub fn open_url(url: &str) -> Result<()> {
+    open_urls(&[url])
+}
+
+pub fn open_urls(urls: &[impl AsRef<str>]) -> Result<()> {
+    if urls.is_empty() {
+        return Ok(());
+    }
     let cwd = std::env::current_dir()?;
+    let arguments: Vec<&str> = urls.iter().map(|url| url.as_ref()).collect();
     let output = run_bounded(
         OsStr::new("open"),
-        [url],
+        arguments,
         &cwd,
         PLATFORM_TIMEOUT,
         OUTPUT_LIMIT,

@@ -11,7 +11,10 @@ use crate::model::topology::{
     ArchiveMode, ConnectorRow, DividerRow, Emphasis, ProjectedRow, ProjectionEntry, StackLabelRow,
     VisualSectionDividerRow, VisualSectionLabelRow,
 };
-use crate::model::{Branch, BranchId, ConfiguredUpstream, DiffState, RemoteRefEvidence};
+use crate::model::{
+    Branch, BranchId, ConfiguredUpstream, DiffState, PullRequest, PullRequestStatus,
+    RemoteRefEvidence,
+};
 
 use super::layout::{ColumnRange, RenderGeometry, WidthMode};
 use super::theme::{
@@ -33,6 +36,7 @@ const RIGHT: u8 = 8;
 struct RenderCell {
     symbol: String,
     style: Style,
+    preserve_foreground: bool,
 }
 
 impl Default for RenderCell {
@@ -40,6 +44,7 @@ impl Default for RenderCell {
         Self {
             symbol: " ".into(),
             style: Style::default(),
+            preserve_foreground: false,
         }
     }
 }
@@ -554,24 +559,17 @@ fn branch_line(
             paint_remote_status(&mut cells, branch, range, metadata_emphasis);
         }
         if let Some(range) = geometry.pr
-            && let Some(pr) = &branch.pr
+            && let Some(pull_request) = &branch.pr
         {
-            put_right(
-                &mut cells,
-                range,
-                match pr.status {
-                    crate::model::PullRequestStatus::Open => format!("#{}", pr.number),
-                    status => status.label().to_owned(),
-                }
-                .as_str(),
-                emphasized(Style::default().fg(Color::Yellow), metadata_emphasis),
-            );
+            paint_pull_request(&mut cells, range, pull_request, metadata_emphasis);
         }
     }
 
     if selected {
         for cell in &mut cells {
-            cell.style = cell.style.fg(Color::Black);
+            if !cell.preserve_foreground {
+                cell.style = cell.style.fg(Color::Black);
+            }
         }
     }
 
@@ -846,6 +844,47 @@ fn paint_diff(cells: &mut [RenderCell], range: ColumnRange, diff: &DiffState, em
     }
 }
 
+fn paint_pull_request(
+    cells: &mut [RenderCell],
+    range: ColumnRange,
+    pull_request: &PullRequest,
+    emphasis: Emphasis,
+) {
+    match pull_request.status {
+        PullRequestStatus::Open => {
+            put_right(
+                cells,
+                range,
+                &pull_request.status.column_text(pull_request.number),
+                emphasized(Style::default().fg(Color::Yellow), emphasis),
+            );
+        }
+        PullRequestStatus::Approved => {
+            let combined = pull_request.status.column_text(pull_request.number);
+            let visible = truncate(&combined, range.width);
+            let visible_count = visible.chars().count();
+            let start_x = range.x + range.width.saturating_sub(visible_count);
+            let check_style = emphasized(Style::default().fg(Color::Green), emphasis);
+            let number_style = emphasized(Style::default().fg(Color::Yellow), emphasis);
+            for (offset, character) in visible.chars().enumerate() {
+                let position = start_x + offset;
+                match character {
+                    '✓' => write_symbol(cells, position, "✓", check_style, true),
+                    _ => write_symbol(cells, position, &character.to_string(), number_style, false),
+                }
+            }
+        }
+        PullRequestStatus::Merged | PullRequestStatus::Closed => {
+            put_right(
+                cells,
+                range,
+                &pull_request.status.column_text(pull_request.number),
+                emphasized(Style::default().fg(Color::DarkGray), emphasis),
+            );
+        }
+    }
+}
+
 fn paint_worktree(
     cells: &mut [RenderCell],
     range: ColumnRange,
@@ -879,10 +918,21 @@ fn blank_cells(width: usize) -> Vec<RenderCell> {
 }
 
 fn set_symbol(cells: &mut [RenderCell], x: usize, symbol: &str, style: Style) {
+    write_symbol(cells, x, symbol, style, false);
+}
+
+fn write_symbol(
+    cells: &mut [RenderCell],
+    x: usize,
+    symbol: &str,
+    style: Style,
+    preserve_foreground: bool,
+) {
     if let Some(cell) = cells.get_mut(x) {
         cell.symbol.clear();
         cell.symbol.push_str(symbol);
         cell.style = style;
+        cell.preserve_foreground = preserve_foreground;
     }
 }
 

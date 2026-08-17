@@ -8,6 +8,9 @@ use serde::Deserialize;
 use super::command::{CommandError, CommandOutput, run_bounded};
 use crate::model::{BranchId, PullRequest, PullRequestStatus};
 
+const GITHUB_LIST_TIMEOUT: Duration = Duration::from_secs(30);
+const GITHUB_LIST_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GhPullRequest {
@@ -75,7 +78,7 @@ pub fn fetch(cwd: &Path) -> Result<Vec<PrMatch>, GitHubError> {
         "pr",
         "list",
         "--state",
-        "all",
+        "open",
         "--limit",
         "1000",
         "--json",
@@ -85,8 +88,8 @@ pub fn fetch(cwd: &Path) -> Result<Vec<PrMatch>, GitHubError> {
         OsStr::new("gh"),
         args,
         cwd,
-        Duration::from_secs(3),
-        4 * 1024 * 1024,
+        GITHUB_LIST_TIMEOUT,
+        GITHUB_LIST_OUTPUT_LIMIT,
     )
     .map_err(GitHubError::from)?;
     parse_output(output)
@@ -109,24 +112,23 @@ pub fn parse_json(bytes: &[u8]) -> Result<Vec<PrMatch>, GitHubError> {
         .map_err(|error| GitHubError::Malformed(Arc::from(error.to_string())))?;
     Ok(values
         .into_iter()
-        .filter_map(|value| {
-            Some(PrMatch {
-                branch: BranchId::new(value.head_ref_name),
-                oid: Arc::from(value.head_ref_oid?),
-                pull_request: PullRequest {
-                    number: value.number,
-                    title: Arc::from(value.title),
-                    url: Arc::from(value.url),
-                    status: match value.state.as_str() {
-                        "MERGED" => PullRequestStatus::Merged,
-                        "CLOSED" => PullRequestStatus::Closed,
-                        _ if value.review_decision.as_deref() == Some("APPROVED") => {
-                            PullRequestStatus::Approved
-                        }
-                        _ => PullRequestStatus::Open,
-                    },
+        .filter(|value| !value.head_ref_name.is_empty())
+        .map(|value| PrMatch {
+            branch: BranchId::new(value.head_ref_name),
+            oid: Arc::from(value.head_ref_oid.unwrap_or_default()),
+            pull_request: PullRequest {
+                number: value.number,
+                title: Arc::from(value.title),
+                url: Arc::from(value.url),
+                status: match value.state.as_str() {
+                    "MERGED" => PullRequestStatus::Merged,
+                    "CLOSED" => PullRequestStatus::Closed,
+                    _ if value.review_decision.as_deref() == Some("APPROVED") => {
+                        PullRequestStatus::Approved
+                    }
+                    _ => PullRequestStatus::Open,
                 },
-            })
+            },
         })
         .collect())
 }
