@@ -19,6 +19,7 @@ pub enum Action {
     Checkout(BranchId),
     Delete(DeleteRequest),
     OpenUrl(Arc<str>),
+    OpenUrls(Vec<Arc<str>>),
     CopyUrl(Arc<str>),
     PersistConfig(ConfigWriteRequest),
 }

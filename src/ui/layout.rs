@@ -44,6 +44,7 @@ impl RenderGeometry {
         let diff_worktree_gap = 1;
         let worktree_width = if wide_worktree { 18 } else { 2 };
         let remote_width = usize::from(show_remote) * 11;
+        let remote_pr_gap = usize::from(show_remote && show_pr);
         let pr_width = usize::from(show_pr) * 8;
         let pr_edge_gap = usize::from(show_pr);
         let metadata_width = time_width
@@ -52,6 +53,7 @@ impl RenderGeometry {
             + diff_worktree_gap
             + worktree_width
             + remote_width
+            + remote_pr_gap
             + pr_width
             + pr_edge_gap;
         let metadata_start = width.saturating_sub(metadata_width);
@@ -79,7 +81,7 @@ impl RenderGeometry {
                 x: cursor,
                 width: remote_width,
             };
-            cursor += remote_width;
+            cursor += remote_width + remote_pr_gap;
             range
         });
         let pr = show_pr.then_some(ColumnRange {

@@ -109,6 +109,15 @@ impl PullRequestStatus {
             Self::Merged => "Merged",
         }
     }
+
+    pub fn column_text(self, number: u64) -> String {
+        match self {
+            Self::Open => format!("#{number}"),
+            Self::Approved => format!("✓#{number}"),
+            Self::Merged => "Mrgd".to_owned(),
+            Self::Closed => "Clsd".to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

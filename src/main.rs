@@ -32,6 +32,7 @@ const CONFIG_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 enum PlatformResult {
     Open(Result<()>),
+    OpenMany { count: usize, result: Result<()> },
     Copy(Result<()>),
 }
 
@@ -258,10 +259,23 @@ fn run() -> Result<()> {
             app.platform_running = false;
             match result {
                 PlatformResult::Open(Ok(())) => app.message = Some(Arc::from("PR opened")),
+                PlatformResult::OpenMany {
+                    count,
+                    result: Ok(()),
+                } => {
+                    app.message = Some(if count == 1 {
+                        Arc::from("PR opened")
+                    } else {
+                        Arc::from(format!("opened {count} PRs"))
+                    });
+                }
                 PlatformResult::Copy(Ok(())) => app.message = Some(Arc::from("PR URL copied")),
                 PlatformResult::Open(Err(error)) => {
                     app.message = Some(Arc::from(format!("open failed: {error}")))
                 }
+                PlatformResult::OpenMany {
+                    result: Err(error), ..
+                } => app.message = Some(Arc::from(format!("open failed: {error}"))),
                 PlatformResult::Copy(Err(error)) => {
                     app.message = Some(Arc::from(format!("copy failed: {error}")))
                 }
@@ -324,6 +338,7 @@ fn run() -> Result<()> {
                         Action::None => {}
                         Action::Quit => break,
                         Action::Refresh => {
+                            next_github_fetch = Instant::now();
                             refresh.request();
                         }
                         Action::PersistConfig(request) => {
@@ -341,6 +356,13 @@ fn run() -> Result<()> {
                             spawn_platform_action(
                                 &mut app,
                                 PlatformAction::Open(url),
+                                platform_send.clone(),
+                            )?;
+                        }
+                        Action::OpenUrls(urls) => {
+                            spawn_platform_action(
+                                &mut app,
+                                PlatformAction::OpenMany(urls),
                                 platform_send.clone(),
                             )?;
                         }
@@ -446,6 +468,7 @@ fn spawn_config_persistence(
 
 enum PlatformAction {
     Open(Arc<str>),
+    OpenMany(Vec<Arc<str>>),
     Copy(Arc<str>),
 }
 
@@ -464,6 +487,10 @@ fn spawn_platform_action(
         .spawn(move || {
             let result = match action {
                 PlatformAction::Open(url) => PlatformResult::Open(platform::open_url(&url)),
+                PlatformAction::OpenMany(urls) => PlatformResult::OpenMany {
+                    count: urls.len(),
+                    result: platform::open_urls(&urls),
+                },
                 PlatformAction::Copy(url) => PlatformResult::Copy(platform::copy_text(&url)),
             };
             let _ = sender.try_send(result);

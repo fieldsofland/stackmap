@@ -125,7 +125,7 @@ sections remain directly above the first visible branch they own.
 | `a` | Toggle Active / Archive view |
 | `X`, then `y` / `n` | Confirm or cancel guarded deletion of one exact local branch |
 | `r` | Force repository reconciliation |
-| `o` / `y` | Open or copy the selected PR URL |
+| `o` / `O` / `y` | Open the selected PR URL, open every PR in the selected stack, or copy the selected PR URL |
 | `?` | Show help and provider status |
 | `Esc` | Close help/message or cancel a filter edit |
 | `q`, `Ctrl-C` | Quit |
@@ -214,17 +214,19 @@ missing, busy, or corrupt metadata produces an explicit topology-unavailable
 state; every Git-local branch remains visible as an independent root. The tool
 never writes or migrates Graphite files.
 
-GitHub enrichment is optional. A single-flight, TTL-limited bounded `gh pr list`
-request retrieves PRs in all states, and results attach only when branch name and tip
-object ID still match. Missing auth, offline operation, timeout, or malformed
-JSON is shown as provider state and does not affect local navigation.
+GitHub enrichment is optional. A single-flight, TTL-limited bounded `gh pr list --state open`
+request attaches PRs by local branch name. A matching tip object ID is preferred when
+several PRs share a name, but drifted local commits still get the branch PR so `o` / `O`
+can open it. Missing auth, offline operation, timeout, or malformed JSON is shown as
+provider state (`?` help, GitHub line) and does not affect local navigation.
 
 ## Troubleshooting
 
 | Symptom | Meaning / action |
 |---|---|
 | `topology unavailable` | Graphite metadata is missing or incompatible; Git branches are still complete |
-| PR details are blank | Run `gh auth status`; local behavior does not require GitHub |
+| PR details are blank | Wait until `?` shows `GitHub: loaded`; run `gh auth status`; press `r` to retry. Local navigation does not require GitHub |
+| `o` does nothing | Select a branch row (not a stack label), wait for a yellow `#N`, then press `o`. Hover does not open. Archive view and `/` search block `o`. |
 | Checkout is disabled | The branch is current, another worktree owns it, or Git has an operation in progress |
 | Git blocks checkout | Commit/move the conflicting work yourself; stackmap deliberately performs no cleanup |
 | Shift-arrow does not jump | This is terminal encoding, not Vim. Use `J` / `K`, or configure the terminal to send `ESC [ 1 ; 2 A` / `ESC [ 1 ; 2 B` for Shift+Up / Shift+Down. Stackmap enables complete modifier reporting when the terminal supports the enhanced keyboard protocol. |

@@ -194,6 +194,13 @@ impl TopologyIndex {
         self.stack_by_branch.get(branch)
     }
 
+    pub fn stack_branches(&self, branch: &BranchId) -> Option<&[BranchId]> {
+        let stack_id = self.stack_for(branch)?;
+        self.groups
+            .get(stack_id)
+            .map(|group| group.branches.as_slice())
+    }
+
     pub fn stack_diff_endpoints(&self) -> Vec<StackDiffEndpoints> {
         self.groups
             .values()

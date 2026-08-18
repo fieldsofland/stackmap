@@ -108,11 +108,24 @@ pub fn footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             "archive"
         };
+        let pull_request_keys = if matches!(app.archive_mode, ArchiveMode::Active)
+            && matches!(app.overlay, Overlay::None)
+            && matches!(app.mutation, MutationState::Idle)
+            && app
+                .selected_branch()
+                .is_some_and(|branch| branch.pr.is_some())
+        {
+            "  o/O/y PR"
+        } else {
+            ""
+        };
         if has_supplementary {
-            format!(" a View {archive_target}  x {archive_action}  X delete  ? help")
+            format!(
+                " a View {archive_target}  x {archive_action}  X delete{pull_request_keys}  ? help"
+            )
         } else {
             format!(
-                " {position}/{}  {order}  {}  {pitch}  a View {archive_target}  x {archive_action}  v range  X delete  ↑↓ {stack_navigation} ? help",
+                " {position}/{}  {order}  {}  {pitch}  a View {archive_target}  x {archive_action}  v range  X delete  ↑↓ {stack_navigation}{pull_request_keys}  ? help",
                 app.projection.navigation.len(),
                 app.scope_label(),
             )
@@ -170,8 +183,22 @@ pub fn detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 pub fn help(frame: &mut Frame<'_>, app: &App) {
-    let area = centered(frame.area(), 72, 25);
+    let text = help_contents(app);
+    let height = u16::try_from(text.lines().count())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let area = centered(frame.area(), 78, height);
     frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .alignment(Alignment::Left)
+            .block(Block::default().title(" Help ").borders(Borders::ALL)),
+        area,
+    );
+}
+
+fn help_contents(app: &App) -> String {
     let graphite = app
         .snapshot
         .as_ref()
@@ -183,32 +210,40 @@ pub fn help(frame: &mut Frame<'_>, app: &App) {
         GitHubState::Ready => "loaded".to_owned(),
         GitHubState::Unavailable(error) => format!("unavailable: {error}"),
     };
-    let text = format!(
-        "Markers: › selected  ○ branch  ● current  ◉ trunk\n         ■ range  * dirty  ⎇ worktree\nRemote:  ✓ pushed  ↑ ahead  ↓ behind  ↕ diverged\n         × gone  ○ no remote  ? unknown\n\n↑/↓ or j/k          previous/next branch\nShift/Cmd+↑/↓ J/K  adjacent stack head, otherwise ±10 rows\nAlt+↑/↓ g/G         top/bottom branch of current section\nt / T               Recent/Graphite toggle / order picker\n+ / - / 0           adjust / reset lane pitch\nh                   focus selected stack; repeat exits\nH                   focus trunk or all Untrunked; repeat exits\ns                   toggle stack spacing\na                   toggle Active / Archive view\nv + arrows          preview contiguous archive/restore range\n/                   filter branch names\nEnter ×2            arm / confirm protected git switch\nc / C               cycle color / color picker\nn                   name / clear selected stack\nx                   archive / restore selected local branch\nX                   guarded delete exact local branch\nr                   full reconciliation\no / y               open / copy PR URL\nEsc                 close message/help\nq or Ctrl-C         quit\n\nLowercase x/v change local config only; uppercase X can delete one exact local ref after confirmation. No remote changes or fetch.\nArchive view shows dim, nonselectable ancestry for stack context.\nFocused sections pin their trunk/bottom row.\nRemote evidence uses local remote-tracking refs only; no fetch.\nColors: stack identity; yellow PR; green/red diff\nActive: {} / {} / {}\n\nGraphite: {graphite}\nGitHub: {github}",
-        match app.order_mode {
-            OrderMode::Recent => "recent order",
-            OrderMode::Alphabetical => "alphabetical order",
-            OrderMode::Graphite => "Graphite order",
-            OrderMode::Chronological => "time order",
-        },
+    let order = match app.order_mode {
+        OrderMode::Recent => "recent order",
+        OrderMode::Alphabetical => "alphabetical order",
+        OrderMode::Graphite => "Graphite order",
+        OrderMode::Chronological => "time order",
+    };
+    let separators = if app.separators {
+        "separators on"
+    } else {
+        "separators off"
+    };
+    format!(
+        "GitHub: {github}\nGraphite: {graphite}\n\n\
+o / O / y           open selected PR / all stack PRs / copy URL\n\
+Esc / ?             close this help\n\
+q or Ctrl-C         quit\n\n\
+Markers: › selected  ○ branch  ● current  ◉ trunk\n         ■ range  * dirty  ⎇ worktree\nRemote:  ✓ pushed  ↑ ahead  ↓ behind  ↕ diverged\n         × gone  ○ no remote  ? unknown\n\n\
+↑/↓ or j/k          previous/next branch\nShift/Cmd+↑/↓ J/K  adjacent stack head, otherwise ±10 rows\nAlt+↑/↓ g/G         top/bottom branch of current section\n\
+t / T               Recent/Graphite toggle / order picker\n+ / - / 0           adjust / reset lane pitch\n\
+h                   focus selected stack; repeat exits\nH                   focus trunk or all Untrunked; repeat exits\n\
+s                   toggle stack spacing\na                   toggle Active / Archive view\n\
+v + arrows          preview contiguous archive/restore range\n/                   filter branch names\n\
+Enter ×2 / Enter    git switch / edit selected label\nc / C               contextual color / color picker\n\
+d                   toggle wide detail sidebar\ni                   toggle visual section boundary\n\
+n                   create missing stack/section label\nx                   archive / restore selected local branch\n\
+X                   guarded delete exact local branch\nr                   full reconciliation\n\n\
+Lowercase x/v change local config only; uppercase X can delete one exact local ref after confirmation. No remote changes or fetch.\n\
+Archive view shows dim, nonselectable ancestry for stack context.\n\
+Focused sections pin their trunk/bottom row.\n\
+Remote evidence uses local remote-tracking refs only; no fetch.\n\
+Colors: stack identity; yellow PR; green/red diff\n\
+Active: {order} / {} / {separators}",
         app.scope_label(),
-        if app.separators {
-            "separators on"
-        } else {
-            "separators off"
-        }
-    );
-    let text = text.replace(
-        "Enter ×2            arm / confirm protected git switch\nc / C               cycle color / color picker\nn                   name / clear selected stack",
-        "Enter ×2 / Enter    git switch / edit selected label\nc / C               contextual color / color picker\nd                   toggle wide detail sidebar\ni                   toggle visual section boundary\nn                   create missing stack/section label",
-    );
-    frame.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .alignment(Alignment::Left)
-            .block(Block::default().title(" Help ").borders(Borders::ALL)),
-        area,
-    );
+    )
 }
 
 pub fn order_picker(frame: &mut Frame<'_>, app: &App) {

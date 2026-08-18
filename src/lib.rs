@@ -63,7 +63,7 @@ pub mod runtime {
 
     /// Bounded macOS open and clipboard helpers.
     pub mod platform {
-        pub use crate::adapters::platform::{copy_text, open_url};
+        pub use crate::adapters::platform::{copy_text, open_url, open_urls};
     }
 }
 
