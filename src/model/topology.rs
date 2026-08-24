@@ -194,10 +194,10 @@ impl TopologyIndex {
         self.stack_by_branch.get(branch)
     }
 
-    pub fn stack_branches(&self, branch: &BranchId) -> Option<&[BranchId]> {
-        let stack_id = self.stack_for(branch)?;
+    pub fn stack_branches_for(&self, branch: &BranchId) -> Option<&[BranchId]> {
+        let stack = self.stack_for(branch)?;
         self.groups
-            .get(stack_id)
+            .get(stack)
             .map(|group| group.branches.as_slice())
     }
 

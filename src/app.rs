@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::adapters::git::{DeleteOutcome, DeleteRequest};
+use crate::adapters::git::{
+    DeleteOutcome, DeleteRequest, GraphiteBranchExpectation, GraphiteEdgeExpectation,
+    GraphiteMutationOutcome, MoveRequest, RestackRequest,
+};
 use crate::adapters::github::{GitHubError, PrMatch};
 use crate::config::{ArchiveMutation, Config, ConfigMutation, MAX_STACK_NAME_CHARS, VisualSection};
 use crate::events::{Input, Key, KeyPhase};
@@ -12,7 +15,13 @@ use crate::model::topology::{
     ArchiveMode, Emphasis, OrderMode, ProjectionOptions, ProjectionScope, TopologyIndex,
     TopologyProjection,
 };
-use crate::model::{Branch, BranchId, PullRequest, PullRequestStatus, RepositorySnapshot};
+use crate::model::{Branch, BranchId, ConfiguredUpstream, PullRequestLookup, RepositorySnapshot};
+use crate::refresh::github::{
+    GithubBatch, GithubCommand, GithubOutcome, GithubRequest, GithubTarget,
+};
+use crate::refresh::graphite_health::{
+    HealthBatch, HealthCommand, HealthRequest, HealthTarget, MAX_TARGETS as MAX_HEALTH_TARGETS,
+};
 use crate::refresh::upstream::{
     MAX_TARGETS, UpstreamBatch, UpstreamCommand, UpstreamRequest, UpstreamTarget,
 };
@@ -40,6 +49,8 @@ const ORDER_OPTIONS: &[OrderMode] = &[
     OrderMode::Graphite,
 ];
 type UpstreamWorkingSet = (u64, Vec<(BranchId, Arc<str>)>);
+type HealthWorkingSet = (u64, Vec<(BranchId, Arc<str>, Arc<str>)>);
+type GithubWorkingSet = (u64, Vec<(BranchId, Arc<str>)>);
 
 fn changed_branch_candidates(
     current: &RepositorySnapshot,
@@ -59,6 +70,72 @@ fn changed_branch_candidates(
     changed.into_iter().map(|(_, branch)| branch).collect()
 }
 
+fn github_changed_candidates(
+    current: &RepositorySnapshot,
+    next: &RepositorySnapshot,
+) -> Vec<BranchId> {
+    let mut changed = next
+        .branches
+        .iter()
+        .filter(|branch| {
+            current
+                .branch(&branch.id)
+                .is_none_or(|previous| previous.oid != branch.oid)
+        })
+        .map(|branch| (branch.committed_at, branch.id.clone()))
+        .collect::<Vec<_>>();
+    changed.sort_by(|left, right| right.cmp(left));
+    changed.into_iter().map(|(_, branch)| branch).collect()
+}
+
+fn changed_health_candidates(
+    current: &RepositorySnapshot,
+    next: &RepositorySnapshot,
+) -> Vec<BranchId> {
+    next.branches
+        .iter()
+        .filter(|branch| {
+            let Some(parent_id) = branch.diff_parent.as_ref() else {
+                return false;
+            };
+            let Some(parent) = next.branch(parent_id) else {
+                return false;
+            };
+            let Some(previous) = current.branch(&branch.id) else {
+                return true;
+            };
+            previous.oid != branch.oid
+                || previous.diff_parent.as_ref() != Some(parent_id)
+                || previous
+                    .diff_parent
+                    .as_ref()
+                    .and_then(|previous_parent| current.branch(previous_parent))
+                    .is_none_or(|previous_parent| previous_parent.oid != parent.oid)
+        })
+        .map(|branch| branch.id.clone())
+        .collect()
+}
+
+fn best_pr_match(branch: &Branch, matches: &[PrMatch]) -> Option<crate::model::PullRequest> {
+    matches
+        .iter()
+        .filter(|candidate| candidate.branch == branch.id)
+        .max_by(|left, right| {
+            let lifecycle_priority = |candidate: &PrMatch| match candidate.pull_request.status {
+                crate::model::PullRequestStatus::Approved => 3,
+                crate::model::PullRequestStatus::Open => 2,
+                crate::model::PullRequestStatus::Merged => 1,
+                crate::model::PullRequestStatus::Closed => 0,
+            };
+            (left.head_oid.as_deref() == Some(branch.oid.as_ref()))
+                .cmp(&(right.head_oid.as_deref() == Some(branch.oid.as_ref())))
+                .then_with(|| lifecycle_priority(left).cmp(&lifecycle_priority(right)))
+                .then_with(|| left.updated_at.cmp(&right.updated_at))
+                .then_with(|| left.pull_request.number.cmp(&right.pull_request.number))
+        })
+        .map(|candidate| candidate.pull_request.clone())
+}
+
 mod archive;
 mod mutation;
 mod overlays;
@@ -68,9 +145,10 @@ use archive::archive_range_slice;
 use mutation::{confirmation_is_valid, deletion_refusal, stale_deletion_refusal};
 use overlays::order_option_index;
 pub use state::{
-    Action, ArchiveRange, ColorPicker, ConfigTarget, ConfigWriteRequest, DeleteConfirmation,
-    DeletionResult, GitHubState, LanePitch, MutationState, OrderPicker, Overlay,
-    ReconciliationOperation, StackNameEditor, ViewScope,
+    Action, ArchiveRange, ClipboardRequest, ClipboardScope, ColorPicker, ConfigTarget,
+    ConfigWriteRequest, DeleteConfirmation, DeletionResult, GitHubState, GraphiteActionResult,
+    LanePitch, MovePreview, MutationState, OrderPicker, Overlay, ReconciliationOperation,
+    StackNameEditor, ViewScope,
 };
 use state::{AllViewState, TransientNotice};
 
@@ -95,6 +173,7 @@ pub struct App {
     pub lane_pitch: LanePitch,
     pub scope: ViewScope,
     pub separators: bool,
+    pub status_visible: bool,
     pub detail_sidebar: bool,
     pub archive_mode: ArchiveMode,
     restore_selection: Option<BranchId>,
@@ -115,8 +194,17 @@ pub struct App {
     notice_duration: Duration,
     upstream_request_pending: bool,
     upstream_cancel_pending: bool,
+    upstream_target_offset: usize,
     last_upstream_working_set: Option<UpstreamWorkingSet>,
-    accepted_upstream_token: Option<(u64, u64)>,
+    health_request_pending: bool,
+    health_cancel_pending: bool,
+    health_demand_targets: HashSet<BranchId>,
+    health_target_offset: usize,
+    last_health_working_set: Option<HealthWorkingSet>,
+    github_request_pending: bool,
+    github_cancel_pending: bool,
+    github_demand_targets: HashSet<BranchId>,
+    last_github_working_set: Option<GithubWorkingSet>,
 }
 
 impl Default for App {
@@ -142,6 +230,7 @@ impl Default for App {
             lane_pitch: LanePitch::Auto,
             scope: ViewScope::All,
             separators: true,
+            status_visible: true,
             detail_sidebar: false,
             archive_mode: ArchiveMode::Active,
             restore_selection: None,
@@ -162,8 +251,17 @@ impl Default for App {
             notice_duration: DEFAULT_NOTICE_DURATION,
             upstream_request_pending: false,
             upstream_cancel_pending: false,
+            upstream_target_offset: 0,
             last_upstream_working_set: None,
-            accepted_upstream_token: None,
+            health_request_pending: false,
+            health_cancel_pending: false,
+            health_demand_targets: HashSet::new(),
+            health_target_offset: 0,
+            last_health_working_set: None,
+            github_request_pending: false,
+            github_cancel_pending: false,
+            github_demand_targets: HashSet::new(),
+            last_github_working_set: None,
         }
     }
 }
@@ -227,15 +325,31 @@ impl App {
         } else {
             Vec::new()
         };
+        let changed_github = if structural {
+            self.snapshot
+                .as_deref()
+                .map(|current| github_changed_candidates(current, &snapshot))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let changed_health = if structural {
+            self.snapshot
+                .as_deref()
+                .map(|current| changed_health_candidates(current, &snapshot))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         if let Some(current) = &self.snapshot {
-            let current_prs: HashMap<BranchId, PullRequest> = current
+            let current_prs: std::collections::HashMap<_, _> = current
                 .branches
                 .iter()
                 .filter_map(|branch| {
                     branch
                         .pr
                         .clone()
-                        .map(|pull_request| (branch.id.clone(), pull_request))
+                        .map(|pr| (branch.id.clone(), (branch.oid.clone(), pr)))
                 })
                 .collect();
             if !current_prs.is_empty() {
@@ -243,11 +357,38 @@ impl App {
                 let branches = Arc::make_mut(&mut snapshot.branches);
                 for branch in branches {
                     if branch.pr.is_none() {
-                        branch.pr = current_prs.get(&branch.id).cloned();
+                        branch.pr = current_prs.get(&branch.id).map(|(oid, pr)| {
+                            let mut retained = pr.clone();
+                            if oid != &branch.oid {
+                                retained.match_quality = crate::model::PullRequestMatch::StaleTip;
+                            }
+                            retained
+                        });
                     }
                 }
             }
-            if !structural && current.generation == snapshot.generation {
+            let current_lookup: HashMap<_, _> = current
+                .branches
+                .iter()
+                .filter(|branch| branch.pr_lookup != PullRequestLookup::NotRequested)
+                .map(|branch| {
+                    (
+                        (branch.id.clone(), branch.oid.clone()),
+                        branch.pr_lookup.clone(),
+                    )
+                })
+                .collect();
+            if !current_lookup.is_empty() {
+                let snapshot = Arc::make_mut(&mut snapshot);
+                for branch in Arc::make_mut(&mut snapshot.branches) {
+                    if let Some(state) =
+                        current_lookup.get(&(branch.id.clone(), branch.oid.clone()))
+                    {
+                        branch.pr_lookup = state.clone();
+                    }
+                }
+            }
+            if structural || current.generation == snapshot.generation {
                 let current_evidence: HashMap<_, _> = current
                     .branches
                     .iter()
@@ -258,12 +399,73 @@ impl App {
                         )
                     })
                     .collect();
-                let snapshot = Arc::make_mut(&mut snapshot);
-                for branch in Arc::make_mut(&mut snapshot.branches) {
-                    if let Some(evidence) =
-                        current_evidence.get(&(branch.id.clone(), branch.oid.clone()))
-                    {
-                        branch.remote_ref = evidence.clone();
+                let current_health: HashMap<_, _> = current
+                    .branches
+                    .iter()
+                    .map(|branch| {
+                        (
+                            (
+                                branch.id.clone(),
+                                branch.oid.clone(),
+                                branch.diff_parent.clone(),
+                                branch
+                                    .diff_parent
+                                    .as_ref()
+                                    .and_then(|parent| current.branch(parent))
+                                    .map(|parent| parent.oid.clone()),
+                            ),
+                            branch.graphite_health.clone(),
+                        )
+                    })
+                    .collect();
+                let current_upstreams: HashMap<_, _> = current
+                    .branches
+                    .iter()
+                    .map(|branch| {
+                        (
+                            (branch.id.clone(), branch.oid.clone()),
+                            branch.configured_upstream.clone(),
+                        )
+                    })
+                    .collect();
+                let next_oids: HashMap<_, _> = snapshot
+                    .branches
+                    .iter()
+                    .map(|branch| (branch.id.clone(), branch.oid.clone()))
+                    .collect();
+                let has_matching_branch = snapshot.branches.iter().any(|branch| {
+                    current_evidence.contains_key(&(branch.id.clone(), branch.oid.clone()))
+                });
+                if has_matching_branch {
+                    let snapshot = Arc::make_mut(&mut snapshot);
+                    for branch in Arc::make_mut(&mut snapshot.branches) {
+                        if let Some(evidence) =
+                            current_evidence.get(&(branch.id.clone(), branch.oid.clone()))
+                        {
+                            branch.remote_ref = evidence.clone();
+                        }
+                        if let Some(health) = current_health.get(&(
+                            branch.id.clone(),
+                            branch.oid.clone(),
+                            branch.diff_parent.clone(),
+                            branch
+                                .diff_parent
+                                .as_ref()
+                                .and_then(|parent| next_oids.get(parent))
+                                .cloned(),
+                        )) {
+                            branch.graphite_health = health.clone();
+                        }
+                        if structural
+                            && matches!(
+                                branch.configured_upstream,
+                                ConfiguredUpstream::Diverged { .. }
+                            )
+                            && let Some(previous @ ConfiguredUpstream::Rewritten { .. }) =
+                                current_upstreams.get(&(branch.id.clone(), branch.oid.clone()))
+                        {
+                            branch.configured_upstream = previous.clone();
+                        }
                     }
                 }
             }
@@ -330,6 +532,12 @@ impl App {
                     "repository changed; archive range preview cancelled",
                 ));
             }
+            if let Overlay::MovePreview(preview) = &self.overlay
+                && !move_preview_is_valid(&snapshot, preview)
+            {
+                self.overlay = Overlay::None;
+                self.message = Some(Arc::from("repository changed; move preview cancelled"));
+            }
             match self.mutation.clone() {
                 MutationState::ConfirmingDeletion(confirmation)
                     if !confirmation_is_valid(&snapshot, &confirmation) =>
@@ -373,7 +581,6 @@ impl App {
         self.loading = false;
         if structural {
             self.refresh_error = None;
-            self.accepted_upstream_token = None;
         }
         if structural {
             self.prune_invalid_archives(protected_deletion_target.as_ref());
@@ -403,8 +610,149 @@ impl App {
             self.apply_current_startup();
         }
         if structural {
-            self.upstream_request_pending = true;
+            if self.status_visible {
+                self.upstream_request_pending = true;
+            }
+            self.health_demand_targets.extend(changed_health);
+            self.demand_current_graphite_health();
+            if self.status_visible && !self.health_demand_targets.is_empty() {
+                self.health_request_pending = true;
+            }
+            self.github_demand_targets.extend(changed_github);
+            self.demand_current_github();
+            self.github_request_pending = self.status_visible
+                && matches!(self.archive_mode, ArchiveMode::Active)
+                && !self.github_demand_targets.is_empty();
         }
+    }
+
+    pub fn apply_graphite_health_batch(&mut self, batch: HealthBatch) {
+        let Some(snapshot) = self.snapshot.as_mut() else {
+            return;
+        };
+        if snapshot.generation != batch.generation {
+            return;
+        }
+        let applicable: Vec<_> = batch
+            .results
+            .iter()
+            .filter_map(|result| {
+                let index = snapshot.branch_index.get(&result.branch).copied()?;
+                let branch = snapshot.branches.get(index)?;
+                let parent = snapshot.branch(&result.parent)?;
+                (branch.oid == result.oid
+                    && branch.diff_parent.as_ref() == Some(&result.parent)
+                    && parent.oid == result.parent_oid)
+                    .then_some((index, result.health.clone()))
+            })
+            .collect();
+        if applicable.is_empty() {
+            return;
+        }
+        let snapshot = Arc::make_mut(snapshot);
+        let branches = Arc::make_mut(&mut snapshot.branches);
+        for (index, health) in applicable {
+            branches[index].graphite_health = health;
+        }
+    }
+
+    pub fn take_graphite_health_command(&mut self) -> Option<HealthCommand> {
+        if self.health_cancel_pending {
+            self.health_cancel_pending = false;
+            return Some(HealthCommand::Cancel);
+        }
+        if !self.status_visible {
+            return None;
+        }
+        if !self.health_request_pending {
+            return None;
+        }
+        self.health_request_pending = false;
+        let snapshot = self.snapshot.as_ref()?;
+        let mut candidates = snapshot
+            .branches
+            .iter()
+            .filter_map(|branch| {
+                if !self.health_demand_targets.contains(&branch.id) {
+                    return None;
+                }
+                let parent_id = branch.diff_parent.as_ref()?;
+                let parent = snapshot.branch(parent_id)?;
+                Some(HealthTarget {
+                    branch: branch.id.clone(),
+                    oid: branch.oid.clone(),
+                    parent: parent.id.clone(),
+                    parent_oid: parent.oid.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|target| {
+            let branch = snapshot.branch(&target.branch);
+            (
+                !self.health_demand_targets.contains(&target.branch),
+                !branch.is_some_and(|branch| branch.current),
+                branch
+                    .map(|branch| -branch.committed_at)
+                    .unwrap_or_default(),
+                target.branch.clone(),
+            )
+        });
+        let target_count = candidates.len().min(MAX_HEALTH_TARGETS);
+        let start = self
+            .health_target_offset
+            .min(candidates.len().saturating_sub(1));
+        let targets = candidates
+            .iter()
+            .cycle()
+            .skip(start)
+            .take(target_count)
+            .cloned()
+            .collect::<Vec<_>>();
+        self.health_target_offset = if candidates.is_empty() {
+            0
+        } else {
+            (start + target_count) % candidates.len()
+        };
+        let explicit_demand = !self.health_demand_targets.is_empty();
+        self.health_demand_targets.clear();
+        let working_set = (
+            snapshot.generation,
+            targets
+                .iter()
+                .map(|target| {
+                    (
+                        target.branch.clone(),
+                        target.parent_oid.clone(),
+                        target.oid.clone(),
+                    )
+                })
+                .collect(),
+        );
+        if !explicit_demand && self.last_health_working_set.as_ref() == Some(&working_set) {
+            return None;
+        }
+        let had_previous_working_set = self.last_health_working_set.is_some();
+        self.last_health_working_set = Some(working_set);
+        if targets.is_empty() {
+            return had_previous_working_set.then_some(HealthCommand::Cancel);
+        }
+        let snapshot = Arc::make_mut(self.snapshot.as_mut()?);
+        for target in &targets {
+            if let Some(index) = snapshot.branch_index.get(&target.branch).copied()
+                && let Some(branch) = Arc::make_mut(&mut snapshot.branches).get_mut(index)
+                && matches!(
+                    branch.graphite_health,
+                    crate::model::GraphiteHealth::NotRequested
+                        | crate::model::GraphiteHealth::Unavailable(_)
+                )
+            {
+                branch.graphite_health = crate::model::GraphiteHealth::Checking;
+            }
+        }
+        Some(HealthCommand::Request(HealthRequest {
+            generation: snapshot.generation,
+            targets: Arc::from(targets),
+        }))
     }
 
     pub fn apply_upstream_batch(&mut self, batch: UpstreamBatch) {
@@ -414,72 +762,65 @@ impl App {
         if snapshot.generation != batch.generation {
             return;
         }
-        let snapshot = Arc::make_mut(snapshot);
-        let branches = Arc::make_mut(&mut snapshot.branches);
         let applicable: Vec<_> = batch
             .results
             .iter()
             .filter_map(|result| {
                 let index = snapshot.branch_index.get(&result.branch).copied()?;
-                (branches.get(index)?.oid == result.oid).then_some((index, result))
+                (snapshot.branches.get(index)?.oid == result.oid).then_some((index, result))
             })
             .collect();
         if applicable.is_empty() {
             return;
         }
-        if let Some(token) = batch.remote_ref_token
-            && self.accepted_upstream_token != Some((batch.generation, token))
-        {
-            for branch in branches.iter_mut() {
-                branch.remote_ref = crate::model::RemoteRefEvidence::NotRequested;
-            }
-            self.accepted_upstream_token = Some((batch.generation, token));
-        }
+        let snapshot = Arc::make_mut(snapshot);
+        let branches = Arc::make_mut(&mut snapshot.branches);
         for (index, result) in applicable {
             branches[index].remote_ref = result.evidence.clone();
+            if let Some(configured_upstream) = &result.configured_upstream {
+                branches[index].configured_upstream = configured_upstream.clone();
+            }
         }
     }
 
     pub fn take_upstream_command(&mut self) -> Option<UpstreamCommand> {
         if self.upstream_cancel_pending {
             self.upstream_cancel_pending = false;
-            self.upstream_request_pending = false;
             return Some(UpstreamCommand::Cancel);
+        }
+        if !self.status_visible {
+            return None;
         }
         if !self.upstream_request_pending {
             return None;
         }
         self.upstream_request_pending = false;
         let snapshot = self.snapshot.as_ref()?;
-        let start = self.scroll.saturating_sub(4);
-        let end = self
-            .scroll
-            .saturating_add(self.viewport_height)
-            .saturating_add(8)
-            .min(self.projection.entries.len());
-        let mut seen = HashSet::new();
-        let mut targets = Vec::new();
-        for entry in &self.projection.entries[start..end] {
-            let crate::model::topology::ProjectionEntry::Branch(row) = entry else {
-                continue;
-            };
-            if !seen.insert(row.branch.clone()) {
-                continue;
-            }
-            let Some(index) = snapshot.branch_index.get(&row.branch).copied() else {
-                continue;
-            };
-            let Some(branch) = snapshot.branches.get(index) else {
-                continue;
-            };
-            targets.push(UpstreamTarget {
+        let candidates = snapshot
+            .branches
+            .iter()
+            .map(|branch| UpstreamTarget {
                 branch: branch.id.clone(),
                 oid: branch.oid.clone(),
-            });
-            if targets.len() == MAX_TARGETS {
-                break;
-            }
-        }
+                configured_upstream: branch.configured_upstream.clone(),
+            })
+            .collect::<Vec<_>>();
+        let target_count = candidates.len().min(MAX_TARGETS);
+        let start = self
+            .upstream_target_offset
+            .min(candidates.len().saturating_sub(1));
+        let targets = candidates
+            .iter()
+            .cycle()
+            .skip(start)
+            .take(target_count)
+            .cloned()
+            .collect::<Vec<_>>();
+        self.upstream_target_offset = if candidates.is_empty() {
+            0
+        } else {
+            (start + target_count) % candidates.len()
+        };
         let working_set = (
             snapshot.generation,
             targets
@@ -518,19 +859,185 @@ impl App {
         self.refresh_error = Some(error);
     }
 
+    pub fn take_github_command(&mut self) -> Option<GithubCommand> {
+        if self.github_cancel_pending {
+            self.github_cancel_pending = false;
+            return Some(GithubCommand::Cancel);
+        }
+        if !self.status_visible || matches!(self.archive_mode, ArchiveMode::Archive) {
+            return None;
+        }
+        if !self.github_request_pending {
+            return None;
+        }
+        self.github_request_pending = false;
+        let snapshot = self.snapshot.as_ref()?;
+        let selected = self.selected.as_ref();
+        let selected_stack =
+            selected.and_then(|selected| self.topology.as_ref()?.stack_for(selected));
+        let mut indexed = snapshot
+            .branches
+            .iter()
+            .enumerate()
+            .filter(|(_, branch)| self.github_demand_targets.contains(&branch.id))
+            .collect::<Vec<_>>();
+        indexed.sort_by_key(|(index, branch)| {
+            let priority = if branch.current {
+                0
+            } else if selected == Some(&branch.id) {
+                1
+            } else if selected_stack.is_some_and(|stack| {
+                self.topology
+                    .as_ref()
+                    .and_then(|topology| topology.stack_for(&branch.id))
+                    == Some(stack)
+            }) {
+                2
+            } else {
+                3
+            };
+            (priority, std::cmp::Reverse(branch.committed_at), *index)
+        });
+        let targets = indexed
+            .into_iter()
+            .take(crate::refresh::github::MAX_TARGETS)
+            .map(|(_, branch)| GithubTarget {
+                branch: branch.id.clone(),
+                oid: branch.oid.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.github_demand_targets.clear();
+        let working_set = (
+            snapshot.generation,
+            targets
+                .iter()
+                .map(|target| (target.branch.clone(), target.oid.clone()))
+                .collect(),
+        );
+        if self.last_github_working_set.as_ref() == Some(&working_set) {
+            return None;
+        }
+        self.last_github_working_set = Some(working_set);
+        let discovery = snapshot
+            .branches
+            .iter()
+            .map(|branch| GithubTarget {
+                branch: branch.id.clone(),
+                oid: branch.oid.clone(),
+            })
+            .collect::<Vec<_>>();
+        let snapshot = Arc::make_mut(self.snapshot.as_mut()?);
+        for target in &targets {
+            if let Some(index) = snapshot.branch_index.get(&target.branch).copied()
+                && let Some(branch) = Arc::make_mut(&mut snapshot.branches).get_mut(index)
+            {
+                branch.pr_lookup = PullRequestLookup::Checking;
+            }
+        }
+        self.github_state = GitHubState::Loading;
+        Some(GithubCommand::Request(GithubRequest {
+            generation: snapshot.generation,
+            targets: Arc::from(targets),
+            discovery: Arc::from(discovery),
+        }))
+    }
+
+    pub fn apply_github_batch(&mut self, batch: GithubBatch) {
+        let previous_error = match &self.github_state {
+            GitHubState::Unavailable(error) => Some(error.clone()),
+            _ => None,
+        };
+        let Some(snapshot) = self.snapshot.as_mut() else {
+            return;
+        };
+        if snapshot.generation != batch.generation {
+            return;
+        }
+        let mut unavailable = None;
+        let snapshot = Arc::make_mut(snapshot);
+        for result in batch.results.iter() {
+            let Some(index) = snapshot.branch_index.get(&result.branch).copied() else {
+                continue;
+            };
+            let Some(branch) = Arc::make_mut(&mut snapshot.branches).get_mut(index) else {
+                continue;
+            };
+            if branch.oid != result.oid {
+                continue;
+            }
+            match &result.outcome {
+                GithubOutcome::Ready(matches) => {
+                    if let Some(mut pull_request) = best_pr_match(branch, matches) {
+                        pull_request.match_quality =
+                            if pull_request.head_oid.as_deref() == Some(branch.oid.as_ref()) {
+                                crate::model::PullRequestMatch::ExactTip
+                            } else {
+                                crate::model::PullRequestMatch::StaleTip
+                            };
+                        branch.pr = Some(pull_request);
+                        branch.pr_lookup = PullRequestLookup::Ready;
+                    } else {
+                        branch.pr = None;
+                        branch.pr_lookup = PullRequestLookup::NoMatch;
+                    }
+                }
+                GithubOutcome::NoMatch => {
+                    branch.pr = None;
+                    branch.pr_lookup = PullRequestLookup::NoMatch;
+                }
+                GithubOutcome::Unavailable(error) => {
+                    unavailable.get_or_insert_with(|| error.clone());
+                    branch.pr_lookup = PullRequestLookup::Unavailable(Arc::from(error.to_string()));
+                }
+            }
+        }
+        let has_retained_unavailable = snapshot
+            .branches
+            .iter()
+            .any(|branch| matches!(branch.pr_lookup, PullRequestLookup::Unavailable(_)));
+        self.github_state = if let Some(error) =
+            unavailable.or_else(|| previous_error.filter(|_| has_retained_unavailable))
+        {
+            GitHubState::Unavailable(error)
+        } else if snapshot
+            .branches
+            .iter()
+            .any(|branch| branch.pr_lookup == PullRequestLookup::Checking)
+        {
+            GitHubState::Loading
+        } else {
+            GitHubState::Ready
+        };
+    }
+
     pub fn apply_prs(&mut self, matches: Vec<PrMatch>) {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return;
         };
-        let mut branches = snapshot.branches.to_vec();
-        for branch in &mut branches {
-            branch.pr = pick_best_pull_request(&matches, branch);
+        let generation = snapshot.generation;
+        let results = snapshot
+            .branches
+            .iter()
+            .filter_map(|branch| {
+                let candidates = matches
+                    .iter()
+                    .filter(|candidate| candidate.branch == branch.id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!candidates.is_empty()).then(|| crate::refresh::github::GithubResult {
+                    branch: branch.id.clone(),
+                    oid: branch.oid.clone(),
+                    outcome: GithubOutcome::Ready(Arc::from(candidates)),
+                })
+            })
+            .collect::<Vec<_>>();
+        if results.is_empty() {
+            return;
         }
-        self.snapshot = Some(Arc::new(RepositorySnapshot {
-            branches: Arc::from(branches),
-            ..(**snapshot).clone()
-        }));
-        self.github_state = GitHubState::Ready;
+        self.apply_github_batch(GithubBatch {
+            generation,
+            results: Arc::from(results),
+        });
     }
 
     pub fn mark_github_loading(&mut self) {
@@ -542,7 +1049,6 @@ impl App {
     }
 
     pub fn set_viewport_height(&mut self, height: usize) {
-        let previous = self.viewport_height;
         self.viewport_height = if self.is_focused() && height >= 2 {
             height - 1
         } else {
@@ -553,9 +1059,6 @@ impl App {
             self.focus_needs_bottom_alignment = false;
         } else {
             self.keep_selected_visible();
-        }
-        if previous != self.viewport_height {
-            self.upstream_request_pending = true;
         }
     }
 
@@ -629,7 +1132,16 @@ impl App {
             return Action::None;
         }
         let key = input.key;
-        if key == Key::Quit {
+        if matches!(key, Key::Quit | Key::Character('q')) {
+            if matches!(
+                self.mutation,
+                MutationState::Restacking(_) | MutationState::Moving(_)
+            ) {
+                self.message = Some(Arc::from(
+                    "quit deferred until the Graphite command finishes",
+                ));
+                return Action::None;
+            }
             return Action::Quit;
         }
         if matches!(self.mutation, MutationState::ConfirmingDeletion(_)) {
@@ -637,6 +1149,12 @@ impl App {
         }
         if matches!(self.mutation, MutationState::ConfirmingCheckout(_)) {
             return self.handle_checkout_confirmation(key);
+        }
+        if matches!(self.mutation, MutationState::ConfirmingRestack(_)) {
+            return self.handle_restack_confirmation(key);
+        }
+        if matches!(self.mutation, MutationState::ConfirmingMove(_)) {
+            return self.handle_move_confirmation(key);
         }
         match &self.overlay {
             Overlay::Search => return self.handle_search_key(key),
@@ -653,6 +1171,7 @@ impl App {
             Overlay::ColorPicker(_) => return self.handle_color_picker_key(key),
             Overlay::StackNameEditor(_) => unreachable!("name editor handled before global keys"),
             Overlay::ArchiveRange(_) => return self.handle_archive_range_key(key),
+            Overlay::MovePreview(_) => return self.handle_move_preview_key(key),
             Overlay::None => {}
         }
         self.handle_normal_key(key)
@@ -694,7 +1213,20 @@ impl App {
                 self.restore_selection = self.selected.clone();
                 Action::None
             }
-            Key::Character('r') => Action::Refresh,
+            Key::Character('R') => {
+                self.demand_selected_graphite_health();
+                Action::Refresh
+            }
+            Key::Character('r') => {
+                self.demand_selected_graphite_health();
+                self.begin_restack_confirmation();
+                Action::None
+            }
+            Key::Character('m') => {
+                self.demand_selected_graphite_health();
+                self.begin_move_preview();
+                Action::None
+            }
             Key::Character('t') => {
                 self.order_mode = match self.order_mode {
                     OrderMode::Recent => OrderMode::Graphite,
@@ -740,6 +1272,47 @@ impl App {
                 Action::None
             }
             Key::Character('s') => {
+                self.status_visible = !self.status_visible;
+                if self.status_visible {
+                    self.upstream_request_pending = true;
+                    self.demand_current_graphite_health();
+                    self.health_request_pending = !self.health_demand_targets.is_empty();
+                    self.last_upstream_working_set = None;
+                    self.last_health_working_set = None;
+                    self.demand_current_github();
+                    self.github_request_pending = !self.github_demand_targets.is_empty();
+                    self.last_github_working_set = None;
+                } else {
+                    self.upstream_request_pending = false;
+                    self.health_request_pending = false;
+                    self.upstream_cancel_pending = true;
+                    self.health_cancel_pending = true;
+                    self.github_request_pending = false;
+                    self.github_cancel_pending = true;
+                    self.github_demand_targets.clear();
+                    if let Some(snapshot) = self.snapshot.as_mut() {
+                        let snapshot = Arc::make_mut(snapshot);
+                        for branch in Arc::make_mut(&mut snapshot.branches) {
+                            if matches!(
+                                branch.graphite_health,
+                                crate::model::GraphiteHealth::Checking
+                            ) {
+                                branch.graphite_health = crate::model::GraphiteHealth::NotRequested;
+                            }
+                            if branch.pr_lookup == PullRequestLookup::Checking {
+                                branch.pr_lookup = PullRequestLookup::NotRequested;
+                            }
+                        }
+                    }
+                }
+                self.message = Some(Arc::from(if self.status_visible {
+                    "status columns shown"
+                } else {
+                    "status columns hidden"
+                }));
+                Action::None
+            }
+            Key::Character('S') => {
                 self.separators = !self.separators;
                 self.reproject();
                 Action::None
@@ -770,6 +1343,18 @@ impl App {
                 self.overlay = Overlay::Help;
                 Action::None
             }
+            Key::CopyBranch => self
+                .clipboard_request(ClipboardScope::Branch)
+                .map(Action::Copy)
+                .unwrap_or(Action::None),
+            Key::CopySection => self
+                .clipboard_request(ClipboardScope::Section)
+                .map(Action::Copy)
+                .unwrap_or(Action::None),
+            Key::CopyStack => self
+                .clipboard_request(ClipboardScope::Stack)
+                .map(Action::Copy)
+                .unwrap_or(Action::None),
             Key::Character('c') => self.cycle_color(),
             Key::Character('C') => {
                 self.open_color_picker();
@@ -780,18 +1365,28 @@ impl App {
                 Action::None
             }
             Key::Character('i') => self.toggle_visual_section(),
-            Key::Character('o') => self
-                .selected_url()
-                .map(Action::OpenUrl)
-                .unwrap_or(Action::None),
+            Key::Character('o') => match self.selected_url() {
+                Some(url) => Action::OpenUrl(url),
+                None => {
+                    self.demand_selected_github();
+                    Action::None
+                }
+            },
             Key::Character('O') => self
                 .stack_pr_urls()
                 .map(Action::OpenUrls)
                 .unwrap_or(Action::None),
-            Key::Character('y') => self
-                .selected_url()
-                .map(Action::CopyUrl)
-                .unwrap_or(Action::None),
+            Key::Character('y') => match self.selected_url() {
+                Some(text) => Action::Copy(ClipboardRequest {
+                    text,
+                    scope: ClipboardScope::PullRequest,
+                    branch_count: 1,
+                }),
+                None => {
+                    self.demand_selected_github();
+                    Action::None
+                }
+            },
             Key::Enter if matches!(self.mutation, MutationState::Idle) => {
                 if let Some(target) = self.selected_label.clone() {
                     self.open_name_editor_for_target(target);
@@ -816,29 +1411,16 @@ impl App {
     }
 
     pub fn cycle_color(&mut self) -> Action {
-        let Some(snapshot) = self.snapshot.as_ref() else {
+        let Some(common_dir) = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.common_dir.clone())
+        else {
             return Action::None;
         };
-        let Some(selected) = self.selected.as_ref() else {
+        let Some(target) = self.selected_color_target() else {
             return Action::None;
         };
-        let target = if let Some(target) = self.selected_label.clone() {
-            target
-        } else {
-            let Some(row) = self.projection.row_for(selected) else {
-                return Action::None;
-            };
-            if row.is_trunk {
-                self.message = Some(Arc::from("trunk rows do not have a stack color"));
-                return Action::None;
-            }
-            if self.config.visual_section(selected).is_some() {
-                ConfigTarget::VisualSection(selected.clone())
-            } else {
-                ConfigTarget::Stack(row.stack_id.clone())
-            }
-        };
-        let common_dir = snapshot.common_dir.clone();
         let current_index = COLOR_OPTIONS
             .iter()
             .position(|(_, value)| *value == self.target_color(&target))
@@ -999,24 +1581,8 @@ impl App {
     }
 
     fn open_color_picker(&mut self) {
-        let Some(selected) = self.selected.as_ref() else {
+        let Some(target) = self.selected_color_target() else {
             return;
-        };
-        let target = if let Some(target) = self.selected_label.clone() {
-            target
-        } else {
-            let Some(row) = self.projection.row_for(selected) else {
-                return;
-            };
-            if row.is_trunk {
-                self.message = Some(Arc::from("trunk rows do not have a stack color"));
-                return;
-            }
-            if self.config.visual_section(selected).is_some() {
-                ConfigTarget::VisualSection(selected.clone())
-            } else {
-                ConfigTarget::Stack(row.stack_id.clone())
-            }
         };
         let original = self.target_color(&target).map(Arc::from);
         let choice_index = COLOR_OPTIONS
@@ -1029,6 +1595,26 @@ impl App {
             original,
             choice_index,
         });
+    }
+
+    fn selected_color_target(&mut self) -> Option<ConfigTarget> {
+        if let Some(target) = self.selected_label.clone() {
+            return Some(target);
+        }
+        let row = self
+            .selected
+            .as_ref()
+            .and_then(|selected| self.projection.row_for(selected))?;
+        if row.is_trunk {
+            self.message = Some(Arc::from("trunk rows do not have a stack color"));
+            return None;
+        }
+        Some(
+            row.visual_section
+                .clone()
+                .map(ConfigTarget::VisualSection)
+                .unwrap_or_else(|| ConfigTarget::Stack(row.stack_id.clone())),
+        )
     }
 
     fn handle_color_picker_key(&mut self, key: Key) -> Action {
@@ -1121,43 +1707,22 @@ impl App {
             self.message = Some(Arc::from("trunk rows cannot be named as stacks"));
             return;
         }
-        let target = if let Some(section) = self.config.visual_section(selected) {
-            if section.name.is_some() {
-                self.message = Some(Arc::from("select the section name and press Enter to edit"));
-                return;
-            }
-            ConfigTarget::VisualSection(selected.clone())
-        } else {
-            let stack = row.stack_id.clone();
-            if self.config.stack_name(&stack).is_some() {
-                self.message = Some(Arc::from("select the stack name and press Enter to edit"));
-                return;
-            }
-            ConfigTarget::Stack(stack)
-        };
-        let draft = match &target {
-            ConfigTarget::Stack(stack) => self.config.stack_name(stack),
-            ConfigTarget::VisualSection(anchor) => self
-                .config
-                .visual_section(anchor)
-                .and_then(|section| section.name.as_deref()),
-        }
-        .unwrap_or_default()
-        .to_owned();
-        let cursor = draft.chars().count();
-        self.overlay = Overlay::StackNameEditor(StackNameEditor {
-            target: target.clone(),
-            draft,
-            cursor,
-        });
-        self.selected_label = Some(target.clone());
-        self.reproject();
+        let target = row
+            .visual_section
+            .clone()
+            .map(ConfigTarget::VisualSection)
+            .unwrap_or_else(|| ConfigTarget::Stack(row.stack_id.clone()));
+        self.begin_name_editor(target);
     }
 
     fn open_name_editor_for_target(&mut self, target: ConfigTarget) {
         if !self.config_target_is_valid(&target) {
             return;
         }
+        self.begin_name_editor(target);
+    }
+
+    fn begin_name_editor(&mut self, target: ConfigTarget) {
         let draft = match &target {
             ConfigTarget::Stack(stack) => self.config.stack_name(stack),
             ConfigTarget::VisualSection(anchor) => self
@@ -1205,6 +1770,13 @@ impl App {
                     editor.cursor -= 1;
                     editor.draft = characters.into_iter().collect();
                 }
+                self.overlay = Overlay::StackNameEditor(editor);
+                self.reproject();
+                Action::None
+            }
+            Key::ClearNameDraft => {
+                editor.draft.clear();
+                editor.cursor = 0;
                 self.overlay = Overlay::StackNameEditor(editor);
                 self.reproject();
                 Action::None
@@ -1328,6 +1900,15 @@ impl App {
             Overlay::StackNameEditor(editor) => {
                 if !self.config_target_is_valid(&editor.target) {
                     self.close_invalid_stack_name_editor();
+                }
+            }
+            Overlay::MovePreview(preview) => {
+                if self.snapshot.as_ref().is_none_or(|snapshot| {
+                    snapshot.branch(&preview.source).is_none()
+                        || snapshot.branch(&preview.target).is_none()
+                }) {
+                    self.overlay = Overlay::None;
+                    self.message = Some(Arc::from("repository changed; move preview cancelled"));
                 }
             }
             Overlay::None
@@ -1633,18 +2214,15 @@ impl App {
                     scroll: self.scroll,
                 });
                 self.archive_mode = ArchiveMode::Archive;
+                self.github_request_pending = false;
+                self.github_cancel_pending = true;
+                self.github_demand_targets.clear();
                 self.selected = None;
                 self.scroll = 0;
                 self.reproject();
-                self.upstream_request_pending = true;
-                self.upstream_cancel_pending = false;
-                self.last_upstream_working_set = None;
             }
             ArchiveMode::Archive => {
                 self.archive_mode = ArchiveMode::Active;
-                self.upstream_request_pending = true;
-                self.upstream_cancel_pending = false;
-                self.last_upstream_working_set = None;
                 self.reproject();
                 if let Some(state) = self.active_view_state.take() {
                     self.selected = state
@@ -1658,6 +2236,11 @@ impl App {
                             .saturating_sub(self.viewport_height),
                     );
                     self.keep_selected_visible();
+                }
+                if self.status_visible {
+                    self.demand_current_github();
+                    self.github_request_pending = !self.github_demand_targets.is_empty();
+                    self.last_github_working_set = None;
                 }
             }
         }
@@ -1705,7 +2288,6 @@ impl App {
         }));
         self.selected = selection_after;
         self.reproject();
-        self.upstream_request_pending = true;
         Action::PersistConfig(self.register_config_mutation(mutation, common_dir))
     }
 
@@ -1837,9 +2419,6 @@ impl App {
             range.branch_count()
         )));
         self.reproject();
-        if matches!(self.archive_mode, ArchiveMode::Archive) {
-            self.upstream_request_pending = true;
-        }
         Action::PersistConfig(self.register_config_mutation(mutation, common_dir))
     }
 
@@ -1892,7 +2471,12 @@ impl App {
             | MutationState::ConfirmingCheckout(_)
             | MutationState::CheckingOut(_)
             | MutationState::Reconciling { .. }
-            | MutationState::DeletionBlocked(_) => None,
+            | MutationState::DeletionBlocked(_)
+            | MutationState::ConfirmingRestack(_)
+            | MutationState::Restacking(_)
+            | MutationState::ConfirmingMove(_)
+            | MutationState::Moving(_)
+            | MutationState::GraphiteBlocked(_) => None,
         }
     }
 
@@ -2088,26 +2672,544 @@ impl App {
         if matches!(self.archive_mode, ArchiveMode::Archive) || self.selected_label.is_some() {
             return None;
         }
-        let (selected, snapshot, topology) = match (&self.selected, &self.snapshot, &self.topology)
-        {
-            (Some(selected), Some(snapshot), Some(topology)) => (selected, snapshot, topology),
-            _ => return None,
-        };
-        let stack_branches = topology.stack_branches(selected)?;
+        let selected = self.selected.as_ref()?;
+        let snapshot = self.snapshot.as_ref()?;
+        let topology = self.topology.as_ref()?;
+        let branches = topology.stack_branches_for(selected)?;
         let mut urls = Vec::new();
         let mut seen = HashSet::new();
-        for branch_id in stack_branches {
-            let Some(pull_request) = snapshot
+        for branch_id in branches {
+            let Some(url) = snapshot
                 .branch(branch_id)
                 .and_then(|branch| branch.pr.as_ref())
+                .map(|pr| Arc::clone(&pr.url))
             else {
                 continue;
             };
-            if seen.insert(Arc::clone(&pull_request.url)) {
-                urls.push(Arc::clone(&pull_request.url));
+            if seen.insert(Arc::clone(&url)) {
+                urls.push(url);
             }
         }
-        if urls.is_empty() { None } else { Some(urls) }
+        (!urls.is_empty()).then_some(urls)
+    }
+
+    fn clipboard_request(&self, scope: ClipboardScope) -> Option<ClipboardRequest> {
+        let target = if let Some(label) = &self.selected_label {
+            label.branch()
+        } else {
+            let selected = self.selected.as_ref()?;
+            self.projection
+                .navigation
+                .iter()
+                .any(|target| {
+                    matches!(
+                        target,
+                        crate::model::topology::SelectionTarget::Branch(branch)
+                            if branch == selected
+                    )
+                })
+                .then_some(selected)?
+        };
+
+        let branches = match scope {
+            ClipboardScope::PullRequest => return None,
+            ClipboardScope::Branch => vec![target.clone()],
+            ClipboardScope::Stack => self.topology.as_ref()?.stack_branches_for(target)?.to_vec(),
+            ClipboardScope::Section => {
+                let group = self.topology.as_ref()?.stack_branches_for(target)?;
+                let anchor = match &self.selected_label {
+                    Some(ConfigTarget::VisualSection(anchor)) => anchor,
+                    Some(ConfigTarget::Stack(_)) => group.first()?,
+                    None => group[..=group.iter().position(|branch| branch == target)?]
+                        .iter()
+                        .rev()
+                        .find(|branch| self.config.visual_section(branch).is_some())
+                        .unwrap_or(group.first()?),
+                };
+                let start = group.iter().position(|branch| branch == anchor)?;
+                group[start..].to_vec()
+            }
+        };
+        let text = branches
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(ClipboardRequest {
+            text: Arc::from(text),
+            scope,
+            branch_count: branches.len(),
+        })
+    }
+
+    fn demand_selected_graphite_health(&mut self) {
+        if !self.status_visible {
+            return;
+        }
+        let Some(selected) = self.selected.as_ref() else {
+            return;
+        };
+        let Some(stack) = self
+            .topology
+            .as_ref()
+            .and_then(|topology| topology.stack_for(selected))
+            .cloned()
+        else {
+            return;
+        };
+        self.health_demand_targets.extend(
+            self.snapshot
+                .as_ref()
+                .into_iter()
+                .flat_map(|snapshot| snapshot.branches.iter())
+                .filter(|branch| {
+                    branch.diff_parent.is_some()
+                        && self
+                            .topology
+                            .as_ref()
+                            .and_then(|topology| topology.stack_for(&branch.id))
+                            == Some(&stack)
+                })
+                .map(|branch| branch.id.clone()),
+        );
+        self.health_request_pending = !self.health_demand_targets.is_empty();
+    }
+
+    fn demand_selected_github(&mut self) {
+        if !self.status_visible || matches!(self.archive_mode, ArchiveMode::Archive) {
+            self.message = Some(Arc::from("show status before checking pull requests"));
+            return;
+        }
+        let Some(selected) = self.selected.clone() else {
+            return;
+        };
+        self.github_demand_targets.insert(selected);
+        self.github_request_pending = true;
+        self.last_github_working_set = None;
+        self.message = Some(Arc::from("checking selected branch for a pull request"));
+    }
+
+    fn demand_current_github(&mut self) {
+        let Some(current) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.branches.iter().find(|branch| branch.current))
+            .map(|branch| branch.id.clone())
+        else {
+            return;
+        };
+        self.github_demand_targets.insert(current.clone());
+        let Some(stack) = self
+            .topology
+            .as_ref()
+            .and_then(|topology| topology.stack_for(&current))
+            .cloned()
+        else {
+            return;
+        };
+        self.github_demand_targets.extend(
+            self.snapshot
+                .as_ref()
+                .into_iter()
+                .flat_map(|snapshot| snapshot.branches.iter())
+                .filter(|branch| {
+                    self.topology
+                        .as_ref()
+                        .and_then(|topology| topology.stack_for(&branch.id))
+                        == Some(&stack)
+                })
+                .map(|branch| branch.id.clone()),
+        );
+    }
+
+    fn demand_current_graphite_health(&mut self) {
+        let Some(current) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.branches.iter().find(|branch| branch.current))
+            .map(|branch| branch.id.clone())
+        else {
+            return;
+        };
+        let Some(stack) = self
+            .topology
+            .as_ref()
+            .and_then(|topology| topology.stack_for(&current))
+        else {
+            return;
+        };
+        self.health_demand_targets.extend(
+            self.snapshot
+                .as_ref()
+                .into_iter()
+                .flat_map(|snapshot| snapshot.branches.iter())
+                .filter(|branch| {
+                    self.topology
+                        .as_ref()
+                        .and_then(|topology| topology.stack_for(&branch.id))
+                        == Some(stack)
+                        && matches!(
+                            branch.graphite_health,
+                            crate::model::GraphiteHealth::NotRequested
+                        )
+                })
+                .map(|branch| branch.id.clone()),
+        );
+    }
+
+    fn graphite_descendants(&self, source: &BranchId) -> Vec<BranchId> {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return Vec::new();
+        };
+        let mut descendants = Vec::new();
+        let mut pending = vec![source.clone()];
+        while let Some(parent) = pending.pop() {
+            let mut children: Vec<_> = snapshot
+                .branches
+                .iter()
+                .filter(|branch| branch.diff_parent.as_ref() == Some(&parent))
+                .map(|branch| branch.id.clone())
+                .collect();
+            children.sort();
+            for child in children.into_iter().rev() {
+                descendants.push(child.clone());
+                pending.push(child);
+            }
+        }
+        descendants
+    }
+
+    fn graphite_expectation(&self, branch: &BranchId) -> Option<GraphiteBranchExpectation> {
+        self.snapshot
+            .as_ref()?
+            .branch(branch)
+            .map(|branch| GraphiteBranchExpectation {
+                branch: branch.id.clone(),
+                oid: branch.oid.clone(),
+            })
+    }
+
+    fn graphite_edge_expectations<'a>(
+        &self,
+        branches: impl IntoIterator<Item = &'a BranchId>,
+    ) -> Arc<[GraphiteEdgeExpectation]> {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return Arc::from([]);
+        };
+        Arc::from(
+            branches
+                .into_iter()
+                .filter_map(|id| {
+                    snapshot.branch(id).map(|branch| GraphiteEdgeExpectation {
+                        branch: id.clone(),
+                        parent: branch.diff_parent.clone(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn graphite_action_refusal(&self, branch: &Branch) -> Option<String> {
+        let snapshot = self.snapshot.as_ref()?;
+        if self.refresh_error.is_some() {
+            return Some("repository data is stale; press R to refresh".into());
+        }
+        if !matches!(snapshot.state, crate::model::RepositoryState::Ready) {
+            return Some(format!(
+                "Graphite action disabled while repository is {:?}",
+                snapshot.state
+            ));
+        }
+        if snapshot
+            .branches
+            .iter()
+            .any(|candidate| candidate.current && candidate.dirty)
+        {
+            return Some("Graphite action requires a clean current worktree".into());
+        }
+        if snapshot.configured_trunks.contains(&branch.id) {
+            return Some("configured trunks cannot be moved or restacked".into());
+        }
+        if branch.graphite != crate::model::GraphiteProvenance::Tracked {
+            return Some("Graphite action requires a tracked branch".into());
+        }
+        if branch.id.0.starts_with('-') {
+            return Some("option-shaped branch names cannot be mutated safely".into());
+        }
+        None
+    }
+
+    fn begin_restack_confirmation(&mut self) {
+        if self.selected_label.is_some() || !matches!(self.mutation, MutationState::Idle) {
+            return;
+        }
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        let Some(branch) = self.selected_branch() else {
+            return;
+        };
+        if let Some(reason) = self.graphite_action_refusal(branch) {
+            self.message = Some(Arc::from(reason));
+            return;
+        }
+        let recorded_parent = match &branch.graphite_health {
+            crate::model::GraphiteHealth::NeedsRestack { recorded_parent } => recorded_parent,
+            crate::model::GraphiteHealth::NotRequested
+            | crate::model::GraphiteHealth::Checking
+            | crate::model::GraphiteHealth::Unavailable(_)
+                if self.status_visible =>
+            {
+                self.message = Some(Arc::from(
+                    "checking Graphite ancestry; press r again when ready",
+                ));
+                return;
+            }
+            _ => {
+                self.message = Some(Arc::from("selected branch does not need restacking"));
+                return;
+            }
+        };
+        let source = GraphiteBranchExpectation {
+            branch: branch.id.clone(),
+            oid: branch.oid.clone(),
+        };
+        let affected: Vec<_> = std::iter::once(branch.id.clone())
+            .chain(self.graphite_descendants(&branch.id))
+            .filter_map(|id| self.graphite_expectation(&id))
+            .collect();
+        let topology =
+            self.graphite_edge_expectations(affected.iter().map(|expectation| &expectation.branch));
+        self.mutation = MutationState::ConfirmingRestack(RestackRequest {
+            repository_id: snapshot.repository_id.clone(),
+            source,
+            expected_parent: recorded_parent.clone(),
+            affected: Arc::from(affected),
+            topology,
+        });
+    }
+
+    fn handle_restack_confirmation(&mut self, key: Key) -> Action {
+        let MutationState::ConfirmingRestack(request) = &self.mutation else {
+            return Action::None;
+        };
+        let request = request.clone();
+        match key {
+            Key::Enter => {
+                self.mutation = MutationState::Restacking(request.clone());
+                Action::Restack(request)
+            }
+            Key::Escape => {
+                self.mutation = MutationState::Idle;
+                self.message = Some(Arc::from("restack cancelled"));
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    fn valid_move_targets(&self, preview: &MovePreview) -> Vec<BranchId> {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return Vec::new();
+        };
+        let Some(source_trunk) = snapshot
+            .branch(&preview.source)
+            .and_then(|branch| branch.trunk.as_ref())
+        else {
+            return Vec::new();
+        };
+        snapshot
+            .branches
+            .iter()
+            .filter(|branch| {
+                branch.id != preview.source
+                    && !preview.affected.contains(&branch.id)
+                    && branch.graphite == crate::model::GraphiteProvenance::Tracked
+                    && !snapshot.configured_trunks.contains(&branch.id)
+                    && branch.trunk.as_ref() == Some(source_trunk)
+            })
+            .map(|branch| branch.id.clone())
+            .collect()
+    }
+
+    fn begin_move_preview(&mut self) {
+        if self.selected_label.is_some() || !matches!(self.mutation, MutationState::Idle) {
+            return;
+        }
+        let Some(branch) = self.selected_branch() else {
+            return;
+        };
+        if let Some(reason) = self.graphite_action_refusal(branch) {
+            self.message = Some(Arc::from(reason));
+            return;
+        }
+        let source = branch.id.clone();
+        let affected: Arc<[BranchId]> = Arc::from(self.graphite_descendants(&source));
+        let affected_expectations: Arc<[GraphiteBranchExpectation]> = Arc::from(
+            std::iter::once(source.clone())
+                .chain(affected.iter().cloned())
+                .filter_map(|id| self.graphite_expectation(&id))
+                .collect::<Vec<_>>(),
+        );
+        let source_expectation = self
+            .graphite_expectation(&source)
+            .expect("selected branch exists");
+        let original_parent = branch.diff_parent.clone();
+        let topology =
+            self.graphite_edge_expectations(std::iter::once(&source).chain(affected.iter()));
+        let seed = MovePreview {
+            source: source.clone(),
+            target: source,
+            only: false,
+            affected,
+            affected_expectations,
+            source_expectation: source_expectation.clone(),
+            target_expectation: source_expectation,
+            original_parent,
+            topology,
+        };
+        let Some(target) = self.valid_move_targets(&seed).into_iter().next() else {
+            self.message = Some(Arc::from("no valid Graphite move target is available"));
+            return;
+        };
+        let Some(target_expectation) = self.graphite_expectation(&target) else {
+            return;
+        };
+        self.overlay = Overlay::MovePreview(MovePreview {
+            target,
+            target_expectation,
+            ..seed
+        });
+        self.reproject();
+    }
+
+    fn handle_move_preview_key(&mut self, key: Key) -> Action {
+        let Overlay::MovePreview(mut preview) = self.overlay.clone() else {
+            return Action::None;
+        };
+        match key {
+            Key::Up | Key::Down | Key::Character('j') | Key::Character('k') => {
+                let targets = self.valid_move_targets(&preview);
+                if let Some(index) = targets.iter().position(|target| target == &preview.target) {
+                    let delta = if matches!(key, Key::Up | Key::Character('k')) {
+                        -1
+                    } else {
+                        1
+                    };
+                    let next = index
+                        .saturating_add_signed(delta)
+                        .min(targets.len().saturating_sub(1));
+                    preview.target = targets[next].clone();
+                    if let Some(expectation) = self.graphite_expectation(&preview.target) {
+                        preview.target_expectation = expectation;
+                    }
+                }
+                self.overlay = Overlay::MovePreview(preview);
+                self.reproject();
+            }
+            Key::Tab => {
+                preview.only = !preview.only;
+                self.overlay = Overlay::MovePreview(preview);
+                self.reproject();
+            }
+            Key::Enter => {
+                let Some(snapshot) = self.snapshot.as_ref() else {
+                    return Action::None;
+                };
+                if self.graphite_expectation(&preview.source).as_ref()
+                    != Some(&preview.source_expectation)
+                    || self.graphite_expectation(&preview.target).as_ref()
+                        != Some(&preview.target_expectation)
+                    || snapshot
+                        .branch(&preview.source)
+                        .and_then(|branch| branch.diff_parent.clone())
+                        != preview.original_parent
+                {
+                    self.overlay = Overlay::None;
+                    self.message = Some(Arc::from("repository changed; move preview cancelled"));
+                    self.reproject();
+                    return Action::None;
+                }
+                let affected_ids: Vec<_> = if preview.only {
+                    std::iter::once(preview.source.clone())
+                        .chain(
+                            preview
+                                .topology
+                                .iter()
+                                .filter(|edge| edge.parent.as_ref() == Some(&preview.source))
+                                .map(|edge| edge.branch.clone()),
+                        )
+                        .collect()
+                } else {
+                    std::iter::once(preview.source.clone())
+                        .chain(preview.affected.iter().cloned())
+                        .collect()
+                };
+                let affected: Vec<_> = preview
+                    .affected_expectations
+                    .iter()
+                    .filter(|expectation| affected_ids.contains(&expectation.branch))
+                    .cloned()
+                    .collect();
+                self.overlay = Overlay::None;
+                self.mutation = MutationState::ConfirmingMove(MoveRequest {
+                    repository_id: snapshot.repository_id.clone(),
+                    source: preview.source_expectation,
+                    target: preview.target_expectation,
+                    expected_parent: preview.original_parent,
+                    affected: Arc::from(affected),
+                    topology: preview.topology,
+                    only: preview.only,
+                });
+                self.reproject();
+            }
+            Key::Escape => {
+                self.overlay = Overlay::None;
+                self.message = Some(Arc::from("move preview cancelled"));
+                self.reproject();
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    fn handle_move_confirmation(&mut self, key: Key) -> Action {
+        let MutationState::ConfirmingMove(request) = &self.mutation else {
+            return Action::None;
+        };
+        let request = request.clone();
+        match key {
+            Key::Enter => {
+                self.mutation = MutationState::Moving(request.clone());
+                Action::Move(request)
+            }
+            Key::Escape => {
+                let affected: Arc<[BranchId]> = Arc::from(
+                    request
+                        .affected
+                        .iter()
+                        .filter(|item| item.branch != request.source.branch)
+                        .map(|item| item.branch.clone())
+                        .collect::<Vec<_>>(),
+                );
+                self.overlay = Overlay::MovePreview(MovePreview {
+                    source: request.source.branch.clone(),
+                    target: request.target.branch.clone(),
+                    only: request.only,
+                    affected,
+                    affected_expectations: request.affected.clone(),
+                    source_expectation: request.source.clone(),
+                    target_expectation: request.target.clone(),
+                    original_parent: request.expected_parent.clone(),
+                    topology: request.topology.clone(),
+                });
+                self.mutation = MutationState::Idle;
+                self.message = Some(Arc::from("returned to move preview"));
+                self.reproject();
+                Action::None
+            }
+            _ => Action::None,
+        }
     }
 
     pub fn begin_delete_confirmation(&mut self) {
@@ -2234,6 +3336,52 @@ impl App {
         }
     }
 
+    pub fn finish_graphite_action(
+        &mut self,
+        result: anyhow::Result<GraphiteMutationOutcome>,
+        request_epoch: u64,
+        now: Instant,
+    ) {
+        let operation = match &self.mutation {
+            MutationState::Restacking(request) => ReconciliationOperation::Restack {
+                request: request.clone(),
+                result: match result {
+                    Ok(GraphiteMutationOutcome::Inconsistent) => {
+                        let message: Arc<str> = Arc::from(
+                            "Graphite restack left inconsistent state; inspect Git/Graphite",
+                        );
+                        self.message = Some(message.clone());
+                        self.mutation = MutationState::GraphiteBlocked(message);
+                        return;
+                    }
+                    Ok(outcome) => GraphiteActionResult::Outcome(outcome),
+                    Err(error) => GraphiteActionResult::Error(Arc::from(error.to_string())),
+                },
+            },
+            MutationState::Moving(request) => ReconciliationOperation::Move {
+                request: request.clone(),
+                result: match result {
+                    Ok(GraphiteMutationOutcome::Inconsistent) => {
+                        let message: Arc<str> = Arc::from(
+                            "Graphite move left inconsistent state; inspect Git/Graphite",
+                        );
+                        self.message = Some(message.clone());
+                        self.mutation = MutationState::GraphiteBlocked(message);
+                        return;
+                    }
+                    Ok(outcome) => GraphiteActionResult::Outcome(outcome),
+                    Err(error) => GraphiteActionResult::Error(Arc::from(error.to_string())),
+                },
+            },
+            _ => return,
+        };
+        self.mutation = MutationState::Reconciling {
+            operation,
+            request_epoch,
+            deadline: now + self.reconciliation_timeout,
+        };
+    }
+
     pub fn mutation_progress(&self) -> Option<String> {
         match &self.mutation {
             MutationState::ConfirmingCheckout(target) => {
@@ -2243,6 +3391,13 @@ impl App {
             MutationState::Deleting(confirmation) => {
                 Some(format!("deleting {} locally…", confirmation.request.branch))
             }
+            MutationState::Restacking(request) => {
+                Some(format!("restacking {}…", request.source.branch))
+            }
+            MutationState::Moving(request) => Some(format!(
+                "moving {} onto {}…",
+                request.source.branch, request.target.branch
+            )),
             MutationState::Reconciling { operation, .. } => Some(match operation {
                 ReconciliationOperation::Checkout { target, .. } => {
                     format!("verifying checkout of {target}…")
@@ -2250,9 +3405,19 @@ impl App {
                 ReconciliationOperation::Deletion { request, .. } => {
                     format!("verifying deletion of {}…", request.branch)
                 }
+                ReconciliationOperation::Restack { request, .. } => {
+                    format!("verifying restack of {}…", request.source.branch)
+                }
+                ReconciliationOperation::Move { request, .. } => {
+                    format!("verifying move of {}…", request.source.branch)
+                }
             }),
             MutationState::DeletionBlocked(message) => Some(format!("DELETION BLOCKED: {message}")),
-            MutationState::Idle | MutationState::ConfirmingDeletion(_) => None,
+            MutationState::GraphiteBlocked(message) => Some(format!("GRAPHITE BLOCKED: {message}")),
+            MutationState::Idle
+            | MutationState::ConfirmingDeletion(_)
+            | MutationState::ConfirmingRestack(_)
+            | MutationState::ConfirmingMove(_) => None,
         }
     }
 
@@ -2283,7 +3448,7 @@ impl App {
             self.mutation = MutationState::Idle;
             self.set_notice(
                 Arc::from(format!(
-                    "could not verify {} for {target}; press r to refresh",
+                    "could not verify {} for {target}; press R to refresh",
                     operation.description()
                 )),
                 now,
@@ -2316,20 +3481,17 @@ impl App {
                 snapshot.state
             ));
         }
-        if branch
-            .worktree
-            .as_ref()
-            .is_some_and(|path| path != &snapshot.root)
-        {
-            return Some(format!("{} is checked out in another worktree", branch.id));
-        }
         None
     }
 
     fn reproject(&mut self) {
         if self.snapshot.is_some() && self.topology.is_some() {
             self.validate_scope();
-            let Some(topology) = self.topology.as_ref() else {
+            let preview_topology = match &self.overlay {
+                Overlay::MovePreview(preview) => self.move_preview_topology(preview),
+                _ => None,
+            };
+            let Some(topology) = preview_topology.as_ref().or(self.topology.as_ref()) else {
                 return;
             };
             let scope = self.resolved_scope();
@@ -2420,10 +3582,45 @@ impl App {
                     );
                 }
             }
-            if matches!(self.archive_mode, ArchiveMode::Archive) {
-                self.upstream_request_pending = true;
+        }
+    }
+
+    fn move_preview_topology(&self, preview: &MovePreview) -> Option<TopologyIndex> {
+        let snapshot = self.snapshot.as_ref()?;
+        let target_trunk = snapshot.branch(&preview.target)?.trunk.clone();
+        let original_parent = snapshot
+            .branch(&preview.source)
+            .and_then(|branch| branch.diff_parent.clone());
+        let mut preview_snapshot = (**snapshot).clone();
+        let branches = Arc::make_mut(&mut preview_snapshot.branches);
+        for branch in branches.iter_mut() {
+            if branch.id == preview.source {
+                branch.parent = (!snapshot.configured_trunks.contains(&preview.target))
+                    .then(|| preview.target.clone());
+                branch.diff_parent = Some(preview.target.clone());
+                branch.trunk = target_trunk.clone().or_else(|| {
+                    snapshot
+                        .configured_trunks
+                        .contains(&preview.target)
+                        .then(|| preview.target.clone())
+                });
+                branch.stack_root = preview.source.clone();
+            } else if preview.only && branch.diff_parent.as_ref() == Some(&preview.source) {
+                branch.diff_parent = original_parent.clone();
+                branch.parent = original_parent.clone().and_then(|parent| {
+                    (!snapshot.configured_trunks.contains(&parent)).then_some(parent)
+                });
+            } else if !preview.only && preview.affected.contains(&branch.id) {
+                branch.trunk = target_trunk.clone().or_else(|| {
+                    snapshot
+                        .configured_trunks
+                        .contains(&preview.target)
+                        .then(|| preview.target.clone())
+                });
             }
         }
+        preview_snapshot.branch_index = RepositorySnapshot::index_branches(branches);
+        Some(TopologyIndex::build(&preview_snapshot))
     }
 
     fn validate_scope(&mut self) {
@@ -2909,11 +4106,7 @@ impl App {
     }
 
     fn keep_selected_visible(&mut self) {
-        let previous_scroll = self.scroll;
         self.keep_selected_visible_inner();
-        if self.scroll != previous_scroll {
-            self.upstream_request_pending = true;
-        }
     }
 
     fn keep_selected_visible_inner(&mut self) {
@@ -2995,6 +4188,8 @@ impl ReconciliationOperation {
         match self {
             Self::Checkout { target, .. } => target,
             Self::Deletion { request, .. } => &request.branch,
+            Self::Restack { request, .. } => &request.source.branch,
+            Self::Move { request, .. } => &request.source.branch,
         }
     }
 
@@ -3002,8 +4197,33 @@ impl ReconciliationOperation {
         match self {
             Self::Checkout { .. } => "checkout",
             Self::Deletion { .. } => "deletion",
+            Self::Restack { .. } => "restack",
+            Self::Move { .. } => "move",
         }
     }
+}
+
+fn move_preview_is_valid(snapshot: &RepositorySnapshot, preview: &MovePreview) -> bool {
+    let matches_expectation = |expected: &GraphiteBranchExpectation| {
+        snapshot
+            .branch(&expected.branch)
+            .is_some_and(|branch| branch.oid == expected.oid)
+    };
+    matches_expectation(&preview.source_expectation)
+        && matches_expectation(&preview.target_expectation)
+        && preview
+            .affected_expectations
+            .iter()
+            .all(matches_expectation)
+        && snapshot
+            .branch(&preview.source)
+            .and_then(|branch| branch.diff_parent.clone())
+            == preview.original_parent
+        && preview.topology.iter().all(|edge| {
+            snapshot
+                .branch(&edge.branch)
+                .is_some_and(|branch| branch.diff_parent == edge.parent)
+        })
 }
 
 fn reconciliation_notice(
@@ -3033,11 +4253,11 @@ fn reconciliation_notice(
                 });
             if let Some(error) = command_error {
                 Arc::from(format!(
-                    "checkout of {target} failed ({error}); repository is on {repository_position}; press r to refresh"
+                    "checkout of {target} failed ({error}); repository is on {repository_position}; press R to refresh"
                 ))
             } else {
                 Arc::from(format!(
-                    "checkout of {target} was not confirmed; repository is on {repository_position}; press r to refresh"
+                    "checkout of {target} was not confirmed; repository is on {repository_position}; press R to refresh"
                 ))
             }
         }
@@ -3056,7 +4276,7 @@ fn reconciliation_notice(
                     Arc::from(format!("deleted {} locally", request.branch))
                 }
                 (DeletionResult::Outcome(DeleteOutcome::Deleted), Some(_)) => Arc::from(format!(
-                    "deletion of {} was not confirmed; branch still exists; press r to refresh",
+                    "deletion of {} was not confirmed; branch still exists; press R to refresh",
                     request.branch
                 )),
                 (DeletionResult::Outcome(DeleteOutcome::Unchanged), Some(_)) => {
@@ -3070,7 +4290,7 @@ fn reconciliation_notice(
                     "deletion result is inconsistent; inspect Git/Graphite before retrying",
                 ),
                 (DeletionResult::Error(error), Some(_)) => Arc::from(format!(
-                    "deletion of {} failed ({error}); press r to refresh",
+                    "deletion of {} failed ({error}); press R to refresh",
                     request.branch
                 )),
                 (DeletionResult::Error(error), None) => Arc::from(format!(
@@ -3079,29 +4299,36 @@ fn reconciliation_notice(
                 )),
             }
         }
-    }
-}
-
-fn pick_best_pull_request(matches: &[PrMatch], branch: &Branch) -> Option<PullRequest> {
-    matches
-        .iter()
-        .filter(|candidate| candidate.branch == branch.id)
-        .max_by_key(|candidate| pull_request_match_score(candidate, &branch.oid))
-        .map(|matched| matched.pull_request.clone())
-}
-
-fn pull_request_match_score(pr_match: &PrMatch, branch_oid: &str) -> (u8, bool, u64) {
-    (
-        pull_request_status_rank(pr_match.pull_request.status),
-        pr_match.oid.as_ref() == branch_oid,
-        pr_match.pull_request.number,
-    )
-}
-
-fn pull_request_status_rank(status: PullRequestStatus) -> u8 {
-    match status {
-        PullRequestStatus::Open | PullRequestStatus::Approved => 2,
-        PullRequestStatus::Closed => 1,
-        PullRequestStatus::Merged => 0,
+        ReconciliationOperation::Restack { request, result } => match result {
+            GraphiteActionResult::Outcome(GraphiteMutationOutcome::Applied) => {
+                Arc::from(format!("restacked {}", request.source.branch))
+            }
+            GraphiteActionResult::Outcome(GraphiteMutationOutcome::Unchanged) => {
+                Arc::from(format!("{} was not restacked", request.source.branch))
+            }
+            GraphiteActionResult::Outcome(GraphiteMutationOutcome::Inconsistent) => {
+                Arc::from("restack result is inconsistent; inspect Git/Graphite before retrying")
+            }
+            GraphiteActionResult::Error(error) => Arc::from(format!(
+                "restack of {} failed ({error}); press R to refresh",
+                request.source.branch
+            )),
+        },
+        ReconciliationOperation::Move { request, result } => match result {
+            GraphiteActionResult::Outcome(GraphiteMutationOutcome::Applied) => Arc::from(format!(
+                "moved {} onto {}",
+                request.source.branch, request.target.branch
+            )),
+            GraphiteActionResult::Outcome(GraphiteMutationOutcome::Unchanged) => {
+                Arc::from(format!("{} was not moved", request.source.branch))
+            }
+            GraphiteActionResult::Outcome(GraphiteMutationOutcome::Inconsistent) => {
+                Arc::from("move result is inconsistent; inspect Git/Graphite before retrying")
+            }
+            GraphiteActionResult::Error(error) => Arc::from(format!(
+                "move of {} failed ({error}); press R to refresh",
+                request.source.branch
+            )),
+        },
     }
 }

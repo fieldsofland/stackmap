@@ -11,6 +11,7 @@ use super::GitAdapter;
 use crate::model::{BranchId, GraphiteProvenance};
 
 pub(super) type DeleteContractCache = Arc<Mutex<Option<Result<(), Arc<str>>>>>;
+pub(super) type GraphiteContractCache = Arc<Mutex<Option<Result<(), Arc<str>>>>>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeleteRequest {
@@ -22,6 +23,45 @@ pub struct DeleteRequest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeleteOutcome {
     Deleted,
+    Unchanged,
+    Inconsistent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphiteBranchExpectation {
+    pub branch: BranchId,
+    pub oid: Arc<str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GraphiteEdgeExpectation {
+    pub branch: BranchId,
+    pub parent: Option<BranchId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestackRequest {
+    pub repository_id: Arc<str>,
+    pub source: GraphiteBranchExpectation,
+    pub expected_parent: BranchId,
+    pub affected: Arc<[GraphiteBranchExpectation]>,
+    pub topology: Arc<[GraphiteEdgeExpectation]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MoveRequest {
+    pub repository_id: Arc<str>,
+    pub source: GraphiteBranchExpectation,
+    pub target: GraphiteBranchExpectation,
+    pub expected_parent: Option<BranchId>,
+    pub affected: Arc<[GraphiteBranchExpectation]>,
+    pub topology: Arc<[GraphiteEdgeExpectation]>,
+    pub only: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphiteMutationOutcome {
+    Applied,
     Unchanged,
     Inconsistent,
 }

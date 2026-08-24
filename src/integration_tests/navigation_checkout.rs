@@ -25,6 +25,7 @@ fn tracked(
     let mut branch = common::branch(name, parent, root, current);
     branch.trunk = Some(BranchId::new(trunk));
     branch.graphite = crate::model::GraphiteProvenance::Tracked;
+    branch.graphite_health = crate::model::GraphiteHealth::Healthy;
     branch.committed_at = committed_at;
     branch
 }
@@ -94,9 +95,43 @@ fn view_modes_toggle_without_losing_selection() {
 
     let with_separators = app.projection.entries.len();
     app.handle_key(Key::Character('s'));
+    assert!(!app.status_visible);
+    assert!(app.separators);
+    assert_eq!(app.projection.entries.len(), with_separators);
+    app.handle_key(Key::Character('S'));
     assert!(!app.separators);
     assert!(app.projection.entries.len() < with_separators);
     assert_eq!(app.selected, Some(BranchId::new("alpha-tip")));
+}
+
+#[test]
+fn hidden_status_retains_pr_open_and_copy_actions() {
+    let mut branch = common::branch("feature", None, "feature", false);
+    branch.pr = Some(crate::model::PullRequest {
+        number: 42,
+        title: Arc::from("Feature"),
+        url: Arc::from("https://example.invalid/42"),
+        status: crate::model::PullRequestStatus::Open,
+        head_oid: Some(branch.oid.clone()),
+        match_quality: crate::model::PullRequestMatch::ExactTip,
+    });
+    let mut app = App::default();
+    app.apply_snapshot(common::snapshot(vec![branch]));
+    app.handle_key(Key::Character('s'));
+
+    assert_eq!(
+        app.handle_key(Key::Character('o')),
+        Action::OpenUrl(Arc::from("https://example.invalid/42"))
+    );
+    app.platform_running = false;
+    assert_eq!(
+        app.handle_key(Key::Character('y')),
+        Action::Copy(crate::app::ClipboardRequest {
+            text: Arc::from("https://example.invalid/42"),
+            scope: crate::app::ClipboardScope::PullRequest,
+            branch_count: 1,
+        })
+    );
 }
 
 #[test]
@@ -255,6 +290,19 @@ fn stack_name_editor_prefills_saves_clears_cancels_and_refuses_trunks() {
         app.config.stack_name(&BranchId::new("alpha")),
         Some("Release train")
     );
+
+    app.selected_label = None;
+    app.selected = Some(BranchId::new("alpha-tip"));
+    app.handle_key(Key::Character('n'));
+    let Overlay::StackNameEditor(editor) = &app.overlay else {
+        panic!("ordinary branch should edit its named real stack");
+    };
+    assert_eq!(
+        editor.target,
+        crate::app::ConfigTarget::Stack(BranchId::new("alpha"))
+    );
+    assert_eq!(editor.draft, "Release train");
+    app.handle_key(Key::Escape);
 
     app.handle_key(Key::Enter);
     for _ in 0.."Release train".chars().count() {
@@ -804,7 +852,7 @@ fn ctrl_c_quits_while_search_is_active() {
 }
 
 #[test]
-fn checkout_refuses_branch_owned_by_linked_worktree() {
+fn checkout_transfers_a_clean_linked_worktree_to_the_primary_checkout() {
     let repository = common::init_repo();
     common::git(repository.path(), &["branch", "feature"]);
     let linked_parent = tempfile::tempdir().unwrap();
@@ -814,11 +862,58 @@ fn checkout_refuses_branch_owned_by_linked_worktree() {
         &["worktree", "add", linked.to_str().unwrap(), "feature"],
     );
     let adapter = GitAdapter::discover(repository.path()).unwrap();
-    let error = adapter.checkout(&BranchId::new("feature")).unwrap_err();
-    assert!(error.to_string().contains("checked out at"));
+    adapter.checkout(&BranchId::new("feature")).unwrap();
+    assert_eq!(
+        common::git(repository.path(), &["branch", "--show-current"]),
+        "feature"
+    );
+    assert!(!linked.exists());
+}
+
+#[test]
+fn checkout_refuses_to_remove_a_dirty_linked_worktree() {
+    let repository = common::init_repo();
+    common::git(repository.path(), &["branch", "feature"]);
+    let linked_parent = tempfile::tempdir().unwrap();
+    let linked = linked_parent.path().join("linked");
     common::git(
         repository.path(),
-        &["worktree", "remove", linked.to_str().unwrap()],
+        &["worktree", "add", linked.to_str().unwrap(), "feature"],
+    );
+    fs::write(linked.join("untracked.txt"), "keep me\n").unwrap();
+
+    let adapter = GitAdapter::discover(repository.path()).unwrap();
+    let error = adapter.checkout(&BranchId::new("feature")).unwrap_err();
+    assert!(error.to_string().contains("uncommitted or untracked"));
+    assert!(linked.exists());
+    assert_eq!(
+        common::git(&linked, &["branch", "--show-current"]),
+        "feature"
+    );
+}
+
+#[test]
+fn checkout_refuses_to_remove_a_linked_worktree_with_ignored_files() {
+    let repository = common::init_repo();
+    fs::write(repository.path().join(".gitignore"), "ignored.txt\n").unwrap();
+    common::git(repository.path(), &["add", ".gitignore"]);
+    common::git(repository.path(), &["commit", "-m", "ignore fixture file"]);
+    common::git(repository.path(), &["branch", "feature"]);
+    let linked_parent = tempfile::tempdir().unwrap();
+    let linked = linked_parent.path().join("linked");
+    common::git(
+        repository.path(),
+        &["worktree", "add", linked.to_str().unwrap(), "feature"],
+    );
+    fs::write(linked.join("ignored.txt"), "keep me\n").unwrap();
+
+    let adapter = GitAdapter::discover(repository.path()).unwrap();
+    let error = adapter.checkout(&BranchId::new("feature")).unwrap_err();
+    assert!(error.to_string().contains("ignored files"));
+    assert!(linked.join("ignored.txt").exists());
+    assert_eq!(
+        common::git(&linked, &["branch", "--show-current"]),
+        "feature"
     );
 }
 
@@ -1075,7 +1170,7 @@ fn causal_checkout_mismatch_unlocks_with_targeted_refresh_guidance() {
     let notice = app.notice().expect("bounded mismatch notice");
     assert!(notice.contains("feature"));
     assert!(notice.contains("main"));
-    assert!(notice.contains("press r"));
+    assert!(notice.contains("press R"));
 }
 
 #[test]
@@ -1097,7 +1192,7 @@ fn checkout_reconciliation_deadline_unlocks_and_expires_deterministically() {
     assert!(matches!(app.mutation, MutationState::Reconciling { .. }));
     assert!(app.tick(now + Duration::from_secs(3)));
     assert!(matches!(app.mutation, MutationState::Idle));
-    assert!(app.notice().unwrap().contains("press r"));
+    assert!(app.notice().unwrap().contains("press R"));
     assert_eq!(app.refresh_error.as_deref(), Some("refresh failed"));
     assert!(!app.tick(now + Duration::from_secs(4)));
     assert!(app.tick(now + Duration::from_secs(5)));
@@ -1373,4 +1468,261 @@ fn option_shaped_untracked_branch_is_deletion_eligible() {
     app.selected = Some(BranchId::new("--force"));
     app.begin_delete_confirmation();
     assert!(matches!(app.mutation, MutationState::ConfirmingDeletion(_)));
+}
+
+#[test]
+fn restack_key_confirms_affected_upstack_and_uppercase_r_refreshes() {
+    let mut snapshot = (*view_snapshot()).clone();
+    let branches = Arc::make_mut(&mut snapshot.branches);
+    branches
+        .iter_mut()
+        .find(|branch| branch.id == BranchId::new("alpha"))
+        .unwrap()
+        .graphite_health = crate::model::GraphiteHealth::NeedsRestack {
+        recorded_parent: BranchId::new("main"),
+    };
+    let mut app = App::default();
+    app.apply_snapshot(Arc::new(snapshot));
+    app.selected = Some(BranchId::new("alpha"));
+
+    assert_eq!(app.handle_key(Key::Character('R')), Action::Refresh);
+    assert_eq!(app.handle_key(Key::Character('r')), Action::None);
+    let MutationState::ConfirmingRestack(request) = &app.mutation else {
+        panic!("restack confirmation");
+    };
+    assert_eq!(request.source.branch, BranchId::new("alpha"));
+    assert!(
+        request
+            .affected
+            .iter()
+            .any(|branch| branch.branch == BranchId::new("alpha-tip"))
+    );
+    assert!(matches!(app.handle_key(Key::Enter), Action::Restack(_)));
+}
+
+#[test]
+fn move_preview_toggles_only_and_preserves_open_pr_key() {
+    let mut app = App::default();
+    app.apply_snapshot(view_snapshot());
+    app.selected = Some(BranchId::new("alpha"));
+
+    assert_eq!(app.handle_key(Key::Character('m')), Action::None);
+    let Overlay::MovePreview(preview) = &app.overlay else {
+        panic!("move preview");
+    };
+    assert!(!preview.only);
+    assert!(preview.affected.contains(&BranchId::new("alpha-tip")));
+    assert_eq!(preview.target, BranchId::new("beta"));
+
+    app.handle_key(Key::Tab);
+    assert!(matches!(
+        app.overlay,
+        Overlay::MovePreview(crate::app::MovePreview { only: true, .. })
+    ));
+    assert_eq!(app.handle_key(Key::Enter), Action::None);
+    assert!(matches!(app.mutation, MutationState::ConfirmingMove(_)));
+    assert_eq!(app.handle_key(Key::Escape), Action::None);
+    assert!(matches!(app.overlay, Overlay::MovePreview(_)));
+    assert_eq!(app.handle_key(Key::Enter), Action::None);
+    assert!(matches!(app.handle_key(Key::Enter), Action::Move(_)));
+    assert_eq!(app.handle_key(Key::Character('q')), Action::None);
+    assert_eq!(app.handle_key(Key::Quit), Action::None);
+    assert_eq!(
+        app.message.as_deref(),
+        Some("quit deferred until the Graphite command finishes")
+    );
+    app.finish_graphite_action(
+        Ok(crate::adapters::git::GraphiteMutationOutcome::Inconsistent),
+        1,
+        Instant::now(),
+    );
+    assert!(matches!(app.mutation, MutationState::GraphiteBlocked(_)));
+    let mut refreshed = (*view_snapshot()).clone();
+    refreshed.generation = 99;
+    app.apply_structural_snapshot(Arc::new(refreshed), 2);
+    assert!(matches!(app.mutation, MutationState::GraphiteBlocked(_)));
+}
+
+#[test]
+fn move_preview_cancels_visibly_when_its_snapshotted_topology_drifts() {
+    let mut app = App::default();
+    let snapshot = view_snapshot();
+    app.apply_snapshot(snapshot.clone());
+    app.selected = Some(BranchId::new("alpha"));
+    app.handle_key(Key::Character('m'));
+    assert!(matches!(app.overlay, Overlay::MovePreview(_)));
+
+    let mut changed = (*snapshot).clone();
+    changed.generation += 1;
+    Arc::make_mut(&mut changed.branches)
+        .iter_mut()
+        .find(|branch| branch.id == BranchId::new("alpha-tip"))
+        .unwrap()
+        .oid = Arc::from("changed");
+    app.apply_structural_snapshot(Arc::new(changed), 1);
+
+    assert!(matches!(app.overlay, Overlay::None));
+    assert_eq!(
+        app.message.as_deref(),
+        Some("repository changed; move preview cancelled")
+    );
+}
+
+#[test]
+fn color_command_inside_indent_targets_effective_visual_section() {
+    let mut app = App::default();
+    app.apply_snapshot(view_snapshot());
+    app.config
+        .set_visual_section_in_memory(
+            &BranchId::new("alpha"),
+            Some(VisualSection {
+                color: "#7aa2f7".into(),
+                name: Some("Area".into()),
+            }),
+        )
+        .unwrap();
+    app.handle_key(Key::Character('t'));
+    app.selected = Some(BranchId::new("alpha-tip"));
+
+    let Action::PersistConfig(request) = app.handle_key(Key::Character('c')) else {
+        panic!("section color persistence");
+    };
+    assert!(
+        request
+            .mutation
+            .visual_section_updates
+            .contains_key(&BranchId::new("alpha"))
+    );
+    assert!(request.mutation.color_updates.is_empty());
+}
+
+#[test]
+fn name_command_inside_nested_indent_targets_deepest_effective_section() {
+    let mut snapshot = (*common::snapshot(vec![
+        tracked("main", None, "main", "main", true, 1),
+        tracked("base", None, "base", "main", false, 2),
+        tracked("middle", Some("base"), "base", "main", false, 3),
+        tracked("tip", Some("middle"), "base", "main", false, 4),
+    ]))
+    .clone();
+    snapshot.graphite_children = Arc::from([
+        (BranchId::new("main"), Arc::from([BranchId::new("base")])),
+        (BranchId::new("base"), Arc::from([BranchId::new("middle")])),
+        (BranchId::new("middle"), Arc::from([BranchId::new("tip")])),
+    ]);
+    let mut app = App::default();
+    app.apply_snapshot(Arc::new(snapshot));
+    for (anchor, name) in [("base", "Outer"), ("middle", "Inner")] {
+        app.config
+            .set_visual_section_in_memory(
+                &BranchId::new(anchor),
+                Some(VisualSection {
+                    color: "#7aa2f7".into(),
+                    name: Some(name.into()),
+                }),
+            )
+            .unwrap();
+    }
+    app.handle_key(Key::Character('t'));
+    app.selected = Some(BranchId::new("tip"));
+    app.selected_label = None;
+
+    app.handle_key(Key::Character('n'));
+    let Overlay::StackNameEditor(editor) = &app.overlay else {
+        panic!("interior branch should open the effective section editor");
+    };
+    assert_eq!(
+        editor.target,
+        crate::app::ConfigTarget::VisualSection(BranchId::new("middle"))
+    );
+    assert_eq!(editor.draft, "Inner");
+
+    app.handle_key(Key::ClearNameDraft);
+    app.handle_key(Key::Escape);
+    assert_eq!(
+        app.config
+            .visual_section(&BranchId::new("middle"))
+            .and_then(|section| section.name.as_deref()),
+        Some("Inner")
+    );
+
+    app.selected_label = None;
+    app.selected = Some(BranchId::new("tip"));
+    app.handle_key(Key::Character('n'));
+    app.handle_key(Key::ClearNameDraft);
+    let Action::PersistConfig(request) = app.handle_key(Key::Enter) else {
+        panic!("clearing the inner section name should persist");
+    };
+    let inner = request.mutation.visual_section_updates[&BranchId::new("middle")]
+        .as_ref()
+        .expect("section remains present");
+    assert_eq!(inner.name, None);
+    assert_eq!(inner.color, "#7aa2f7");
+    assert_eq!(
+        app.config
+            .visual_section(&BranchId::new("base"))
+            .and_then(|section| section.name.as_deref()),
+        Some("Outer")
+    );
+}
+
+#[test]
+fn clear_name_draft_resets_unicode_cursor_without_persisting() {
+    let mut app = App::default();
+    app.apply_snapshot(view_snapshot());
+    app.selected = Some(BranchId::new("alpha"));
+    app.handle_key(Key::Character('n'));
+    for character in "é🙂name".chars() {
+        app.handle_key(Key::Character(character));
+    }
+    app.handle_key(Key::Left);
+    app.handle_key(Key::ClearNameDraft);
+
+    let Overlay::StackNameEditor(editor) = &app.overlay else {
+        panic!("name editor");
+    };
+    assert!(editor.draft.is_empty());
+    assert_eq!(editor.cursor, 0);
+    assert_eq!(app.config.stack_name(&BranchId::new("alpha")), None);
+
+    for _ in 0..81 {
+        app.handle_key(Key::Character('x'));
+    }
+    let Overlay::StackNameEditor(editor) = &app.overlay else {
+        panic!("name editor");
+    };
+    assert_eq!(editor.draft.chars().count(), 80);
+    assert_eq!(editor.cursor, 80);
+}
+
+#[test]
+fn section_name_editor_closes_when_refresh_removes_its_anchor() {
+    let mut app = App::default();
+    app.apply_snapshot(view_snapshot());
+    app.config
+        .set_visual_section_in_memory(
+            &BranchId::new("alpha"),
+            Some(VisualSection {
+                color: "#7aa2f7".into(),
+                name: Some("Area".into()),
+            }),
+        )
+        .unwrap();
+    app.handle_key(Key::Character('t'));
+    app.selected = Some(BranchId::new("alpha-tip"));
+    app.selected_label = None;
+    app.handle_key(Key::Character('n'));
+    assert!(matches!(app.overlay, Overlay::StackNameEditor(_)));
+
+    let mut changed =
+        (*common::snapshot(vec![tracked("main", None, "main", "main", true, 1)])).clone();
+    changed.generation = 2;
+    app.apply_structural_snapshot(Arc::new(changed), 1);
+
+    assert_eq!(app.overlay, Overlay::None);
+    assert!(
+        app.message
+            .as_deref()
+            .is_some_and(|message| message.contains("name editor closed"))
+    );
 }

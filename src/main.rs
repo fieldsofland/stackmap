@@ -1,5 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write, stdout};
+use std::mem::ManuallyDrop;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
+use crossterm::cursor::Show;
 use crossterm::event::{
     self, Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
@@ -20,20 +22,23 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use stackmap::runtime::git::{DeleteOutcome, DeleteRequest, GitAdapter};
+use stackmap::runtime::git::{
+    DeleteOutcome, DeleteRequest, GitAdapter, GraphiteMutationOutcome, MoveRequest, RestackRequest,
+};
 use stackmap::runtime::{
-    Action, App, ArchiveMode, BranchId, Config, ConfigWriteRequest, Input, Key, RefreshEvent,
-    RefreshHandle, github, platform, render,
+    Action, App, ArchiveDisposition, ArchiveRequest, BranchId, ClipboardRequest, ClipboardScope,
+    Config, ConfigWriteRequest, Input, Key, RefreshEvent, RefreshHandle, archive, platform, render,
 };
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
-const GITHUB_TTL: Duration = Duration::from_secs(30);
 const CONFIG_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_REFRESH_EVENTS_PER_FRAME: usize = 4;
+const INPUT_EVENT_CAPACITY: usize = 16;
 
 enum PlatformResult {
     Open(Result<()>),
     OpenMany { count: usize, result: Result<()> },
-    Copy(Result<()>),
+    Copy(ClipboardRequest, Result<()>),
 }
 
 struct ConfigPersistenceResult {
@@ -73,7 +78,7 @@ impl ConfigPersistenceQueue {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("stackmap: {error:#}");
+        let _ = writeln!(io::stderr(), "stackmap: {error:#}");
         std::process::exit(2);
     }
 }
@@ -81,16 +86,29 @@ fn main() {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CliAction {
     Help,
+    ArchiveHelp,
     Version,
     Run {
         repository: Option<PathBuf>,
         current: bool,
     },
+    Archive {
+        repository: Option<PathBuf>,
+        dry_run: bool,
+        branches: Vec<String>,
+    },
 }
 
 fn help_text() -> String {
     format!(
-        "stackmap {}\n\nUSAGE:\n    stackmap [--current] [REPOSITORY]\n\nRun a live local branch and Graphite stack map. Press ? in the TUI for keys.",
+        "stackmap {}\n\nUSAGE:\n    stackmap [--current] [REPOSITORY]\n    stackmap archive [--repo PATH] [--dry-run] BRANCH...\n\nRun a live local branch and Graphite stack map. Press ? in the TUI for keys.",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn archive_help_text() -> String {
+    format!(
+        "stackmap {}\n\nUSAGE:\n    stackmap archive [--repo PATH] [--dry-run] BRANCH...\n\nArchive an explicit branch batch in reversible repository-local Stackmap config. Options must precede branch names; use -- before an option-shaped branch. Output is deterministic: would archive, archived, or unchanged. --dry-run performs the same validation without changing config or Git; the command never changes Git refs, worktrees, remotes, Graphite metadata, or pull requests.",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -104,11 +122,27 @@ where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
 {
+    let args = args.into_iter().map(Into::into).collect::<Vec<OsString>>();
+    if args
+        .first()
+        .is_some_and(|value| value == OsStr::new("archive"))
+    {
+        if args
+            .get(1)
+            .is_some_and(|value| value == OsStr::new("--help") || value == OsStr::new("-h"))
+        {
+            if args.len() != 2 {
+                return Err("archive help cannot be combined with other arguments".into());
+            }
+            return Ok(CliAction::ArchiveHelp);
+        }
+        return parse_archive_cli(args.into_iter().skip(1));
+    }
     let mut repository = None;
     let mut current = false;
     let mut terminated = false;
     let mut meta = None;
-    for value in args.into_iter().map(Into::into) {
+    for value in args {
         if !terminated && value == OsStr::new("--") {
             terminated = true;
             continue;
@@ -153,11 +187,73 @@ where
     })
 }
 
+fn parse_archive_cli(
+    args: impl IntoIterator<Item = OsString>,
+) -> std::result::Result<CliAction, String> {
+    let mut repository = None;
+    let mut dry_run = false;
+    let mut terminated = false;
+    let mut saw_branch = false;
+    let mut branches = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(value) = args.next() {
+        if !terminated && value == OsStr::new("--") {
+            terminated = true;
+            continue;
+        }
+        if !terminated && !saw_branch && value == OsStr::new("--repo") {
+            if repository.is_some() {
+                return Err("--repo may be provided only once".into());
+            }
+            repository = Some(PathBuf::from(
+                args.next()
+                    .ok_or_else(|| "--repo requires a path".to_owned())?,
+            ));
+            continue;
+        }
+        if !terminated && !saw_branch && value == OsStr::new("--dry-run") {
+            if dry_run {
+                return Err("--dry-run may be provided only once".into());
+            }
+            dry_run = true;
+            continue;
+        }
+        if !terminated && value.to_string_lossy().starts_with('-') {
+            return Err(if saw_branch {
+                format!(
+                    "archive options must precede branch names: {}",
+                    value.to_string_lossy()
+                )
+            } else {
+                format!("unknown archive option: {}", value.to_string_lossy())
+            });
+        }
+        saw_branch = true;
+        branches.push(
+            value
+                .into_string()
+                .map_err(|_| "archive branch names must be valid UTF-8".to_owned())?,
+        );
+    }
+    if branches.is_empty() {
+        return Err("archive requires at least one branch".into());
+    }
+    Ok(CliAction::Archive {
+        repository,
+        dry_run,
+        branches,
+    })
+}
+
 fn run() -> Result<()> {
     let cli = parse_cli(std::env::args_os().skip(1)).map_err(anyhow::Error::msg)?;
     let (repository, current) = match cli {
         CliAction::Help => {
             println!("{}", help_text());
+            return Ok(());
+        }
+        CliAction::ArchiveHelp => {
+            println!("{}", archive_help_text());
             return Ok(());
         }
         CliAction::Version => {
@@ -168,6 +264,29 @@ fn run() -> Result<()> {
             repository,
             current,
         } => (repository, current),
+        CliAction::Archive {
+            repository,
+            dry_run,
+            branches,
+        } => {
+            let results = archive(ArchiveRequest {
+                repository: repository.unwrap_or(std::env::current_dir()?),
+                dry_run,
+                branches,
+            })?;
+            for result in results {
+                match result.disposition {
+                    ArchiveDisposition::Archived => println!("archived {}", result.branch),
+                    ArchiveDisposition::WouldArchive => {
+                        println!("would archive {}", result.branch)
+                    }
+                    ArchiveDisposition::Unchanged => {
+                        println!("unchanged {} (already archived)", result.branch)
+                    }
+                }
+            }
+            return Ok(());
+        }
     };
     let start_dir = repository.unwrap_or(std::env::current_dir()?);
     let adapter = GitAdapter::discover(&start_dir).with_context(|| {
@@ -179,12 +298,10 @@ fn run() -> Result<()> {
     let refresh = RefreshHandle::start(start_dir.clone())?;
     let (checkout_send, checkout_receive) = mpsc::sync_channel(1);
     let (delete_send, delete_receive) = mpsc::sync_channel(1);
-    let (github_send, github_receive) = mpsc::sync_channel(1);
+    let (graphite_send, graphite_receive) = mpsc::sync_channel(1);
     let (platform_send, platform_receive) = mpsc::sync_channel(1);
     let (config_send, config_receive) = mpsc::sync_channel::<ConfigPersistenceResult>(1);
     let mut config_queue = ConfigPersistenceQueue::default();
-    let mut github_in_flight = false;
-    let mut next_github_fetch = Instant::now();
     let shutdown = Arc::new(AtomicBool::new(false));
     for signal in [
         signal_hook::consts::SIGINT,
@@ -196,7 +313,12 @@ fn run() -> Result<()> {
 
     let guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(stdout());
-    let mut terminal = Terminal::new(backend)?;
+    // TerminalGuard owns restoration. Ratatui's destructor logs cursor errors
+    // to stderr, which itself is revoked when a terminal disappears and can
+    // turn an otherwise clean hangup into a panic.
+    let mut terminal = ManuallyDrop::new(Terminal::new(backend)?);
+    let (input_send, input_receive) = mpsc::sync_channel(INPUT_EVENT_CAPACITY);
+    spawn_input_reader(input_send)?;
     let mut app = App::default();
     if current {
         app.request_current_startup();
@@ -206,10 +328,14 @@ fn run() -> Result<()> {
     let mut redraw = true;
 
     loop {
-        if shutdown.load(Ordering::Acquire) {
+        let terminal_attached = terminal_is_attached();
+        if shutdown.load(Ordering::Acquire) || !terminal_attached {
             break;
         }
-        while let Some(event) = refresh.try_event() {
+        for _ in 0..MAX_REFRESH_EVENTS_PER_FRAME {
+            let Some(event) = refresh.try_event() else {
+                break;
+            };
             if shutdown.load(Ordering::Acquire) {
                 break;
             }
@@ -225,61 +351,16 @@ fn run() -> Result<()> {
                     {
                         spawn_config_persistence(start, config_send.clone())?;
                     }
-                    if matches!(app.archive_mode, ArchiveMode::Active)
-                        && !github_in_flight
-                        && Instant::now() >= next_github_fetch
-                    {
-                        github_in_flight = true;
-                        app.mark_github_loading();
-                        let directory = start_dir.clone();
-                        let sender = github_send.clone();
-                        thread::Builder::new()
-                            .name("stackmap-github".into())
-                            .spawn(move || {
-                                let result = github::fetch(&directory);
-                                let _ = sender.try_send(result);
-                            })?;
-                    }
                 }
                 RefreshEvent::Enriched(snapshot) => app.apply_enriched_snapshot(snapshot),
                 RefreshEvent::Upstream(batch) => app.apply_upstream_batch(batch),
+                RefreshEvent::GraphiteHealth(batch) => app.apply_graphite_health_batch(batch),
+                RefreshEvent::Github(batch) => app.apply_github_batch(batch),
                 RefreshEvent::Failed(error) => app.mark_stale(error),
             }
         }
-        while let Ok(result) = github_receive.try_recv() {
-            github_in_flight = false;
-            next_github_fetch = Instant::now() + GITHUB_TTL;
-            match result {
-                Ok(matches) => app.apply_prs(matches),
-                Err(error) => app.mark_github_failed(error),
-            }
-            redraw = true;
-        }
         while let Ok(result) = platform_receive.try_recv() {
-            app.platform_running = false;
-            match result {
-                PlatformResult::Open(Ok(())) => app.message = Some(Arc::from("PR opened")),
-                PlatformResult::OpenMany {
-                    count,
-                    result: Ok(()),
-                } => {
-                    app.message = Some(if count == 1 {
-                        Arc::from("PR opened")
-                    } else {
-                        Arc::from(format!("opened {count} PRs"))
-                    });
-                }
-                PlatformResult::Copy(Ok(())) => app.message = Some(Arc::from("PR URL copied")),
-                PlatformResult::Open(Err(error)) => {
-                    app.message = Some(Arc::from(format!("open failed: {error}")))
-                }
-                PlatformResult::OpenMany {
-                    result: Err(error), ..
-                } => app.message = Some(Arc::from(format!("open failed: {error}"))),
-                PlatformResult::Copy(Err(error)) => {
-                    app.message = Some(Arc::from(format!("copy failed: {error}")))
-                }
-            }
+            apply_platform_result(&mut app, result);
             redraw = true;
         }
         while let Ok(result) = config_receive.try_recv() {
@@ -303,9 +384,22 @@ fn run() -> Result<()> {
             app.finish_deletion_at(result, request_epoch, Instant::now());
             redraw = true;
         }
+        while let Ok(result) = graphite_receive.try_recv() {
+            let request_epoch = refresh.request();
+            app.finish_graphite_action(result, request_epoch, Instant::now());
+            redraw = true;
+        }
 
         if let Some(command) = app.take_upstream_command() {
             refresh.request_upstream(command);
+            redraw = true;
+        }
+        if let Some(command) = app.take_graphite_health_command() {
+            refresh.request_graphite_health(command);
+            redraw = true;
+        }
+        if let Some(command) = app.take_github_command() {
+            refresh.request_github(command);
             redraw = true;
         }
 
@@ -317,15 +411,20 @@ fn run() -> Result<()> {
             last_clock_tick = Instant::now();
         }
         if redraw {
-            terminal.draw(|frame| render(frame, &mut app, SystemTime::now()))?;
+            if let Err(error) = terminal.draw(|frame| render(frame, &mut app, SystemTime::now())) {
+                if !terminal_is_attached() {
+                    break;
+                }
+                return Err(error.into());
+            }
             redraw = false;
         }
         if last_reconcile.elapsed() >= RECONCILE_INTERVAL {
             refresh.request();
             last_reconcile = Instant::now();
         }
-        if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
+        match input_receive.recv_timeout(Duration::from_millis(100)) {
+            Ok(event) => match event? {
                 Event::Key(key) => {
                     let Some(input) = Input::from_event(key) else {
                         continue;
@@ -338,7 +437,6 @@ fn run() -> Result<()> {
                         Action::None => {}
                         Action::Quit => break,
                         Action::Refresh => {
-                            next_github_fetch = Instant::now();
                             refresh.request();
                         }
                         Action::PersistConfig(request) => {
@@ -351,6 +449,12 @@ fn run() -> Result<()> {
                         }
                         Action::Delete(request) => {
                             spawn_delete(adapter.clone(), request, delete_send.clone())?;
+                        }
+                        Action::Restack(request) => {
+                            spawn_restack(adapter.clone(), request, graphite_send.clone())?;
+                        }
+                        Action::Move(request) => {
+                            spawn_move(adapter.clone(), request, graphite_send.clone())?;
                         }
                         Action::OpenUrl(url) => {
                             spawn_platform_action(
@@ -366,10 +470,10 @@ fn run() -> Result<()> {
                                 platform_send.clone(),
                             )?;
                         }
-                        Action::CopyUrl(url) => {
+                        Action::Copy(request) => {
                             spawn_platform_action(
                                 &mut app,
-                                PlatformAction::Copy(url),
+                                PlatformAction::Copy(request),
                                 platform_send.clone(),
                             )?;
                         }
@@ -377,13 +481,47 @@ fn run() -> Result<()> {
                 }
                 Event::Resize(_, _) => redraw = true,
                 _ => {}
-            }
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    drop(terminal);
     drop(guard);
     flush_config_persistence(&mut app, &mut config_queue, &config_send, &config_receive)?;
     Ok(())
+}
+
+fn spawn_input_reader(sender: mpsc::SyncSender<io::Result<Event>>) -> io::Result<()> {
+    thread::Builder::new()
+        .name("stackmap-input".into())
+        .spawn(move || {
+            loop {
+                let result = event::read();
+                let failed = result.is_err();
+                if sender.send(result).is_err() || failed {
+                    break;
+                }
+            }
+        })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn terminal_is_attached() -> bool {
+    use std::os::fd::AsRawFd;
+
+    if unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) >= 0 } {
+        return true;
+    }
+    let Ok(tty) = std::fs::File::open("/dev/tty") else {
+        return false;
+    };
+    unsafe { libc::tcgetpgrp(tty.as_raw_fd()) >= 0 }
+}
+
+#[cfg(not(unix))]
+fn terminal_is_attached() -> bool {
+    true
 }
 
 fn flush_config_persistence(
@@ -469,7 +607,58 @@ fn spawn_config_persistence(
 enum PlatformAction {
     Open(Arc<str>),
     OpenMany(Vec<Arc<str>>),
-    Copy(Arc<str>),
+    Copy(ClipboardRequest),
+}
+
+fn copy_scope_name(scope: ClipboardScope) -> &'static str {
+    match scope {
+        ClipboardScope::PullRequest => "PR URL",
+        ClipboardScope::Branch => "branch",
+        ClipboardScope::Section => "section",
+        ClipboardScope::Stack => "stack",
+    }
+}
+
+fn copy_success_message(request: &ClipboardRequest) -> String {
+    match request.scope {
+        ClipboardScope::PullRequest => "PR URL copied".to_owned(),
+        ClipboardScope::Branch => "branch copied".to_owned(),
+        ClipboardScope::Section | ClipboardScope::Stack => {
+            let branch = if request.branch_count == 1 {
+                "branch"
+            } else {
+                "branches"
+            };
+            format!(
+                "{} {} {branch} copied",
+                request.branch_count,
+                copy_scope_name(request.scope)
+            )
+        }
+    }
+}
+
+fn apply_platform_result(app: &mut App, result: PlatformResult) {
+    app.platform_running = false;
+    app.message = Some(Arc::from(match result {
+        PlatformResult::Open(Ok(())) => "PR opened".to_owned(),
+        PlatformResult::OpenMany {
+            count: 1,
+            result: Ok(()),
+        } => "PR opened".to_owned(),
+        PlatformResult::OpenMany {
+            count,
+            result: Ok(()),
+        } => format!("opened {count} PRs"),
+        PlatformResult::Copy(request, Ok(())) => copy_success_message(&request),
+        PlatformResult::Open(Err(error)) => format!("open failed: {error}"),
+        PlatformResult::OpenMany {
+            result: Err(error), ..
+        } => format!("open failed: {error}"),
+        PlatformResult::Copy(request, Err(error)) => {
+            format!("{} copy failed: {error}", copy_scope_name(request.scope))
+        }
+    }));
 }
 
 fn spawn_platform_action(
@@ -478,11 +667,23 @@ fn spawn_platform_action(
     sender: std::sync::mpsc::SyncSender<PlatformResult>,
 ) -> io::Result<()> {
     if app.platform_running {
-        app.message = Some(Arc::from("open/copy action already running"));
+        app.message = Some(Arc::from(match &action {
+            PlatformAction::Open(_) => "open/copy action already running".to_owned(),
+            PlatformAction::OpenMany(_) => "open/copy action already running".to_owned(),
+            PlatformAction::Copy(request) => format!(
+                "{} copy blocked: open/copy action already running",
+                copy_scope_name(request.scope)
+            ),
+        }));
         return Ok(());
     }
     app.platform_running = true;
-    thread::Builder::new()
+    let spawn_scope = match &action {
+        PlatformAction::Open(_) => "open".to_owned(),
+        PlatformAction::OpenMany(_) => "open".to_owned(),
+        PlatformAction::Copy(request) => format!("{} copy", copy_scope_name(request.scope)),
+    };
+    let spawn = thread::Builder::new()
         .name("stackmap-platform".into())
         .spawn(move || {
             let result = match action {
@@ -491,10 +692,17 @@ fn spawn_platform_action(
                     count: urls.len(),
                     result: platform::open_urls(&urls),
                 },
-                PlatformAction::Copy(url) => PlatformResult::Copy(platform::copy_text(&url)),
+                PlatformAction::Copy(request) => {
+                    let result = platform::copy_text(&request.text);
+                    PlatformResult::Copy(request, result)
+                }
             };
             let _ = sender.try_send(result);
-        })?;
+        });
+    if let Err(error) = spawn {
+        app.platform_running = false;
+        app.message = Some(Arc::from(format!("{spawn_scope} spawn failed: {error}")));
+    }
     Ok(())
 }
 
@@ -520,6 +728,32 @@ fn spawn_delete(
         .name("stackmap-delete".into())
         .spawn(move || {
             let _ = sender.try_send(adapter.delete_branch(&request));
+        })?;
+    Ok(())
+}
+
+fn spawn_restack(
+    adapter: GitAdapter,
+    request: RestackRequest,
+    sender: std::sync::mpsc::SyncSender<anyhow::Result<GraphiteMutationOutcome>>,
+) -> Result<()> {
+    thread::Builder::new()
+        .name("stackmap-restack".into())
+        .spawn(move || {
+            let _ = sender.try_send(adapter.graphite_restack(&request));
+        })?;
+    Ok(())
+}
+
+fn spawn_move(
+    adapter: GitAdapter,
+    request: MoveRequest,
+    sender: std::sync::mpsc::SyncSender<anyhow::Result<GraphiteMutationOutcome>>,
+) -> Result<()> {
+    thread::Builder::new()
+        .name("stackmap-move".into())
+        .spawn(move || {
+            let _ = sender.try_send(adapter.graphite_move(&request));
         })?;
     Ok(())
 }
@@ -571,7 +805,7 @@ fn restore_terminal(writer: &mut impl Write, keyboard_enhanced: bool) -> io::Res
     if keyboard_enhanced {
         queue!(writer, PopKeyboardEnhancementFlags)?;
     }
-    queue!(writer, LeaveAlternateScreen)?;
+    queue!(writer, LeaveAlternateScreen, Show)?;
     writer.flush()
 }
 
@@ -582,8 +816,8 @@ mod tests {
     use std::sync::Arc;
 
     use stackmap::runtime::{
-        Branch, BranchId, ConfiguredUpstream, DiffState, GraphiteProvenance, RemoteRefEvidence,
-        RepositorySnapshot, RepositoryState,
+        Branch, BranchId, ConfiguredUpstream, DiffState, GraphiteHealth, GraphiteProvenance,
+        RemoteRefEvidence, RepositorySnapshot, RepositoryState,
     };
 
     use super::*;
@@ -608,6 +842,7 @@ mod tests {
             stack_root: BranchId::new(name),
             trunk: Some(BranchId::new("main")),
             graphite: GraphiteProvenance::Tracked,
+            graphite_health: GraphiteHealth::Healthy,
             committed_at: 1,
             current,
             dirty: false,
@@ -616,6 +851,7 @@ mod tests {
             remote_ref: RemoteRefEvidence::NotRequested,
             diff: DiffState::Loading,
             pr: None,
+            pr_lookup: stackmap::runtime::PullRequestLookup::NotRequested,
         };
         let branches = vec![branch("main", true), branch("alpha", false)];
         Arc::new(RepositorySnapshot {
@@ -711,11 +947,11 @@ mod tests {
     fn terminal_cleanup_always_leaves_alt_screen_and_pops_enabled_keyboard_flags() {
         let mut enhanced = Vec::new();
         restore_terminal(&mut enhanced, true).unwrap();
-        assert_eq!(enhanced, b"\x1b[<1u\x1b[?1049l");
+        assert_eq!(enhanced, b"\x1b[<1u\x1b[?1049l\x1b[?25h");
 
         let mut fallback = Vec::new();
         restore_terminal(&mut fallback, false).unwrap();
-        assert_eq!(fallback, b"\x1b[?1049l");
+        assert_eq!(fallback, b"\x1b[?1049l\x1b[?25h");
     }
 
     #[test]
@@ -725,6 +961,146 @@ mod tests {
         assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
         assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
         assert!(flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+    }
+
+    #[test]
+    fn archive_command_parser_accepts_repo_dry_run_and_exact_targets() {
+        assert_eq!(
+            parse_cli([
+                "archive",
+                "--repo",
+                "/tmp/repo",
+                "--dry-run",
+                "feature/one",
+                "feature/two",
+            ])
+            .unwrap(),
+            CliAction::Archive {
+                repository: Some(PathBuf::from("/tmp/repo")),
+                dry_run: true,
+                branches: vec!["feature/one".into(), "feature/two".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn archive_command_has_specific_successful_help() {
+        assert_eq!(
+            parse_cli(["archive", "--help"]).unwrap(),
+            CliAction::ArchiveHelp
+        );
+        assert_eq!(
+            parse_cli(["archive", "-h"]).unwrap(),
+            CliAction::ArchiveHelp
+        );
+        assert_eq!(
+            parse_cli(["archive", "--help", "feature"]).unwrap_err(),
+            "archive help cannot be combined with other arguments"
+        );
+        let help = archive_help_text();
+        assert!(help.contains("stackmap archive [--repo PATH] [--dry-run] BRANCH..."));
+        assert!(help.contains("Options must precede branch names"));
+        assert!(help.contains("would archive, archived, or unchanged"));
+        assert!(help.contains("never changes Git refs"));
+    }
+
+    #[test]
+    fn archive_command_requires_at_least_one_target() {
+        assert_eq!(
+            parse_cli(["archive"]).unwrap_err(),
+            "archive requires at least one branch"
+        );
+    }
+
+    #[test]
+    fn archive_command_rejects_duplicate_unknown_and_misplaced_options() {
+        assert_eq!(
+            parse_cli(["archive", "--dry-run", "--dry-run", "alpha"]).unwrap_err(),
+            "--dry-run may be provided only once"
+        );
+        assert_eq!(
+            parse_cli(["archive", "--wat", "alpha"]).unwrap_err(),
+            "unknown archive option: --wat"
+        );
+        assert_eq!(
+            parse_cli(["archive", "alpha", "--dry-run"]).unwrap_err(),
+            "archive options must precede branch names: --dry-run"
+        );
+        assert_eq!(
+            parse_cli(["archive", "--repo"]).unwrap_err(),
+            "--repo requires a path"
+        );
+    }
+
+    #[test]
+    fn option_termination_keeps_archive_available_as_a_legacy_repository_path() {
+        assert_eq!(
+            parse_cli(["--", "archive"]).unwrap(),
+            CliAction::Run {
+                repository: Some(PathBuf::from("archive")),
+                current: false,
+            }
+        );
+        assert_eq!(
+            parse_cli(["archive", "--", "--dry-run"]).unwrap(),
+            CliAction::Archive {
+                repository: None,
+                dry_run: false,
+                branches: vec!["--dry-run".into()],
+            }
+        );
+    }
+
+    fn clipboard_request(scope: ClipboardScope, count: usize) -> ClipboardRequest {
+        ClipboardRequest {
+            text: Arc::from("base\ntip"),
+            scope,
+            branch_count: count,
+        }
+    }
+
+    #[test]
+    fn clipboard_results_report_accurate_scope_count_and_failures() {
+        let mut app = App::default();
+        app.platform_running = true;
+        apply_platform_result(
+            &mut app,
+            PlatformResult::Copy(clipboard_request(ClipboardScope::Section, 2), Ok(())),
+        );
+        assert!(!app.platform_running);
+        assert_eq!(app.message.as_deref(), Some("2 section branches copied"));
+
+        app.platform_running = true;
+        apply_platform_result(
+            &mut app,
+            PlatformResult::Copy(
+                clipboard_request(ClipboardScope::Stack, 2),
+                Err(anyhow::anyhow!("clipboard helper timed out")),
+            ),
+        );
+        assert!(!app.platform_running);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("stack copy failed: clipboard helper timed out")
+        );
+    }
+
+    #[test]
+    fn clipboard_worker_is_single_flight_with_visible_overlap_rejection() {
+        let mut app = App::default();
+        app.platform_running = true;
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        spawn_platform_action(
+            &mut app,
+            PlatformAction::Copy(clipboard_request(ClipboardScope::Branch, 1)),
+            sender,
+        )
+        .unwrap();
+        assert!(app.platform_running);
+        assert_eq!(
+            app.message.as_deref(),
+            Some("branch copy blocked: open/copy action already running")
+        );
     }
 
     #[test]

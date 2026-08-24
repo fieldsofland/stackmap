@@ -2,7 +2,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local};
 
-use crate::model::{Branch, ConfiguredUpstream, RemoteRefEvidence};
+use crate::model::{
+    Branch, ConfiguredUpstream, GraphiteHealth, PullRequestLookup, PullRequestMatch,
+    RemoteRefEvidence,
+};
+
+use super::{PushedState, pushed_state};
 
 pub fn relative_time(timestamp: i64, now: SystemTime) -> String {
     let now = now
@@ -39,22 +44,70 @@ pub fn detail(branch: &Branch) -> String {
     let pr = branch
         .pr
         .as_ref()
-        .map(|pr| format!("PR #{} · {} · {}", pr.number, pr.status.label(), pr.title))
-        .unwrap_or_else(|| "No matching PR".into());
+        .map(|pr| {
+            let quality = match pr.match_quality {
+                PullRequestMatch::ExactTip => "exact local tip",
+                PullRequestMatch::StaleTip if pr.head_oid.is_some() => {
+                    "stale branch-name match; head differs"
+                }
+                PullRequestMatch::StaleTip => "stale branch-name match; head unavailable",
+            };
+            format!(
+                "PR #{} · {} · {} · {quality}",
+                pr.number,
+                pr.status.label(),
+                pr.title
+            )
+        })
+        .unwrap_or_else(|| match &branch.pr_lookup {
+            PullRequestLookup::NotRequested => "PR lookup: not requested".into(),
+            PullRequestLookup::Checking => "PR lookup: checking".into(),
+            PullRequestLookup::NoMatch => "PR lookup: confirmed no match".into(),
+            PullRequestLookup::Ready => "PR lookup: ready without a usable match".into(),
+            PullRequestLookup::Unavailable(reason) => {
+                format!("PR lookup: unavailable ({reason})")
+            }
+        });
     let worktree = branch
         .worktree
         .as_ref()
         .map(|path| format!("Worktree: {}", path.display()))
         .unwrap_or_else(|| "Worktree: not checked out".into());
     format!(
-        "{}\nLast edited: {}\n{}\n{}\n{}\n{}\nRemote evidence uses local refs only · no fetch",
+        "{}\nLast edited: {}\n{}\n{}\n{}\n{}\n{}\n{}\nRemote evidence uses local refs only · no fetch",
         branch.id,
         exact_time(branch.committed_at),
         worktree,
         pr,
+        pushed_detail(branch),
         upstream_detail(&branch.configured_upstream),
         remote_detail(&branch.remote_ref),
+        graphite_health_detail(&branch.graphite_health),
     )
+}
+
+fn pushed_detail(branch: &Branch) -> &'static str {
+    match pushed_state(branch) {
+        PushedState::Pushed => "Pushed: exact local tip found",
+        PushedState::NotPushed => "Pushed: exact local tip absent",
+        PushedState::Checking => "Pushed: checking exact local tip",
+        PushedState::Unavailable => "Pushed: unavailable or insufficient evidence",
+    }
+}
+
+fn graphite_health_detail(health: &GraphiteHealth) -> String {
+    match health {
+        GraphiteHealth::NotTracked => "Graphite stack health: not tracked".into(),
+        GraphiteHealth::NotRequested => "Graphite stack health: not requested".into(),
+        GraphiteHealth::Checking => "Graphite stack health: checking".into(),
+        GraphiteHealth::Healthy => "Graphite stack health: healthy".into(),
+        GraphiteHealth::NeedsRestack { recorded_parent } => {
+            format!("Graphite stack health: restack needed onto {recorded_parent}")
+        }
+        GraphiteHealth::Unavailable(reason) => {
+            format!("Graphite stack health: unavailable ({reason})")
+        }
+    }
 }
 
 pub fn local_detail(branch: &Branch) -> String {
@@ -75,7 +128,12 @@ pub fn local_detail(branch: &Branch) -> String {
 
 pub fn evidence_source_footer(branch: &Branch) -> String {
     match &branch.remote_ref {
-        RemoteRefEvidence::Contained {
+        RemoteRefEvidence::ExactTip {
+            source_token,
+            checked_at,
+            ..
+        }
+        | RemoteRefEvidence::Contained {
             source_token,
             checked_at,
             ..
@@ -121,6 +179,13 @@ fn upstream_detail(upstream: &ConfiguredUpstream) -> String {
             ahead,
             behind,
         } => format!("Configured upstream: {reference} (ahead {ahead}, behind {behind})"),
+        ConfiguredUpstream::Rewritten {
+            reference,
+            ahead,
+            behind,
+        } => format!(
+            "Configured upstream: {reference} (updated locally; no remote-only patches; raw ahead {ahead}, behind {behind})"
+        ),
         ConfiguredUpstream::Gone { reference } => {
             format!("Configured upstream: {reference} (gone from local refs)")
         }
@@ -135,6 +200,15 @@ fn remote_detail(evidence: &RemoteRefEvidence) -> String {
     match evidence {
         RemoteRefEvidence::NotRequested => "Remote-ref evidence: not checked".into(),
         RemoteRefEvidence::Checking => "Remote-ref evidence: checking local refs…".into(),
+        RemoteRefEvidence::ExactTip {
+            reference,
+            source_token,
+            checked_at,
+        } => format!(
+            "Remote-ref evidence: exact tip at {reference}; source {:016x} @ {}",
+            source_token,
+            system_time(*checked_at)
+        ),
         RemoteRefEvidence::Contained {
             reference,
             source_token,

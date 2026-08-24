@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::adapters::git::{DeleteOutcome, DeleteRequest};
+use crate::adapters::git::{
+    DeleteOutcome, DeleteRequest, GraphiteBranchExpectation, GraphiteEdgeExpectation,
+    GraphiteMutationOutcome, MoveRequest, RestackRequest,
+};
 use crate::adapters::github::GitHubError;
 use crate::config::{Config, ConfigMutation};
 use crate::model::BranchId;
@@ -18,10 +21,27 @@ pub enum Action {
     Refresh,
     Checkout(BranchId),
     Delete(DeleteRequest),
+    Restack(RestackRequest),
+    Move(MoveRequest),
     OpenUrl(Arc<str>),
     OpenUrls(Vec<Arc<str>>),
-    CopyUrl(Arc<str>),
+    Copy(ClipboardRequest),
     PersistConfig(ConfigWriteRequest),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClipboardScope {
+    PullRequest,
+    Branch,
+    Section,
+    Stack,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipboardRequest {
+    pub text: Arc<str>,
+    pub scope: ClipboardScope,
+    pub branch_count: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,12 +128,17 @@ pub enum MutationState {
     CheckingOut(BranchId),
     ConfirmingDeletion(DeleteConfirmation),
     Deleting(DeleteConfirmation),
+    ConfirmingRestack(RestackRequest),
+    Restacking(RestackRequest),
+    ConfirmingMove(MoveRequest),
+    Moving(MoveRequest),
     Reconciling {
         operation: ReconciliationOperation,
         request_epoch: u64,
         deadline: Instant,
     },
     DeletionBlocked(Arc<str>),
+    GraphiteBlocked(Arc<str>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -127,11 +152,25 @@ pub enum ReconciliationOperation {
         result: DeletionResult,
         selection_after: Option<BranchId>,
     },
+    Restack {
+        request: RestackRequest,
+        result: GraphiteActionResult,
+    },
+    Move {
+        request: MoveRequest,
+        result: GraphiteActionResult,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DeletionResult {
     Outcome(DeleteOutcome),
+    Error(Arc<str>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GraphiteActionResult {
+    Outcome(GraphiteMutationOutcome),
     Error(Arc<str>),
 }
 
@@ -213,4 +252,18 @@ pub enum Overlay {
     ColorPicker(ColorPicker),
     StackNameEditor(StackNameEditor),
     ArchiveRange(ArchiveRange),
+    MovePreview(MovePreview),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MovePreview {
+    pub source: BranchId,
+    pub target: BranchId,
+    pub only: bool,
+    pub affected: Arc<[BranchId]>,
+    pub affected_expectations: Arc<[GraphiteBranchExpectation]>,
+    pub source_expectation: GraphiteBranchExpectation,
+    pub target_expectation: GraphiteBranchExpectation,
+    pub original_parent: Option<BranchId>,
+    pub topology: Arc<[GraphiteEdgeExpectation]>,
 }

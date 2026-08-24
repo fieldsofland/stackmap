@@ -1,5 +1,7 @@
 pub mod builder;
 pub mod diffstats;
+pub mod github;
+pub mod graphite_health;
 pub mod upstream;
 pub mod watcher;
 
@@ -15,6 +17,8 @@ use crate::model::RepositorySnapshot;
 
 use self::builder::SnapshotBuilder;
 use self::diffstats::DiffCache;
+use self::github::{GithubBatch, GithubCommand, GithubCoordinator};
+use self::graphite_health::{HealthBatch, HealthCommand, HealthCoordinator};
 use self::upstream::{UpstreamBatch, UpstreamCommand, UpstreamCoordinator};
 
 #[derive(Debug)]
@@ -25,6 +29,8 @@ pub enum RefreshEvent {
     },
     Enriched(Arc<RepositorySnapshot>),
     Upstream(UpstreamBatch),
+    GraphiteHealth(HealthBatch),
+    Github(GithubBatch),
     Failed(Arc<str>),
 }
 
@@ -40,6 +46,8 @@ pub struct RefreshHandle {
     workers: Vec<JoinHandle<()>>,
     diff_state: Arc<(Mutex<DiffCoordinator>, Condvar)>,
     upstream: UpstreamCoordinator,
+    graphite_health: HealthCoordinator,
+    github: GithubCoordinator,
     shutdown: Arc<AtomicBool>,
     watcher: Option<watcher::RepositoryWatcher>,
 }
@@ -71,7 +79,8 @@ struct DiffCoordinator {
 impl RefreshHandle {
     pub fn start(start_dir: PathBuf) -> anyhow::Result<Self> {
         let adapter = GitAdapter::discover(&start_dir)?;
-        let initial = adapter.inventory()?;
+        let git_dir = adapter.git_dir().to_path_buf();
+        let common_dir = adapter.common_dir().to_path_buf();
         let (request_send, request_receive) = mpsc::sync_channel(1);
         let pending_epoch = Arc::new(AtomicU64::new(0));
         let requester = RefreshRequester {
@@ -84,6 +93,8 @@ impl RefreshHandle {
         let shutdown = Arc::new(AtomicBool::new(false));
         let latest_generation = Arc::new(AtomicU64::new(0));
         let upstream = UpstreamCoordinator::start(adapter.clone())?;
+        let graphite_health = HealthCoordinator::start(adapter.clone())?;
+        let github = GithubCoordinator::start(&start_dir)?;
         let structural_worker = thread::Builder::new()
             .name("stackmap-refresh".into())
             .spawn({
@@ -102,27 +113,35 @@ impl RefreshHandle {
                         if request_epoch == 0 {
                             continue;
                         }
-                        match builder.build() {
-                            Ok(structural) => {
-                                latest_generation.store(structural.generation, Ordering::Release);
-                                push_event(
+                        match builder.build_candidate() {
+                            Ok(candidate) => {
+                                publish_structural(
                                     &events,
-                                    RefreshEvent::Structural {
-                                        request_epoch,
-                                        snapshot: structural.clone(),
-                                    },
+                                    &diff_state,
+                                    &latest_generation,
+                                    request_epoch,
+                                    candidate.snapshot.clone(),
                                 );
-                                let (state, wake) = &*diff_state;
-                                match state.lock() {
-                                    Ok(mut state) => {
-                                        state.latest = Some(structural);
-                                        wake.notify_one();
-                                    }
-                                    Err(_) => push_event(
+                                match builder.verify_candidate(&candidate) {
+                                    Ok(true) => {}
+                                    Ok(false) => match builder.build() {
+                                        Ok(corrected) => publish_structural(
+                                            &events,
+                                            &diff_state,
+                                            &latest_generation,
+                                            request_epoch,
+                                            corrected,
+                                        ),
+                                        Err(error) => push_event(
+                                            &events,
+                                            RefreshEvent::Failed(Arc::from(error.to_string())),
+                                        ),
+                                    },
+                                    Err(error) => push_event(
                                         &events,
-                                        RefreshEvent::Failed(Arc::from(
-                                            "diff coordinator stopped after internal state failure",
-                                        )),
+                                        RefreshEvent::Failed(Arc::from(format!(
+                                            "could not verify repository snapshot: {error}"
+                                        ))),
                                     ),
                                 }
                             }
@@ -199,15 +218,15 @@ impl RefreshHandle {
                     }
                 }
             })?;
-        let watcher =
-            watcher::watch_repository(&initial.git_dir, &initial.common_dir, requester.clone())
-                .ok();
+        let watcher = watcher::watch_repository(&git_dir, &common_dir, requester.clone()).ok();
         let handle = Self {
             requester,
             events,
             workers: vec![structural_worker, diff_worker],
             diff_state,
             upstream,
+            graphite_health,
+            github,
             shutdown,
             watcher,
         };
@@ -225,10 +244,54 @@ impl RefreshHandle {
             .ok()?
             .pop_front()
             .or_else(|| self.upstream.try_result().map(RefreshEvent::Upstream))
+            .or_else(|| {
+                self.graphite_health
+                    .try_result()
+                    .map(RefreshEvent::GraphiteHealth)
+            })
+            .or_else(|| self.github.try_result().map(RefreshEvent::Github))
     }
 
     pub fn request_upstream(&self, command: UpstreamCommand) {
         self.upstream.submit(command);
+    }
+
+    pub fn request_graphite_health(&self, command: HealthCommand) {
+        self.graphite_health.submit(command);
+    }
+
+    pub fn request_github(&self, command: GithubCommand) {
+        self.github.submit(command);
+    }
+}
+
+fn publish_structural(
+    events: &Mutex<VecDeque<RefreshEvent>>,
+    diff_state: &(Mutex<DiffCoordinator>, Condvar),
+    latest_generation: &AtomicU64,
+    request_epoch: u64,
+    snapshot: Arc<RepositorySnapshot>,
+) {
+    latest_generation.store(snapshot.generation, Ordering::Release);
+    push_event(
+        events,
+        RefreshEvent::Structural {
+            request_epoch,
+            snapshot: snapshot.clone(),
+        },
+    );
+    let (state, wake) = diff_state;
+    match state.lock() {
+        Ok(mut state) => {
+            state.latest = Some(snapshot);
+            wake.notify_one();
+        }
+        Err(_) => push_event(
+            events,
+            RefreshEvent::Failed(Arc::from(
+                "diff coordinator stopped after internal state failure",
+            )),
+        ),
     }
 }
 

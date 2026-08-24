@@ -6,7 +6,9 @@ use crate::adapters::github::PrMatch;
 use crate::app::{Action, App, ConfigTarget, Overlay};
 use crate::events::Key;
 use crate::model::topology::ArchiveMode;
-use crate::model::{Branch, BranchId, GraphiteProvenance, PullRequest, PullRequestStatus};
+use crate::model::{
+    Branch, BranchId, GraphiteProvenance, PullRequest, PullRequestMatch, PullRequestStatus,
+};
 
 fn pull_request(number: u64) -> PullRequest {
     PullRequest {
@@ -14,13 +16,16 @@ fn pull_request(number: u64) -> PullRequest {
         title: Arc::from(format!("PR {number}")),
         url: Arc::from(format!("https://example.invalid/pr/{number}")),
         status: PullRequestStatus::Open,
+        head_oid: None,
+        match_quality: PullRequestMatch::StaleTip,
     }
 }
 
 fn pr_match(branch: &str, oid: &str, number: u64) -> PrMatch {
     PrMatch {
         branch: BranchId::new(branch),
-        oid: Arc::from(oid),
+        head_oid: Some(Arc::from(oid)),
+        updated_at: Arc::from("2026-08-18T00:00:00Z"),
         pull_request: pull_request(number),
     }
 }
@@ -266,6 +271,8 @@ fn uppercase_o_deduplicates_duplicate_pull_request_urls() {
                     title: Arc::from("Shared"),
                     url: shared_url.clone(),
                     status: PullRequestStatus::Open,
+                    head_oid: None,
+                    match_quality: PullRequestMatch::StaleTip,
                 });
             }
             updated

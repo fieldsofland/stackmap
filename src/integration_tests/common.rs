@@ -49,6 +49,7 @@ pub fn branch(name: &str, parent: Option<&str>, root: &str, current: bool) -> Br
         stack_root: BranchId::new(root.to_owned()),
         trunk: None,
         graphite: GraphiteProvenance::DefinitelyUntracked,
+        graphite_health: crate::model::GraphiteHealth::NotTracked,
         committed_at: 1_700_000_000,
         current,
         dirty: false,
@@ -57,6 +58,7 @@ pub fn branch(name: &str, parent: Option<&str>, root: &str, current: bool) -> Br
         remote_ref: RemoteRefEvidence::NotRequested,
         diff: DiffState::Loading,
         pr: None,
+        pr_lookup: crate::model::PullRequestLookup::NotRequested,
     }
 }
 

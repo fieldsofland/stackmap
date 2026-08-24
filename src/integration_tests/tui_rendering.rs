@@ -10,7 +10,7 @@ use crate::model::{
     BranchId, ConfiguredUpstream, DiffStat, DiffState, PullRequest, PullRequestStatus,
     RemoteRefEvidence,
 };
-use crate::ui::layout::{ColumnRange, RenderGeometry, WidthMode, areas};
+use crate::ui::layout::{RenderGeometry, WidthMode, areas};
 use crate::ui::theme::{
     TRUNK_COLOR_HEX, current_background, selected_background, stack_color, trunk_color,
 };
@@ -46,12 +46,15 @@ fn visual_section_snapshot() -> Arc<crate::model::RepositorySnapshot> {
     let mut main = common::branch("main", None, "main", true);
     main.trunk = Some(BranchId::new("main"));
     main.graphite = crate::model::GraphiteProvenance::Tracked;
+    main.graphite_health = crate::model::GraphiteHealth::Healthy;
     let mut root = common::branch("feature-root", None, "feature-root", false);
     root.trunk = Some(BranchId::new("main"));
     root.graphite = crate::model::GraphiteProvenance::Tracked;
+    root.graphite_health = crate::model::GraphiteHealth::Healthy;
     let mut tip = common::branch("feature-tip", Some("feature-root"), "feature-root", false);
     tip.trunk = Some(BranchId::new("main"));
     tip.graphite = crate::model::GraphiteProvenance::Tracked;
+    tip.graphite_health = crate::model::GraphiteHealth::Healthy;
     let mut snapshot = (*common::snapshot(vec![main, root, tip])).clone();
     snapshot.configured_trunks = Arc::from([BranchId::new("main")]);
     snapshot.trunks = snapshot.configured_trunks.clone();
@@ -59,6 +62,32 @@ fn visual_section_snapshot() -> Arc<crate::model::RepositorySnapshot> {
         (
             BranchId::new("main"),
             Arc::from([BranchId::new("feature-root")]),
+        ),
+        (
+            BranchId::new("feature-root"),
+            Arc::from([BranchId::new("feature-tip")]),
+        ),
+    ]);
+    Arc::new(snapshot)
+}
+
+fn move_preview_snapshot() -> Arc<crate::model::RepositorySnapshot> {
+    let mut snapshot = (*visual_section_snapshot()).clone();
+    let mut target = common::branch("feature-other", Some("main"), "feature-other", false);
+    target.trunk = Some(BranchId::new("main"));
+    target.graphite = crate::model::GraphiteProvenance::Tracked;
+    target.graphite_health = crate::model::GraphiteHealth::Healthy;
+    let mut branches = snapshot.branches.to_vec();
+    branches.push(target);
+    snapshot.branch_index = crate::model::RepositorySnapshot::index_branches(&branches);
+    snapshot.branches = Arc::from(branches);
+    snapshot.graphite_children = Arc::from([
+        (
+            BranchId::new("main"),
+            Arc::from([
+                BranchId::new("feature-root"),
+                BranchId::new("feature-other"),
+            ]),
         ),
         (
             BranchId::new("feature-root"),
@@ -181,6 +210,68 @@ fn inline_section_editor_renders_cursor_once_and_footer_only_instructions() {
     assert!(joined.contains("Enter save"));
     assert!(app.selected_branch().is_none());
     assert!(line_with(&lines, "Draft jK").1.contains('›'));
+
+    app.handle_key(Key::ClearNameDraft);
+    terminal
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let cleared = rendered_lines(&terminal).join("\n");
+    assert!(!cleared.contains("Draft jK"));
+    assert!(cleared.contains('▏'));
+}
+
+#[test]
+fn selected_section_name_uses_a_dark_tint_of_its_effective_color() {
+    let mut app = App::default();
+    app.apply_snapshot(visual_section_snapshot());
+    add_named_visual_section(&mut app, "Feature area");
+    let anchor = BranchId::new("feature-root");
+    app.selected_label = Some(crate::app::ConfigTarget::VisualSection(anchor));
+    let repository_id = app.snapshot.as_ref().unwrap().repository_id.as_ref();
+    let effective_color = stack_color(repository_id, &BranchId::new("feature-root"), &app.config);
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let lines = rendered_lines(&terminal);
+    let (row, line) = line_with(&lines, "Feature area");
+    let column = char_column(line, "Feature area").unwrap() as u16;
+    let expected_background = if effective_color == Color::Reset {
+        selected_background()
+    } else {
+        current_background(effective_color)
+    };
+    assert_eq!(
+        terminal.backend().buffer()[(column, row as u16)].bg,
+        expected_background
+    );
+    assert_eq!(
+        terminal.backend().buffer()[(column, row as u16)].fg,
+        Color::White
+    );
+}
+
+#[test]
+fn move_preview_is_explicit_and_tab_updates_its_mode() {
+    let mut app = App::default();
+    app.apply_snapshot(move_preview_snapshot());
+    app.selected = Some(BranchId::new("feature-root"));
+    app.handle_key(Key::Character('m'));
+    let mut terminal = Terminal::new(TestBackend::new(120, 12)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    assert!(
+        rendered_lines(&terminal)
+            .join("\n")
+            .contains("MOVE PREVIEW")
+    );
+    app.handle_key(Key::Tab);
+    terminal
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    assert!(rendered_lines(&terminal).join("\n").contains("branch only"));
 }
 
 #[test]
@@ -317,7 +408,7 @@ fn render_geometry_is_left_anchored_and_selection_independent() {
         LanePitch::Fixed(6),
         30,
     );
-    assert_eq!(clamped.effective_pitch, 6);
+    assert_eq!(clamped.effective_pitch, 1);
     assert!(clamped.last_visible_lane < 29);
     assert!(clamped.name_width(29) >= 8);
 }
@@ -379,10 +470,10 @@ fn trunk_uses_reserved_bold_hue_and_checked_out_marker() {
         if accent == Color::Reset {
             selected_background()
         } else {
-            accent
+            current_background(accent)
         }
     );
-    assert_eq!(marker.fg, Color::Black);
+    assert_eq!(marker.fg, Color::White);
     assert!(marker.modifier.contains(Modifier::BOLD));
 
     app.config
@@ -426,7 +517,7 @@ fn selected_rows_use_dark_content_and_current_rows_use_tinted_stack_fill() {
     let selected_accent = if selected_accent == Color::Reset {
         selected_background()
     } else {
-        selected_accent
+        current_background(selected_accent)
     };
     for x in 0..80 {
         assert_eq!(
@@ -447,102 +538,23 @@ fn selected_rows_use_dark_content_and_current_rows_use_tinted_stack_fill() {
     assert!(
         selected_cells
             .clone()
-            .any(|cell| cell.symbol() == "+" && cell.fg == Color::Black)
+            .any(|cell| cell.symbol() == "+" && cell.fg == Color::White)
     );
-    assert!(selected_cells.any(|cell| cell.symbol() == "-" && cell.fg == Color::Black));
+    assert!(selected_cells.any(|cell| cell.symbol() == "-" && cell.fg == Color::White));
     let (_, selected_line) = line_with(&lines, "selected");
     let selected_name_x = char_column(selected_line, "selected").unwrap();
     assert_eq!(
         terminal.backend().buffer()[(selected_name_x as u16, selected_y as u16)].fg,
-        Color::Black
-    );
-}
-
-fn sample_pull_request(status: PullRequestStatus) -> PullRequest {
-    PullRequest {
-        number: 42,
-        title: Arc::from("Feature"),
-        url: Arc::from("https://example.invalid/42"),
-        status,
-    }
-}
-
-fn render_branch_pull_request(
-    branch_name: &str,
-    status: PullRequestStatus,
-    sibling_names: &[&str],
-    selected_name: Option<&str>,
-) -> Terminal<TestBackend> {
-    let mut primary = common::branch(branch_name, None, branch_name, false);
-    primary.pr = Some(sample_pull_request(status));
-    let mut branches = vec![primary];
-    for sibling_name in sibling_names {
-        branches.push(common::branch(sibling_name, None, sibling_name, false));
-    }
-    let mut app = App::default();
-    app.apply_snapshot(common::snapshot(branches));
-    if let Some(name) = selected_name {
-        app.selected = Some(BranchId::new(name));
-    }
-    let mut terminal = Terminal::new(TestBackend::new(100, 8)).unwrap();
-    terminal
-        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
-        .unwrap();
-    terminal
-}
-
-#[test]
-fn approved_pull_request_checkmark_uses_green() {
-    let terminal =
-        render_branch_pull_request("feature-approved", PullRequestStatus::Approved, &[], None);
-    let check = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .find(|cell| cell.symbol() == "✓")
-        .expect("approved checkmark");
-    assert_eq!(check.fg, Color::Green);
-}
-
-#[test]
-fn open_pull_request_has_no_green_checkmark() {
-    let terminal = render_branch_pull_request("feature-open", PullRequestStatus::Open, &[], None);
-    let rendered = rendered_lines(&terminal).join("\n");
-    assert!(rendered.contains("#42"), "{rendered}");
-    assert!(
-        !terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .any(|cell| cell.symbol() == "✓" && cell.fg == Color::Green)
+        Color::White
     );
 }
 
 #[test]
-fn approved_pull_request_checkmark_stays_green_when_selected() {
-    let terminal = render_branch_pull_request(
-        "approved",
-        PullRequestStatus::Approved,
-        &["selected"],
-        Some("approved"),
-    );
-    let lines = rendered_lines(&terminal);
-    let (approved_y, _) = line_with(&lines, "approved");
-    let check = (0..100)
-        .map(|x| &terminal.backend().buffer()[(x, approved_y as u16)])
-        .find(|cell| cell.symbol() == "✓")
-        .expect("approved checkmark on selected row");
-    assert_eq!(check.fg, Color::Green);
-}
-
-#[test]
-fn pull_request_status_replaces_the_number_for_terminal_states_and_approval() {
-    for (status, expected) in [
-        (PullRequestStatus::Approved, "✓#42"),
-        (PullRequestStatus::Closed, "Clsd"),
-        (PullRequestStatus::Merged, "Mrgd"),
+fn pull_request_status_uses_compact_lifecycle_symbols_and_colors() {
+    for (status, expected, color) in [
+        (PullRequestStatus::Approved, "✓ #42", Color::Green),
+        (PullRequestStatus::Merged, "✓ #42", Color::Green),
+        (PullRequestStatus::Closed, "X #42", Color::Red),
     ] {
         let mut branch = common::branch("feature", None, "feature", false);
         branch.pr = Some(PullRequest {
@@ -550,6 +562,8 @@ fn pull_request_status_replaces_the_number_for_terminal_states_and_approval() {
             title: Arc::from("Feature"),
             url: Arc::from("https://example.invalid/42"),
             status,
+            head_oid: Some(Arc::from("oid-feature")),
+            match_quality: crate::model::PullRequestMatch::ExactTip,
         });
         let mut app = App::default();
         app.apply_snapshot(common::snapshot(vec![branch]));
@@ -557,50 +571,45 @@ fn pull_request_status_replaces_the_number_for_terminal_states_and_approval() {
         terminal
             .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
             .unwrap();
-        assert!(
-            rendered_lines(&terminal)
-                .iter()
-                .any(|line| line.contains(expected))
-        );
+        let rendered = rendered_lines(&terminal);
+        let (y, line) = line_with(&rendered, "feature");
+        let x = char_column(line, expected).expect("status text") as u16;
+        assert_eq!(terminal.backend().buffer()[(x, y as u16)].fg, color);
     }
 }
 
 #[test]
-fn diverged_remote_and_approved_pr_stay_in_separate_metadata_columns() {
-    let mut branch = common::branch("feature-x", None, "feature-x", false);
-    branch.configured_upstream = ConfiguredUpstream::Diverged {
-        reference: Arc::from("origin/feature-x"),
-        ahead: 95,
-        behind: 2,
+fn pull_request_status_replaces_local_or_pushed_state() {
+    let mut branch = common::branch("feature", None, "feature", false);
+    branch.configured_upstream = ConfiguredUpstream::Ahead {
+        reference: Arc::from("origin/feature"),
+        ahead: 1,
     };
     branch.pr = Some(PullRequest {
-        number: 4593,
+        number: 42,
         title: Arc::from("Feature"),
-        url: Arc::from("https://example.invalid/4593"),
-        status: PullRequestStatus::Approved,
+        url: Arc::from("https://example.invalid/42"),
+        status: PullRequestStatus::Open,
+        head_oid: Some(Arc::from("older-tip")),
+        match_quality: crate::model::PullRequestMatch::StaleTip,
     });
     let mut app = App::default();
     app.apply_snapshot(common::snapshot(vec![branch]));
-    let mut terminal = Terminal::new(TestBackend::new(100, 8)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
     terminal
         .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
-    let geometry = RenderGeometry::new(100, WidthMode::Medium, LanePitch::Auto, 1);
-    let remote = geometry.remote.expect("remote column");
-    let pull_request = geometry.pr.expect("PR column");
-    let lines = rendered_lines(&terminal);
-    let (_, branch_line) = line_with(&lines, "feature-x");
-    let remote_text = metadata_column_text(branch_line, remote);
-    let pull_request_text = metadata_column_text(branch_line, pull_request);
-    assert!(remote_text.contains("div"));
-    assert!(pull_request_text.contains("✓#4593"));
-    assert!(!pull_request_text.contains("div"));
-    assert!(!branch_line.contains("divApproved"));
-    assert!(!branch_line.contains("div✓"));
-}
-
-fn metadata_column_text(line: &str, range: ColumnRange) -> String {
-    line.chars().skip(range.x).take(range.width).collect()
+    let rendered = rendered_lines(&terminal);
+    let (_, line) = line_with(&rendered, "feature");
+    assert!(line.contains("#42"), "missing PR number in {line:?}");
+    assert!(
+        !line.contains("local"),
+        "PR did not replace local: {line:?}"
+    );
+    assert!(
+        !line.contains("pushed"),
+        "PR did not replace pushed: {line:?}"
+    );
 }
 
 #[test]
@@ -619,7 +628,7 @@ fn named_stack_renders_a_white_label_with_a_spacer_above_its_head() {
     app.handle_key(Key::Enter);
     app.selected_label = None;
 
-    let mut terminal = Terminal::new(TestBackend::new(90, 10)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
     terminal
         .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
@@ -679,6 +688,11 @@ fn footer_labels_a_as_view_archive() {
         rendered_lines(&terminal)
             .iter()
             .any(|line| line.contains("a View Archive"))
+    );
+    assert!(
+        rendered_lines(&terminal)
+            .iter()
+            .any(|line| line.contains("s status  S spacing"))
     );
 }
 
@@ -773,7 +787,13 @@ fn stack_local_name_columns_are_stable_across_selection_and_child_lanes() {
             })
             .collect();
         assert_eq!(columns[0], columns[1], "same stack at width {width}");
-        let expected_pitch = if width == 40 { 2 } else { 4 };
+        let expected_pitch = RenderGeometry::new(
+            width,
+            crate::ui::layout::width_mode(width),
+            LanePitch::Auto,
+            app.projection.lane_count,
+        )
+        .effective_pitch;
         assert_eq!(
             columns[2] - columns[1],
             expected_pitch,
@@ -1049,6 +1069,29 @@ fn checkout_confirmation_is_a_visible_popup_at_minimum_width() {
 }
 
 #[test]
+fn linked_worktree_checkout_confirms_a_clean_transfer() {
+    let mut app = App::default();
+    let mut feature = common::branch("feature", None, "feature", false);
+    feature.worktree = Some(std::path::PathBuf::from("/tmp/feature-worktree"));
+    app.apply_snapshot(common::snapshot(vec![
+        common::branch("main", None, "main", true),
+        feature,
+    ]));
+    app.selected = Some(BranchId::new("feature"));
+    assert_eq!(app.handle_key(Key::Enter), crate::app::Action::None);
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let rendered = rendered_lines(&terminal).join("\n");
+    assert!(rendered.contains("Move worktree"));
+    assert!(rendered.contains("Move this branch to the primary checkout?"));
+    assert!(rendered.contains("The linked worktree must be clean."));
+    assert!(rendered.contains("Enter move · Esc cancel"));
+}
+
+#[test]
 fn too_narrow_terminal_has_explicit_state() {
     let mut app = App::default();
     app.apply_snapshot(common::snapshot(vec![common::branch(
@@ -1086,6 +1129,25 @@ fn archive_mode_is_unmistakably_framed_and_empty_state_explains_return() {
     assert!(rendered.contains("No archived branches · press a to return to Active"));
     assert!(rendered.contains("x restore"));
     assert!(rendered.contains("X delete"));
+}
+
+#[test]
+fn clipboard_scope_feedback_is_rendered() {
+    let mut app = App::default();
+    app.apply_snapshot(common::snapshot(vec![
+        common::branch("main", None, "main", true),
+        common::branch("base", None, "base", false),
+    ]));
+    app.message = Some(Arc::from("3 stack branches copied"));
+    let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    assert!(
+        rendered_lines(&terminal)
+            .join("\n")
+            .contains("3 stack branches copied")
+    );
 }
 
 #[test]
@@ -1155,52 +1217,160 @@ fn forty_column_terminal_renders_branches() {
     );
     assert!(geometry.time.is_none());
     assert!(geometry.remote.is_none());
-    assert!(geometry.pr.is_none());
+    assert_eq!(geometry.pr.expect("compact status").width, 8);
+    assert!(geometry.stack_health.is_none());
 }
 
 #[test]
 fn metadata_columns_leave_time_diff_and_pr_edge_gutters() {
     let geometry = RenderGeometry::new(100, WidthMode::Medium, LanePitch::Auto, 2);
     let time = geometry.time.expect("time column");
-    let remote = geometry.remote.expect("remote column");
-    let pr = geometry.pr.expect("PR column");
+    let status = geometry.pr.expect("status column");
 
-    assert_eq!(geometry.diff.x, time.x + time.width + 1);
+    assert_eq!(geometry.diff.x, time.x + time.width + 2);
     assert_eq!(
         geometry.worktree.x,
-        geometry.diff.x + geometry.diff.width + 1
+        geometry.diff.x + geometry.diff.width + 2
     );
-    assert_eq!(remote.x, geometry.worktree.x + geometry.worktree.width);
-    assert_eq!(pr.x, remote.x + remote.width + 1);
-    assert_eq!(pr.x + pr.width + 1, geometry.width);
+    assert_eq!(status.x, geometry.worktree.x + geometry.worktree.width + 2);
+    assert_eq!(status.x + status.width + 1, geometry.width);
+    assert!(geometry.remote.is_none());
+    assert!(geometry.stack_health.is_none());
 }
 
 #[test]
-fn main_page_remote_column_distinguishes_all_safety_states() {
+fn right_status_column_ignores_graphite_health() {
+    let mut feature = common::branch("feature", None, "feature", false);
+    feature.diff_parent = Some(BranchId::new("main"));
+    feature.graphite = crate::model::GraphiteProvenance::Tracked;
+    feature.trunk = Some(BranchId::new("main"));
+    feature.graphite_health = crate::model::GraphiteHealth::NeedsRestack {
+        recorded_parent: BranchId::new("main"),
+    };
+    let mut app = App::default();
+    let mut snapshot =
+        (*common::snapshot(vec![common::branch("main", None, "main", true), feature])).clone();
+    snapshot.graphite_children =
+        Arc::from([(BranchId::new("main"), Arc::from([BranchId::new("feature")]))]);
+    app.apply_snapshot(Arc::new(snapshot));
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 10)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    let geometry = RenderGeometry::new(140, WidthMode::Wide, LanePitch::Auto, 2);
+    let lines = rendered_lines(&terminal);
+    let (_, line) = line_with(&lines, "feature");
+
+    let status = geometry.pr.expect("status column");
+    assert_eq!(status.width, 12);
+    assert_eq!(
+        char_column(line, "local"),
+        Some(status.x + status.width - 5)
+    );
+    assert!(!line.contains("restack"));
+}
+
+#[test]
+fn actionable_status_tokens_follow_responsive_priority_and_survive_no_color() {
+    for width in [40, 64, 90, 99, 100, 120, 180] {
+        let mut feature = common::branch("feature", None, "feature", false);
+        feature.configured_upstream = ConfiguredUpstream::Equal {
+            reference: Arc::from("origin/feature"),
+        };
+        feature.pr = Some(PullRequest {
+            number: 42,
+            title: Arc::from("Feature"),
+            url: Arc::from("https://example.invalid/42"),
+            status: PullRequestStatus::Open,
+            head_oid: Some(feature.oid.clone()),
+            match_quality: crate::model::PullRequestMatch::ExactTip,
+        });
+        feature.graphite_health = crate::model::GraphiteHealth::NeedsRestack {
+            recorded_parent: BranchId::new("main"),
+        };
+        let mut app = App::default();
+        app.apply_snapshot(common::snapshot(vec![feature]));
+        let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+        crate::ui::theme::with_no_color(|| {
+            terminal
+                .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
+                .unwrap();
+        });
+        let lines = rendered_lines(&terminal);
+        let (_, line) = line_with(&lines, "feature");
+        assert!(line.contains("#42"), "width {width}: {line}");
+        assert!(!line.contains("pushed"), "width {width}: {line}");
+        assert!(!line.contains('↻'), "width {width}: {line}");
+        assert_eq!(line.chars().count(), width as usize);
+        if matches!(width, 99 | 100) {
+            app.status_visible = false;
+            let mut hidden_terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+            crate::ui::theme::with_no_color(|| {
+                hidden_terminal
+                    .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
+                    .unwrap();
+            });
+            let hidden_lines = rendered_lines(&hidden_terminal);
+            let (_, hidden_line) = line_with(&hidden_lines, "feature");
+            assert_eq!(hidden_line.chars().count(), width as usize);
+            assert!(!hidden_line.contains("#42"), "width {width}: {hidden_line}");
+            assert!(
+                !hidden_line.contains("pushed"),
+                "width {width}: {hidden_line}"
+            );
+            assert!(!hidden_line.contains('↻'), "width {width}: {hidden_line}");
+        }
+    }
+}
+
+#[test]
+fn hidden_status_geometry_reclaims_all_status_ranges_and_gutters() {
+    for width in [40, 64, 90, 99, 100, 120, 180] {
+        let mode = crate::ui::layout::width_mode(width);
+        let shown = RenderGeometry::new_with_status(width, mode, LanePitch::Auto, 3, true);
+        let hidden = RenderGeometry::new_with_status(width, mode, LanePitch::Auto, 3, false);
+        assert!(hidden.pr.is_none());
+        assert!(hidden.remote.is_none());
+        assert!(hidden.stack_health.is_none());
+        assert!(hidden.metadata_start > shown.metadata_start);
+        assert!(hidden.name_width(0) > shown.name_width(0));
+        let status = [shown.pr, shown.remote, shown.stack_health]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert!(
+            status
+                .windows(2)
+                .all(|pair| pair[0].x + pair[0].width <= pair[1].x)
+        );
+        assert!(
+            status
+                .iter()
+                .all(|range| range.x + range.width <= usize::from(width))
+        );
+    }
+}
+
+#[test]
+fn main_page_status_collapses_non_pushed_states_to_local() {
     let mut pushed = common::branch("pushed", None, "pushed", false);
     pushed.configured_upstream = ConfiguredUpstream::Equal {
         reference: Arc::from("origin/pushed"),
+    };
+    let mut exact_remote = common::branch("exact-remote", None, "exact-remote", false);
+    exact_remote.remote_ref = RemoteRefEvidence::ExactTip {
+        reference: Arc::from("origin/exact-remote"),
+        source_token: 2,
+        checked_at: UNIX_EPOCH,
     };
     let mut ahead = common::branch("ahead", None, "ahead", false);
     ahead.configured_upstream = ConfiguredUpstream::Ahead {
         reference: Arc::from("origin/ahead"),
         ahead: 2,
     };
-    let mut behind = common::branch("behind", None, "behind", false);
-    behind.configured_upstream = ConfiguredUpstream::Behind {
-        reference: Arc::from("origin/behind"),
-        behind: 3,
-    };
-    let mut diverged = common::branch("diverged", None, "diverged", false);
-    diverged.configured_upstream = ConfiguredUpstream::Diverged {
-        reference: Arc::from("origin/diverged"),
-        ahead: 4,
-        behind: 5,
-    };
-    let mut gone = common::branch("gone", None, "gone", false);
-    gone.configured_upstream = ConfiguredUpstream::Gone {
-        reference: Arc::from("origin/gone"),
-    };
+    let mut checking = common::branch("checking", None, "checking", false);
+    checking.remote_ref = RemoteRefEvidence::Checking;
     let mut no_remote = common::branch("no-remote", None, "no-remote", false);
     no_remote.remote_ref = RemoteRefEvidence::LocalOnly {
         source_token: 1,
@@ -1213,7 +1383,12 @@ fn main_page_remote_column_distinguishes_all_safety_states() {
     };
     let mut app = App::default();
     app.apply_snapshot(common::snapshot(vec![
-        pushed, ahead, behind, diverged, gone, no_remote, unknown,
+        pushed,
+        exact_remote,
+        ahead,
+        checking,
+        no_remote,
+        unknown,
     ]));
 
     let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
@@ -1221,20 +1396,17 @@ fn main_page_remote_column_distinguishes_all_safety_states() {
         .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let rendered = rendered_lines(&terminal).join("\n");
-    for expected in [
-        "✓ pushed",
-        "↑2 ahead",
-        "↓3 behind",
-        "↕4/5 div",
-        "× gone",
-        "○ no remote",
-        "? remote",
-    ] {
+    for expected in ["pushed", "local"] {
         assert!(
             rendered.contains(expected),
             "missing {expected:?}:\n{rendered}"
         );
     }
+    assert!(!rendered.contains("↑2 ahead"));
+    assert!(!rendered.contains("not pushed"));
+    let lines = rendered_lines(&terminal);
+    let (_, exact_remote) = line_with(&lines, "exact-remote");
+    assert!(exact_remote.contains("pushed"));
 }
 
 #[test]
@@ -1256,7 +1428,7 @@ fn named_stack_renders_summary_then_a_dedicated_spacer() {
         "feature-root",
     )));
 
-    let width = 100;
+    let width = 120;
     let backend = TestBackend::new(width, 14);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
@@ -1542,7 +1714,7 @@ fn nested_side_stacks_clamp_to_visible_graph_edge_with_stable_overflow_cue() {
         app.lane_pitch,
         app.projection.lane_count,
     );
-    assert_eq!(expanded.effective_pitch, 6);
+    assert_eq!(expanded.effective_pitch, 1);
     assert!(expanded.name_width(logical_lane) >= 8);
     app.handle_key(crate::events::Key::Character('0'));
 
@@ -1574,7 +1746,7 @@ fn nested_side_stacks_clamp_to_visible_graph_edge_with_stable_overflow_cue() {
 }
 
 #[test]
-fn forty_column_archive_row_composes_worktree_divergence_and_containment() {
+fn forty_column_archive_row_composes_worktree_and_unified_status() {
     let mut hidden = common::branch("useful-hidden-name", None, "useful-hidden-name", false);
     hidden.worktree = Some(PathBuf::from("/tmp/worktrees/hidden-worktree"));
     hidden.configured_upstream = ConfiguredUpstream::Diverged {
@@ -1603,7 +1775,8 @@ fn forty_column_archive_row_composes_worktree_divergence_and_containment() {
     let rendered = rendered_lines(&terminal).join("\n");
     assert!(rendered.contains("useful-hidden"));
     assert!(rendered.contains('⎇'));
-    assert!(rendered.contains("↕2/3"));
+    assert!(rendered.contains("local"));
+    assert!(!rendered.contains("!DIV"));
     assert!(rendered.contains("ARCHIVE"));
     assert!(rendered.contains("000000000000002c"));
 
@@ -1613,7 +1786,8 @@ fn forty_column_archive_row_composes_worktree_divergence_and_containment() {
     let lines = rendered_lines(&wide);
     let (_, branch_line) = line_with(&lines, "useful-hidden-name");
     assert!(branch_line.contains('⎇'));
-    assert!(branch_line.contains("↕2/3 div"));
+    assert!(branch_line.contains("local"));
+    assert!(!branch_line.contains("diverged"));
 }
 
 #[test]
@@ -1673,7 +1847,7 @@ fn unavailable_archive_evidence_never_renders_as_local_only() {
         .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let rendered = rendered_lines(&terminal).join("\n");
-    assert!(rendered.contains("? remote"));
+    assert!(rendered.contains('?'));
     assert!(rendered.contains("unavailable"));
     assert!(!rendered.contains("local only"));
 }
@@ -1685,20 +1859,23 @@ fn help_documents_archive_range_and_picker_keys() {
         "main", None, "main", true,
     )]));
     app.overlay = crate::app::Overlay::Help;
-    let backend = TestBackend::new(90, 48);
+    let backend = TestBackend::new(90, 45);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
-    let rendered = rendered_lines(&terminal).join("\n");
+    let rendered: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
     assert!(rendered.contains("archive / restore selected local branch"));
     assert!(rendered.contains("guarded delete exact local branch"));
     assert!(rendered.contains("preview contiguous archive/restore range"));
     assert!(rendered.contains("order picker"));
     assert!(rendered.contains("color picker"));
-    assert!(rendered.contains("open selected PR / all stack PRs / copy URL"));
-    assert!(rendered.contains("GitHub:"));
-    assert!(rendered.contains("Graphite:"));
     assert!(rendered.contains("› selected"));
     assert!(rendered.contains("○ branch"));
     assert!(rendered.contains("● current"));
@@ -1706,50 +1883,10 @@ fn help_documents_archive_range_and_picker_keys() {
     assert!(rendered.contains("■ range"));
     assert!(rendered.contains("* dirty"));
     assert!(rendered.contains("⎇ worktree"));
-}
-
-#[test]
-fn help_shows_open_pr_keys_and_github_status_on_short_terminal() {
-    let mut app = App::default();
-    app.apply_snapshot(common::snapshot(vec![common::branch(
-        "main", None, "main", true,
-    )]));
-    app.overlay = Overlay::Help;
-    let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
-    terminal
-        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
-        .unwrap();
-    let rendered = rendered_lines(&terminal).join("\n");
-    assert!(rendered.contains("open selected PR / all stack PRs / copy URL"));
-    assert!(rendered.contains("GitHub:"));
-}
-
-#[test]
-fn footer_shows_open_pr_keys_when_selected_branch_has_pull_request() {
-    let mut app = App::default();
-    let snapshot = common::snapshot(vec![common::branch(
-        "feature/stack-map",
-        None,
-        "feature/stack-map",
-        true,
-    )]);
-    app.apply_snapshot(snapshot);
-    app.apply_prs(vec![crate::adapters::github::PrMatch {
-        branch: BranchId::new("feature/stack-map"),
-        oid: Arc::from("remote-oid"),
-        pull_request: PullRequest {
-            number: 42,
-            title: Arc::from("PR"),
-            url: Arc::from("https://example.invalid/pr/42"),
-            status: PullRequestStatus::Open,
-        },
-    }]);
-    let mut terminal = Terminal::new(TestBackend::new(160, 10)).unwrap();
-    terminal
-        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
-        .unwrap();
-    let rendered = rendered_lines(&terminal).join("\n");
-    assert!(rendered.contains("o/O/y PR"));
+    assert!(rendered.contains("toggle status / stack spacing"));
+    assert!(rendered.contains("copy branch / section / stack"));
+    assert!(rendered.contains("edit deepest section / real stack name"));
+    assert!(rendered.contains("clear complete name draft"));
 }
 
 #[test]

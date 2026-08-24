@@ -11,10 +11,7 @@ use crate::model::topology::{
     ArchiveMode, ConnectorRow, DividerRow, Emphasis, ProjectedRow, ProjectionEntry, StackLabelRow,
     VisualSectionDividerRow, VisualSectionLabelRow,
 };
-use crate::model::{
-    Branch, BranchId, ConfiguredUpstream, DiffState, PullRequest, PullRequestStatus,
-    RemoteRefEvidence,
-};
+use crate::model::{Branch, BranchId, ConfiguredUpstream, DiffState, RemoteRefEvidence};
 
 use super::layout::{ColumnRange, RenderGeometry, WidthMode};
 use super::theme::{
@@ -84,11 +81,12 @@ pub fn render_with_mode(
         return;
     }
 
-    let geometry = RenderGeometry::new(
+    let geometry = RenderGeometry::new_with_status(
         area.width,
         mode,
         app.lane_pitch,
         app.projection.lane_count.max(1),
+        app.status_visible,
     );
     let sticky = (area.height >= 2)
         .then(|| app.sticky_visual_row())
@@ -185,13 +183,13 @@ fn visual_section_label_line(
     let desired_x = geometry
         .name_x(label.lane)
         .saturating_add(label.manual_depth.saturating_mul(2));
-    let x = desired_x.min(geometry.metadata_start.saturating_sub(2));
+    let x = desired_x.min(geometry.width.saturating_sub(2));
     let text = if x < desired_x {
         format!("{} {}", label.manual_depth, label.text)
     } else {
         label.text.to_string()
     };
-    let width = geometry.metadata_start.saturating_sub(x + 1);
+    let width = geometry.width.saturating_sub(x + 1);
     let cursor = match &app.overlay {
         Overlay::StackNameEditor(editor)
             if editor.target == ConfigTarget::VisualSection(label.anchor.clone()) =>
@@ -231,11 +229,21 @@ fn visual_section_label_line(
         }
     }
     let selected_background = selected.then(|| {
-        let color = visual_section_color(&label.color);
-        if color == Color::Reset {
+        let section_color = visual_section_color(&label.color);
+        let accent = if section_color != Color::Reset {
+            section_color
+        } else {
+            let repository_id = app
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.repository_id.as_ref())
+                .unwrap_or_default();
+            stack_color(repository_id, &label.stack_id, &app.config)
+        };
+        if accent == Color::Reset {
             selected_background()
         } else {
-            color
+            current_background(accent)
         }
     });
     cells_to_line(cells, selected_background)
@@ -307,7 +315,7 @@ fn stack_label_line(
         }
         _ => None,
     };
-    let count = format!(
+    let full_count = format!(
         " · {} {}",
         label.branch_count,
         if label.branch_count == 1 {
@@ -316,6 +324,12 @@ fn stack_label_line(
             "branches"
         }
     );
+    let compact_count = format!(" · {}", label.branch_count);
+    let count = if label.text.chars().count() + full_count.chars().count() <= width {
+        full_count
+    } else {
+        compact_count
+    };
     let name_width = width.saturating_sub(count.chars().count());
     let text = format!(
         "{}{count}",
@@ -364,7 +378,7 @@ fn stack_label_line(
         if color == Color::Reset {
             selected_background()
         } else {
-            color
+            current_background(color)
         }
     });
     cells_to_line(cells, selected_background)
@@ -429,6 +443,8 @@ fn branch_line(
     let background = if selected {
         let accent = if row.is_trunk {
             trunk_color()
+        } else if let Some(color) = &row.visual_color {
+            visual_section_color(color)
         } else {
             let repository_id = app
                 .snapshot
@@ -440,7 +456,7 @@ fn branch_line(
         Some(if accent == Color::Reset {
             selected_background()
         } else {
-            accent
+            current_background(accent)
         })
     } else if branch.current {
         let accent = if row.is_trunk {
@@ -463,13 +479,7 @@ fn branch_line(
 
     let mut identity = identity_style(app, &row.stack_id, row.is_trunk, row.emphasis);
     if selected {
-        identity = if background == Some(selected_background()) {
-            identity.add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD)
-        };
+        identity = identity.add_modifier(Modifier::BOLD);
     }
     if row.context_only {
         identity = identity.add_modifier(Modifier::DIM);
@@ -509,10 +519,13 @@ fn branch_line(
     let desired_name_x = geometry
         .name_x(row.lane)
         .saturating_add(row.manual_depth.saturating_mul(2));
-    let name_x = desired_name_x.min(geometry.metadata_start.saturating_sub(2));
-    let name_width = geometry
-        .metadata_start
-        .saturating_sub(name_x.saturating_add(1));
+    let name_limit = if matches!(app.archive_mode, ArchiveMode::Archive) && geometry.width < 60 {
+        geometry.width.saturating_sub(9)
+    } else {
+        geometry.metadata_start
+    };
+    let name_x = desired_name_x.min(name_limit.saturating_sub(2));
+    let name_width = name_limit.saturating_sub(name_x.saturating_add(1));
     let dirty = if branch.dirty { "*" } else { "" };
     let branch_name = if name_x < desired_name_x {
         format!("{} {}{dirty}", row.manual_depth, branch.id)
@@ -538,7 +551,13 @@ fn branch_line(
 
     let metadata_emphasis = row.emphasis;
     if matches!(app.archive_mode, ArchiveMode::Archive) {
-        paint_archive_evidence(&mut cells, branch, geometry, metadata_emphasis);
+        paint_archive_evidence(
+            &mut cells,
+            branch,
+            geometry,
+            metadata_emphasis,
+            app.status_visible,
+        );
     } else {
         if let Some(range) = geometry.time {
             put_right(
@@ -555,20 +574,21 @@ fn branch_line(
             branch.worktree.as_deref(),
             metadata_emphasis,
         );
-        if let Some(range) = geometry.remote {
-            paint_remote_status(&mut cells, branch, range, metadata_emphasis);
-        }
-        if let Some(range) = geometry.pr
-            && let Some(pull_request) = &branch.pr
-        {
-            paint_pull_request(&mut cells, range, pull_request, metadata_emphasis);
+        if let Some(range) = geometry.pr {
+            let (label, color) = branch_status(branch);
+            put_right_preserved(
+                &mut cells,
+                range,
+                &truncate(&label, range.width),
+                emphasized(Style::default().fg(color), metadata_emphasis),
+            );
         }
     }
 
     if selected {
         for cell in &mut cells {
             if !cell.preserve_foreground {
-                cell.style = cell.style.fg(Color::Black);
+                cell.style = cell.style.fg(Color::White);
             }
         }
     }
@@ -581,10 +601,16 @@ fn paint_archive_evidence(
     branch: &Branch,
     geometry: RenderGeometry,
     emphasis: Emphasis,
+    status_visible: bool,
 ) {
+    let x = if geometry.width < 60 {
+        geometry.width.saturating_sub(9)
+    } else {
+        geometry.metadata_start
+    };
     let range = ColumnRange {
-        x: geometry.metadata_start,
-        width: geometry.width.saturating_sub(geometry.metadata_start),
+        x,
+        width: geometry.width.saturating_sub(x),
     };
     let compact = range.width < 20;
     let mut badges = Vec::with_capacity(2);
@@ -600,10 +626,12 @@ fn paint_archive_evidence(
             format!("⎇ {}", truncate(basename, 10))
         });
     }
-    let (remote, color) = remote_status(branch, compact);
-    badges.push(remote);
+    let (status, color) = branch_status(branch);
+    if status_visible {
+        badges.push(status);
+    }
     let label = truncate(&badges.join(" "), range.width);
-    put_text(
+    put_text_preserved(
         cells,
         range.x,
         range.width,
@@ -612,106 +640,62 @@ fn paint_archive_evidence(
     );
 }
 
-fn paint_remote_status(
-    cells: &mut [RenderCell],
-    branch: &Branch,
-    range: ColumnRange,
-    emphasis: Emphasis,
-) {
-    let (label, color) = remote_status(branch, range.width < 10);
-    put_right(
-        cells,
-        range,
-        &truncate(&label, range.width),
-        emphasized(Style::default().fg(color), emphasis),
-    );
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PushedState {
+    Pushed,
+    NotPushed,
+    Checking,
+    Unavailable,
 }
 
-fn remote_status(branch: &Branch, compact: bool) -> (String, Color) {
-    let label = match &branch.configured_upstream {
-        ConfiguredUpstream::None => match &branch.remote_ref {
-            RemoteRefEvidence::Contained { .. } => {
-                if compact {
-                    "✓".into()
-                } else {
-                    "✓ pushed".into()
-                }
-            }
-            RemoteRefEvidence::Checking => {
-                if compact {
-                    "…".into()
-                } else {
-                    "… checking".into()
-                }
-            }
-            RemoteRefEvidence::LocalOnly { .. } | RemoteRefEvidence::NotRequested => {
-                if compact {
-                    "○".into()
-                } else {
-                    "○ no remote".into()
-                }
-            }
-            RemoteRefEvidence::Unavailable { .. } => {
-                if compact {
-                    "?".into()
-                } else {
-                    "? remote".into()
-                }
-            }
-        },
-        ConfiguredUpstream::Equal { .. } => {
-            if compact {
-                "✓".into()
-            } else {
-                "✓ pushed".into()
-            }
+fn pushed_state(branch: &Branch) -> PushedState {
+    if matches!(branch.configured_upstream, ConfiguredUpstream::Equal { .. })
+        || matches!(branch.remote_ref, RemoteRefEvidence::ExactTip { .. })
+        || branch.pr.as_ref().is_some_and(|pr| {
+            pr.match_quality == crate::model::PullRequestMatch::ExactTip
+                && pr.head_oid.as_deref() == Some(branch.oid.as_ref())
+        })
+    {
+        return PushedState::Pushed;
+    }
+    match (&branch.configured_upstream, &branch.remote_ref) {
+        (_, RemoteRefEvidence::Checking) => PushedState::Checking,
+        (ConfiguredUpstream::Unavailable { .. }, _)
+        | (ConfiguredUpstream::None, RemoteRefEvidence::NotRequested)
+        | (ConfiguredUpstream::None, RemoteRefEvidence::Contained { .. })
+        | (ConfiguredUpstream::None, RemoteRefEvidence::Unavailable { .. }) => {
+            PushedState::Unavailable
         }
-        ConfiguredUpstream::Ahead { ahead, .. } => {
-            if compact {
-                format!("↑{ahead}")
-            } else {
-                format!("↑{ahead} ahead")
-            }
+        _ => PushedState::NotPushed,
+    }
+}
+
+fn branch_status(branch: &Branch) -> (String, Color) {
+    if let Some(pr) = branch.pr.as_ref() {
+        return pr_status(pr);
+    }
+    match pushed_state(branch) {
+        PushedState::Pushed => ("pushed".into(), Color::White),
+        PushedState::NotPushed | PushedState::Checking | PushedState::Unavailable => {
+            ("local".into(), Color::Gray)
         }
-        ConfiguredUpstream::Behind { behind, .. } => {
-            if compact {
-                format!("↓{behind}")
-            } else {
-                format!("↓{behind} behind")
-            }
+    }
+}
+
+fn pr_status(pr: &crate::model::PullRequest) -> (String, Color) {
+    let label = match pr.status {
+        crate::model::PullRequestStatus::Open => format!("#{}", pr.number),
+        crate::model::PullRequestStatus::Approved | crate::model::PullRequestStatus::Merged => {
+            format!("✓ #{}", pr.number)
         }
-        ConfiguredUpstream::Diverged { ahead, behind, .. } => {
-            if compact {
-                format!("↕{ahead}/{behind}")
-            } else {
-                format!("↕{ahead}/{behind} div")
-            }
-        }
-        ConfiguredUpstream::Gone { .. } => {
-            if compact {
-                "×".into()
-            } else {
-                "× gone".into()
-            }
-        }
-        ConfiguredUpstream::Unavailable { .. } => {
-            if compact {
-                "?".into()
-            } else {
-                "? remote".into()
-            }
-        }
+        crate::model::PullRequestStatus::Closed => format!("X #{}", pr.number),
     };
-    let color = match &branch.configured_upstream {
-        ConfiguredUpstream::Equal { .. } => Color::Green,
-        ConfiguredUpstream::Ahead { .. } | ConfiguredUpstream::None => match &branch.remote_ref {
-            RemoteRefEvidence::Contained { .. } => Color::Green,
-            RemoteRefEvidence::Checking | RemoteRefEvidence::Unavailable { .. } => Color::DarkGray,
-            _ => Color::Yellow,
-        },
-        ConfiguredUpstream::Behind { .. } => Color::Cyan,
-        ConfiguredUpstream::Diverged { .. } | ConfiguredUpstream::Gone { .. } => Color::Red,
-        ConfiguredUpstream::Unavailable { .. } => Color::DarkGray,
+    let color = match pr.status {
+        crate::model::PullRequestStatus::Open => Color::Yellow,
+        crate::model::PullRequestStatus::Approved | crate::model::PullRequestStatus::Merged => {
+            Color::Green
+        }
+        crate::model::PullRequestStatus::Closed => Color::Red,
     };
     (label, color)
 }
@@ -844,47 +828,6 @@ fn paint_diff(cells: &mut [RenderCell], range: ColumnRange, diff: &DiffState, em
     }
 }
 
-fn paint_pull_request(
-    cells: &mut [RenderCell],
-    range: ColumnRange,
-    pull_request: &PullRequest,
-    emphasis: Emphasis,
-) {
-    match pull_request.status {
-        PullRequestStatus::Open => {
-            put_right(
-                cells,
-                range,
-                &pull_request.status.column_text(pull_request.number),
-                emphasized(Style::default().fg(Color::Yellow), emphasis),
-            );
-        }
-        PullRequestStatus::Approved => {
-            let combined = pull_request.status.column_text(pull_request.number);
-            let visible = truncate(&combined, range.width);
-            let visible_count = visible.chars().count();
-            let start_x = range.x + range.width.saturating_sub(visible_count);
-            let check_style = emphasized(Style::default().fg(Color::Green), emphasis);
-            let number_style = emphasized(Style::default().fg(Color::Yellow), emphasis);
-            for (offset, character) in visible.chars().enumerate() {
-                let position = start_x + offset;
-                match character {
-                    '✓' => write_symbol(cells, position, "✓", check_style, true),
-                    _ => write_symbol(cells, position, &character.to_string(), number_style, false),
-                }
-            }
-        }
-        PullRequestStatus::Merged | PullRequestStatus::Closed => {
-            put_right(
-                cells,
-                range,
-                &pull_request.status.column_text(pull_request.number),
-                emphasized(Style::default().fg(Color::DarkGray), emphasis),
-            );
-        }
-    }
-}
-
 fn paint_worktree(
     cells: &mut [RenderCell],
     range: ColumnRange,
@@ -918,22 +861,35 @@ fn blank_cells(width: usize) -> Vec<RenderCell> {
 }
 
 fn set_symbol(cells: &mut [RenderCell], x: usize, symbol: &str, style: Style) {
-    write_symbol(cells, x, symbol, style, false);
-}
-
-fn write_symbol(
-    cells: &mut [RenderCell],
-    x: usize,
-    symbol: &str,
-    style: Style,
-    preserve_foreground: bool,
-) {
     if let Some(cell) = cells.get_mut(x) {
         cell.symbol.clear();
         cell.symbol.push_str(symbol);
         cell.style = style;
-        cell.preserve_foreground = preserve_foreground;
+        cell.preserve_foreground = false;
     }
+}
+
+fn put_text_preserved(cells: &mut [RenderCell], x: usize, width: usize, text: &str, style: Style) {
+    for (offset, character) in text.chars().take(width).enumerate() {
+        if let Some(cell) = cells.get_mut(x + offset) {
+            cell.symbol.clear();
+            cell.symbol.push(character);
+            cell.style = style;
+            cell.preserve_foreground = true;
+        }
+    }
+}
+
+fn put_right_preserved(cells: &mut [RenderCell], range: ColumnRange, text: &str, style: Style) {
+    let text = truncate(text, range.width);
+    let count = text.chars().count();
+    put_text_preserved(
+        cells,
+        range.x + range.width.saturating_sub(count),
+        range.width,
+        &text,
+        style,
+    );
 }
 
 fn put_text(cells: &mut [RenderCell], x: usize, width: usize, text: &str, style: Style) {

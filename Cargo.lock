@@ -1010,6 +1010,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "crossterm",
+ "libc",
  "notify",
  "ratatui",
  "rusqlite",

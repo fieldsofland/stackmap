@@ -547,6 +547,7 @@ mod tests {
             stack_root: BranchId::new(root),
             trunk: Some(BranchId::new("main")),
             graphite: GraphiteProvenance::Tracked,
+            graphite_health: crate::model::GraphiteHealth::Healthy,
             committed_at: 1,
             current,
             dirty: false,
@@ -555,6 +556,7 @@ mod tests {
             remote_ref: RemoteRefEvidence::NotRequested,
             diff: DiffState::Loading,
             pr: None,
+            pr_lookup: crate::model::PullRequestLookup::NotRequested,
         }
     }
 }

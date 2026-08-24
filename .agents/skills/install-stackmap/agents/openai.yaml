@@ -1,0 +1,4 @@
+interface:
+  display_name: "Install Stackmap"
+  short_description: "Build and install the latest local Stackmap"
+  default_prompt: "Use $install-stackmap after completing the requested code changes."
