@@ -29,9 +29,9 @@ pub struct ArchiveResult {
     pub disposition: ArchiveDisposition,
 }
 
-struct StableEvidence {
-    snapshot: Arc<RepositorySnapshot>,
-    source_token: u64,
+pub(super) struct StableEvidence {
+    pub(super) snapshot: Arc<RepositorySnapshot>,
+    pub(super) source_token: u64,
 }
 
 pub fn execute(request: ArchiveRequest) -> Result<Vec<ArchiveResult>> {
@@ -90,7 +90,7 @@ fn deduplicate_targets(branches: Vec<String>) -> Result<Vec<BranchId>> {
     Ok(targets)
 }
 
-fn stable_evidence(adapter: &GitAdapter) -> Result<StableEvidence> {
+pub(super) fn stable_evidence(adapter: &GitAdapter) -> Result<StableEvidence> {
     for _ in 0..3 {
         let mut builder = SnapshotBuilder::new(adapter.clone());
         let snapshot = builder.build()?;
@@ -151,7 +151,7 @@ fn validate_targets(snapshot: &RepositorySnapshot, targets: &[BranchId]) -> Resu
     Ok(())
 }
 
-fn ensure_unchanged(initial: &StableEvidence, current: &StableEvidence) -> Result<()> {
+pub(super) fn ensure_unchanged(initial: &StableEvidence, current: &StableEvidence) -> Result<()> {
     if initial.snapshot.repository_id != current.snapshot.repository_id
         || initial.snapshot.common_dir != current.snapshot.common_dir
     {

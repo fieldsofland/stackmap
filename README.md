@@ -68,6 +68,21 @@ command never changes refs, worktrees, remotes, Graphite metadata, or pull
 requests. There is no restore subcommand yet: press `a`, select the branch in
 Archive view, and press `x`.
 
+Agents can also rename an existing displayed stack without starting the TUI:
+
+```sh
+stackmap stack rename --dry-run --repo /path/to/repository feature/branch "Payments cleanup"
+stackmap stack rename --repo /path/to/repository feature/branch "Payments cleanup"
+```
+
+`BRANCH` may be any branch in the stack. Stackmap resolves the displayed stack
+ID, including child stacks created by forks, and stores `NAME` against that ID.
+Names are single-line, non-empty, and limited to 80 characters. Output is
+deterministic: `would rename <stack> to <name>`, `renamed <stack> to <name>`, or
+`unchanged <stack> (<name>)`. Dry-run creates no config artifacts. The command
+revalidates repository topology before its atomic config write and never changes
+Git refs, worktrees, remotes, Graphite metadata, or pull requests.
+
 ## What Stackmap shows
 
 ```text
@@ -255,6 +270,10 @@ Writes use a bounded cross-process lock, synced temporary file, and atomic
 rename. Before saving, stackmap reloads the latest configuration so separate
 worktrees changing different stack roots do not overwrite each other. Invalid
 on-disk edits leave the last valid in-memory configuration active.
+
+The TUI and `stackmap stack rename` share the same `stack_names` entries. A CLI
+rename refuses a concurrent rename of that same stack while preserving unrelated
+config changes.
 
 ## Graphite and GitHub fallbacks
 

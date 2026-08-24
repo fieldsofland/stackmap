@@ -64,6 +64,20 @@ explains which work belongs together or what is safe to clean up.
 - The wide branch-detail sidebar starts hidden and toggles with `d`.
 - `--current` starts with only the current stack and shared ancestry in view.
 
+## Agent stack naming
+
+- `stackmap stack rename [--repo PATH] [--dry-run] BRANCH NAME` names an
+  existing displayed stack without opening the TUI. `BRANCH` may be any member;
+  Stackmap resolves the canonical stack ID through complete topology, so a forked
+  child stack remains distinct from its Graphite component root.
+- Names use the same repository-local config and validation as TUI naming. They
+  must be non-empty, single-line, and at most 80 characters. Reapplying the same
+  name is an idempotent success.
+- The command revalidates repository identity, refs, trunks, and displayed stack
+  identity before a locked atomic write. Dry-run creates no config artifacts. A
+  competing rename of the same stack aborts, while unrelated concurrent config
+  changes survive. Git, Graphite, worktrees, remotes, and PRs are read-only.
+
 ## Reversible archive workflow
 
 - Lowercase `x` archives or restores a branch without modifying Git. Range mode

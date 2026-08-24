@@ -27,7 +27,8 @@ use stackmap::runtime::git::{
 };
 use stackmap::runtime::{
     Action, App, ArchiveDisposition, ArchiveRequest, BranchId, ClipboardRequest, ClipboardScope,
-    Config, ConfigWriteRequest, Input, Key, RefreshEvent, RefreshHandle, archive, platform, render,
+    Config, ConfigWriteRequest, Input, Key, RefreshEvent, RefreshHandle, StackRenameDisposition,
+    StackRenameRequest, archive, platform, rename_stack, render,
 };
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
@@ -87,6 +88,8 @@ fn main() {
 enum CliAction {
     Help,
     ArchiveHelp,
+    StackHelp,
+    StackRenameHelp,
     Version,
     Run {
         repository: Option<PathBuf>,
@@ -97,11 +100,31 @@ enum CliAction {
         dry_run: bool,
         branches: Vec<String>,
     },
+    StackRename {
+        repository: Option<PathBuf>,
+        dry_run: bool,
+        branch: String,
+        name: String,
+    },
 }
 
 fn help_text() -> String {
     format!(
-        "stackmap {}\n\nUSAGE:\n    stackmap [--current] [REPOSITORY]\n    stackmap archive [--repo PATH] [--dry-run] BRANCH...\n\nRun a live local branch and Graphite stack map. Press ? in the TUI for keys.",
+        "stackmap {}\n\nUSAGE:\n    stackmap [--current] [REPOSITORY]\n    stackmap archive [--repo PATH] [--dry-run] BRANCH...\n    stackmap stack rename [--repo PATH] [--dry-run] BRANCH NAME\n\nRun a live local branch and Graphite stack map. Press ? in the TUI for keys.",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn stack_help_text() -> String {
+    format!(
+        "stackmap {}\n\nUSAGE:\n    stackmap stack rename [--repo PATH] [--dry-run] BRANCH NAME\n\nManage existing displayed stacks. Run stackmap stack rename --help for rename details.",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn stack_rename_help_text() -> String {
+    format!(
+        "stackmap {}\n\nUSAGE:\n    stackmap stack rename [--repo PATH] [--dry-run] BRANCH NAME\n\nRename the displayed stack containing BRANCH in repository-local Stackmap config. The command requires exactly one BRANCH and one NAME. Options must precede BRANCH and NAME; use -- before option-shaped operands. Output is deterministic: would rename, renamed, or unchanged. --dry-run performs the same validation without changing config. The command never changes Git refs, worktrees, remotes, Graphite metadata, or pull requests.",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -137,6 +160,12 @@ where
             return Ok(CliAction::ArchiveHelp);
         }
         return parse_archive_cli(args.into_iter().skip(1));
+    }
+    if args
+        .first()
+        .is_some_and(|value| value == OsStr::new("stack"))
+    {
+        return parse_stack_cli(args.into_iter().skip(1));
     }
     let mut repository = None;
     let mut current = false;
@@ -184,6 +213,97 @@ where
     Ok(CliAction::Run {
         repository,
         current,
+    })
+}
+
+fn parse_stack_cli(
+    args: impl IntoIterator<Item = OsString>,
+) -> std::result::Result<CliAction, String> {
+    let args = args.into_iter().collect::<Vec<_>>();
+    if args.is_empty()
+        || (args.len() == 1 && (args[0] == OsStr::new("--help") || args[0] == OsStr::new("-h")))
+    {
+        return Ok(CliAction::StackHelp);
+    }
+    if args
+        .first()
+        .is_none_or(|value| value != OsStr::new("rename"))
+    {
+        return Err(format!(
+            "unknown stack command: {}",
+            args.first()
+                .map(|value| value.to_string_lossy())
+                .unwrap_or_default()
+        ));
+    }
+    if args
+        .get(1)
+        .is_some_and(|value| value == OsStr::new("--help") || value == OsStr::new("-h"))
+    {
+        if args.len() != 2 {
+            return Err("stack rename help cannot be combined with other arguments".into());
+        }
+        return Ok(CliAction::StackRenameHelp);
+    }
+    parse_stack_rename_cli(args.into_iter().skip(1))
+}
+
+fn parse_stack_rename_cli(
+    args: impl IntoIterator<Item = OsString>,
+) -> std::result::Result<CliAction, String> {
+    let mut repository = None;
+    let mut dry_run = false;
+    let mut terminated = false;
+    let mut saw_operand = false;
+    let mut operands = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(value) = args.next() {
+        if !terminated && value == OsStr::new("--") {
+            terminated = true;
+            continue;
+        }
+        if !terminated && !saw_operand && value == OsStr::new("--repo") {
+            if repository.is_some() {
+                return Err("--repo may be provided only once".into());
+            }
+            repository = Some(PathBuf::from(
+                args.next()
+                    .ok_or_else(|| "--repo requires a path".to_owned())?,
+            ));
+            continue;
+        }
+        if !terminated && !saw_operand && value == OsStr::new("--dry-run") {
+            if dry_run {
+                return Err("--dry-run may be provided only once".into());
+            }
+            dry_run = true;
+            continue;
+        }
+        if !terminated && value.to_string_lossy().starts_with('-') {
+            return Err(if saw_operand {
+                format!(
+                    "stack rename options must precede BRANCH and NAME: {}",
+                    value.to_string_lossy()
+                )
+            } else {
+                format!("unknown stack rename option: {}", value.to_string_lossy())
+            });
+        }
+        saw_operand = true;
+        operands.push(
+            value
+                .into_string()
+                .map_err(|_| "stack rename operands must be valid UTF-8".to_owned())?,
+        );
+    }
+    if operands.len() != 2 {
+        return Err("stack rename requires exactly BRANCH and NAME".into());
+    }
+    Ok(CliAction::StackRename {
+        repository,
+        dry_run,
+        branch: operands.remove(0),
+        name: operands.remove(0),
     })
 }
 
@@ -256,6 +376,14 @@ fn run() -> Result<()> {
             println!("{}", archive_help_text());
             return Ok(());
         }
+        CliAction::StackHelp => {
+            println!("{}", stack_help_text());
+            return Ok(());
+        }
+        CliAction::StackRenameHelp => {
+            println!("{}", stack_rename_help_text());
+            return Ok(());
+        }
         CliAction::Version => {
             println!("{}", version_text());
             return Ok(());
@@ -283,6 +411,31 @@ fn run() -> Result<()> {
                     ArchiveDisposition::Unchanged => {
                         println!("unchanged {} (already archived)", result.branch)
                     }
+                }
+            }
+            return Ok(());
+        }
+        CliAction::StackRename {
+            repository,
+            dry_run,
+            branch,
+            name,
+        } => {
+            let result = rename_stack(StackRenameRequest {
+                repository: repository.unwrap_or(std::env::current_dir()?),
+                dry_run,
+                branch,
+                name,
+            })?;
+            match result.disposition {
+                StackRenameDisposition::Renamed => {
+                    println!("renamed {} to {}", result.stack, result.name)
+                }
+                StackRenameDisposition::WouldRename => {
+                    println!("would rename {} to {}", result.stack, result.name)
+                }
+                StackRenameDisposition::Unchanged => {
+                    println!("unchanged {} ({})", result.stack, result.name)
                 }
             }
             return Ok(());
@@ -1048,6 +1201,119 @@ mod tests {
                 dry_run: false,
                 branches: vec!["--dry-run".into()],
             }
+        );
+    }
+
+    #[test]
+    fn stack_rename_parser_accepts_repo_dry_run_branch_and_name() {
+        assert_eq!(
+            parse_cli([
+                "stack",
+                "rename",
+                "--repo",
+                "/tmp/repo",
+                "--dry-run",
+                "feature/one",
+                "Payments cleanup",
+            ])
+            .unwrap(),
+            CliAction::StackRename {
+                repository: Some(PathBuf::from("/tmp/repo")),
+                dry_run: true,
+                branch: "feature/one".into(),
+                name: "Payments cleanup".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn stack_and_stack_rename_have_specific_help() {
+        assert_eq!(parse_cli(["stack"]).unwrap(), CliAction::StackHelp);
+        assert_eq!(
+            parse_cli(["stack", "--help"]).unwrap(),
+            CliAction::StackHelp
+        );
+        assert_eq!(
+            parse_cli(["stack", "rename", "--help"]).unwrap(),
+            CliAction::StackRenameHelp
+        );
+        assert_eq!(
+            parse_cli(["stack", "rename", "--help", "alpha"]).unwrap_err(),
+            "stack rename help cannot be combined with other arguments"
+        );
+        assert!(stack_help_text().contains("stackmap stack rename"));
+        let help = stack_rename_help_text();
+        assert!(help.contains("exactly"));
+        assert!(help.contains("would rename, renamed, or unchanged"));
+        assert!(help.contains("never changes Git refs"));
+    }
+
+    #[test]
+    fn stack_rename_requires_exactly_two_operands() {
+        for args in [
+            vec!["stack", "rename"],
+            vec!["stack", "rename", "alpha"],
+            vec!["stack", "rename", "alpha", "Name", "extra"],
+        ] {
+            assert_eq!(
+                parse_cli(args).unwrap_err(),
+                "stack rename requires exactly BRANCH and NAME"
+            );
+        }
+    }
+
+    #[test]
+    fn stack_rename_rejects_duplicate_unknown_and_misplaced_options() {
+        assert_eq!(
+            parse_cli(["stack", "rename", "--dry-run", "--dry-run", "alpha", "Name",]).unwrap_err(),
+            "--dry-run may be provided only once"
+        );
+        assert_eq!(
+            parse_cli(["stack", "rename", "--wat", "alpha", "Name"]).unwrap_err(),
+            "unknown stack rename option: --wat"
+        );
+        assert_eq!(
+            parse_cli(["stack", "rename", "alpha", "--dry-run", "Name"]).unwrap_err(),
+            "stack rename options must precede BRANCH and NAME: --dry-run"
+        );
+        assert_eq!(
+            parse_cli(["stack", "rename", "--repo"]).unwrap_err(),
+            "--repo requires a path"
+        );
+        assert_eq!(
+            parse_cli(["stack", "wat"]).unwrap_err(),
+            "unknown stack command: wat"
+        );
+    }
+
+    #[test]
+    fn stack_rename_option_termination_accepts_option_shaped_operands() {
+        assert_eq!(
+            parse_cli(["stack", "rename", "--", "--branch", "--name"]).unwrap(),
+            CliAction::StackRename {
+                repository: None,
+                dry_run: false,
+                branch: "--branch".into(),
+                name: "--name".into(),
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stack_rename_requires_utf8_operands() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = OsString::from_vec(vec![0xff]);
+        assert_eq!(
+            parse_cli([
+                OsString::from("stack"),
+                OsString::from("rename"),
+                OsString::from("alpha"),
+                invalid,
+            ])
+            .unwrap_err(),
+            "stack rename operands must be valid UTF-8"
         );
     }
 
