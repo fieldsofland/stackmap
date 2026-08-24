@@ -4,21 +4,21 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::adapters::git::GitAdapter;
-use crate::model::{BranchId, RemoteRefEvidence};
+use crate::adapters::git::{ExactRemoteRefTips, GitAdapter};
+use crate::model::{BranchId, ConfiguredUpstream, RemoteRefEvidence};
 
-pub const MAX_TARGETS: usize = 64;
+pub const MAX_TARGETS: usize = 512;
 const CACHE_CAPACITY: usize = 1024;
 const RESULT_CAPACITY: usize = 8;
-// Remote-ref Git commands have a 250ms individual timeout. Including the
-// before/after source-token checks, a non-cancelled request is bounded to
-// roughly this deadline plus 750ms.
+// Stop starting additional classification checks after this deadline. An
+// already-running bounded Git command may finish after it.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpstreamTarget {
     pub branch: BranchId,
     pub oid: Arc<str>,
+    pub configured_upstream: ConfiguredUpstream,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,6 +32,7 @@ pub struct UpstreamResult {
     pub branch: BranchId,
     pub oid: Arc<str>,
     pub evidence: RemoteRefEvidence,
+    pub configured_upstream: Option<ConfiguredUpstream>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55,7 +56,6 @@ struct CoordinatorState {
 }
 
 type CacheKey = (Arc<str>, u64);
-
 struct EvidenceCache {
     capacity: usize,
     values: HashMap<CacheKey, RemoteRefEvidence>,
@@ -218,178 +218,104 @@ fn enrich(
         return None;
     }
     let checked_at = SystemTime::now();
-    let same_generation_token = (cache.last_request_generation == Some(request.generation))
-        .then_some(cache.last_source_token)
-        .flatten();
-    let observed_token = match same_generation_token {
-        Some(token) => token,
-        None => match adapter.remote_ref_token() {
-            Ok(token) => token,
-            Err(error) => {
-                return unavailable_batch(
-                    &request,
-                    &format!("local remote refs unavailable: {error}"),
-                    None,
-                    checked_at,
-                    request_revision,
-                    revision,
-                );
+    if let (Some(generation), Some(observed_token)) =
+        (cache.last_request_generation, cache.last_source_token)
+    {
+        if generation == request.generation {
+            let cached = request
+                .targets
+                .iter()
+                .map(|target| cache.get(&(target.oid.clone(), observed_token)))
+                .collect::<Option<Vec<_>>>();
+            if let Some(evidence) = cached {
+                return Some(completed_batch(request, evidence, observed_token));
             }
-        },
-    };
-    let mut results = Vec::with_capacity(request.targets.len());
-    let mut misses = Vec::new();
-    for target in request.targets.iter() {
-        let key = (target.oid.clone(), observed_token);
-        if let Some(evidence) = cache.get(&key) {
-            results.push(UpstreamResult {
-                branch: target.branch.clone(),
-                oid: target.oid.clone(),
-                evidence,
-            });
-        } else {
-            misses.push(target.clone());
         }
-    }
-    if misses.is_empty() {
-        cache.last_request_generation = Some(request.generation);
-        cache.last_source_token = Some(observed_token);
-        return (!obsolete(request_revision, revision)).then(|| UpstreamBatch {
-            generation: request.generation,
-            remote_ref_token: Some(observed_token),
-            results: Arc::from(results),
-        });
     }
 
-    if same_generation_token.is_some() {
-        match adapter.remote_ref_token() {
-            Ok(token) if token == observed_token => {}
-            Ok(_) => {
-                cache.last_request_generation = None;
-                cache.last_source_token = None;
-                return unavailable_batch(
-                    &request,
-                    "local remote-tracking refs changed while checking",
-                    None,
-                    checked_at,
-                    request_revision,
-                    revision,
-                );
-            }
-            Err(error) => {
-                cache.last_request_generation = None;
-                cache.last_source_token = None;
-                return unavailable_batch(
-                    &request,
-                    &format!("local remote refs unavailable: {error}"),
-                    None,
-                    checked_at,
-                    request_revision,
-                    revision,
-                );
-            }
-        }
-    }
     let deadline = Instant::now() + request_deadline;
-    let mut computed = HashMap::<Arc<str>, RemoteRefEvidence>::new();
-    for target in &misses {
-        if obsolete(request_revision, revision) {
-            return None;
-        }
-        let evidence = if Instant::now() >= deadline {
-            RemoteRefEvidence::Unavailable {
-                reason: Arc::from("local remote-ref check deadline exceeded"),
-                source_token: Some(observed_token),
-                checked_at,
-            }
-        } else if let Some(value) = computed.get(&target.oid) {
-            value.clone()
-        } else {
-            let value = match adapter.containing_remote_ref(&target.oid) {
-                Ok(Some(reference)) => RemoteRefEvidence::Contained {
-                    reference,
-                    source_token: observed_token,
-                    checked_at,
-                },
-                Ok(None) => RemoteRefEvidence::LocalOnly {
-                    source_token: observed_token,
-                    checked_at,
-                },
-                Err(error) => RemoteRefEvidence::Unavailable {
-                    reason: Arc::from(error.to_string()),
-                    source_token: Some(observed_token),
-                    checked_at,
-                },
-            };
-            computed.insert(target.oid.clone(), value.clone());
-            value
-        };
-        results.push(UpstreamResult {
-            branch: target.branch.clone(),
-            oid: target.oid.clone(),
-            evidence,
-        });
+    if Instant::now() >= deadline {
+        return unavailable_batch(
+            &request,
+            "local remote-ref check deadline exceeded",
+            None,
+            checked_at,
+            request_revision,
+            revision,
+        );
     }
+    let (observed_token, exact_tips) = match adapter.exact_remote_ref_tips() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return unavailable_batch(
+                &request,
+                &format!("local remote refs unavailable: {error}"),
+                None,
+                checked_at,
+                request_revision,
+                revision,
+            );
+        }
+    };
     if obsolete(request_revision, revision) {
         return None;
     }
-    match adapter.remote_ref_token() {
-        Ok(token) if token == observed_token => {}
-        Ok(_) => {
-            cache.last_request_generation = None;
-            cache.last_source_token = None;
-            return unavailable_batch(
-                &request,
-                "local remote-tracking refs changed while checking",
-                None,
-                SystemTime::now(),
-                request_revision,
-                revision,
-            );
-        }
-        Err(error) => {
-            cache.last_request_generation = None;
-            cache.last_source_token = None;
-            return unavailable_batch(
-                &request,
-                &format!("could not revalidate local remote refs: {error}"),
-                Some(observed_token),
-                SystemTime::now(),
-                request_revision,
-                revision,
-            );
-        }
-    }
-    for result in &results {
-        if !matches!(result.evidence, RemoteRefEvidence::Unavailable { .. }) {
-            cache.insert(
-                (result.oid.clone(), observed_token),
-                result.evidence.clone(),
-            );
+    let evidence = request
+        .targets
+        .iter()
+        .map(|target| match exact_tips.get(&target.oid) {
+            Some(reference) => RemoteRefEvidence::ExactTip {
+                reference: reference.clone(),
+                source_token: observed_token,
+                checked_at,
+            },
+            None => RemoteRefEvidence::LocalOnly {
+                source_token: observed_token,
+                checked_at,
+            },
+        })
+        .collect::<Vec<_>>();
+    for (target, evidence) in request.targets.iter().zip(&evidence) {
+        if !matches!(evidence, RemoteRefEvidence::Unavailable { .. }) {
+            cache.insert((target.oid.clone(), observed_token), evidence.clone());
         }
     }
     cache.last_request_generation = Some(request.generation);
     cache.last_source_token = Some(observed_token);
+    Some(completed_batch(request, evidence, observed_token))
+}
+
+fn completed_batch(
+    request: UpstreamRequest,
+    evidence: Vec<RemoteRefEvidence>,
+    observed_token: u64,
+) -> UpstreamBatch {
+    let mut results = request
+        .targets
+        .iter()
+        .zip(evidence)
+        .map(|(target, evidence)| UpstreamResult {
+            branch: target.branch.clone(),
+            oid: target.oid.clone(),
+            evidence,
+            configured_upstream: None,
+        })
+        .collect::<Vec<_>>();
     results.sort_by(|left, right| left.branch.cmp(&right.branch));
-    Some(UpstreamBatch {
+    UpstreamBatch {
         generation: request.generation,
         remote_ref_token: Some(observed_token),
         results: Arc::from(results),
-    })
+    }
 }
 
 trait EvidenceGit: Send + Sync {
-    fn remote_ref_token(&self) -> anyhow::Result<u64>;
-    fn containing_remote_ref(&self, oid: &str) -> anyhow::Result<Option<Arc<str>>>;
+    fn exact_remote_ref_tips(&self) -> anyhow::Result<(u64, ExactRemoteRefTips)>;
 }
 
 impl EvidenceGit for GitAdapter {
-    fn remote_ref_token(&self) -> anyhow::Result<u64> {
-        GitAdapter::remote_ref_token(self)
-    }
-
-    fn containing_remote_ref(&self, oid: &str) -> anyhow::Result<Option<Arc<str>>> {
-        GitAdapter::containing_remote_ref(self, oid)
+    fn exact_remote_ref_tips(&self) -> anyhow::Result<(u64, ExactRemoteRefTips)> {
+        GitAdapter::exact_remote_ref_tips(self)
     }
 }
 
@@ -415,6 +341,7 @@ fn unavailable_batch(
                     source_token,
                     checked_at,
                 },
+                configured_upstream: None,
             })
             .collect(),
     })
@@ -431,8 +358,9 @@ mod tests {
 
     struct FakeGit {
         token: AtomicU64,
-        token_calls: AtomicUsize,
+        map_calls: AtomicUsize,
         containment_calls: AtomicUsize,
+        patch_calls: AtomicUsize,
         delay: Duration,
     }
 
@@ -440,23 +368,30 @@ mod tests {
         fn new(token: u64, delay: Duration) -> Self {
             Self {
                 token: AtomicU64::new(token),
-                token_calls: AtomicUsize::new(0),
+                map_calls: AtomicUsize::new(0),
                 containment_calls: AtomicUsize::new(0),
+                patch_calls: AtomicUsize::new(0),
                 delay,
             }
         }
     }
 
     impl EvidenceGit for FakeGit {
-        fn remote_ref_token(&self) -> anyhow::Result<u64> {
-            self.token_calls.fetch_add(1, Ordering::AcqRel);
-            Ok(self.token.load(Ordering::Acquire))
-        }
-
-        fn containing_remote_ref(&self, oid: &str) -> anyhow::Result<Option<Arc<str>>> {
-            self.containment_calls.fetch_add(1, Ordering::AcqRel);
+        fn exact_remote_ref_tips(&self) -> anyhow::Result<(u64, ExactRemoteRefTips)> {
+            self.map_calls.fetch_add(1, Ordering::AcqRel);
             thread::sleep(self.delay);
-            Ok((oid != "local").then(|| Arc::from("origin/main")))
+            Ok((
+                self.token.load(Ordering::Acquire),
+                HashMap::from([
+                    (Arc::from("exact"), Arc::from("refs/remotes/origin/exact")),
+                    (Arc::from("old"), Arc::from("refs/remotes/origin/old")),
+                    (Arc::from("new"), Arc::from("refs/remotes/origin/new")),
+                    (
+                        Arc::from("contained"),
+                        Arc::from("refs/remotes/origin/main"),
+                    ),
+                ]),
+            ))
         }
     }
 
@@ -469,6 +404,7 @@ mod tests {
                 .map(|(index, oid)| UpstreamTarget {
                     branch: BranchId::new(format!("branch-{index}")),
                     oid: Arc::from(*oid),
+                    configured_upstream: ConfiguredUpstream::None,
                 })
                 .collect(),
         }
@@ -499,7 +435,8 @@ mod tests {
         for index in 0..20 {
             cache.insert(
                 (Arc::from(format!("oid-{index}")), index),
-                RemoteRefEvidence::LocalOnly {
+                RemoteRefEvidence::ExactTip {
+                    reference: Arc::from("refs/remotes/origin/branch"),
                     source_token: index,
                     checked_at: SystemTime::UNIX_EPOCH,
                 },
@@ -516,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn same_generation_cache_hit_spawns_no_more_git_checks() {
+    fn exact_tip_map_is_called_once_and_same_generation_uses_cache() {
         let git = Arc::new(FakeGit::new(7, Duration::ZERO));
         let coordinator =
             UpstreamCoordinator::start_with(git.clone(), Duration::from_millis(100)).unwrap();
@@ -524,34 +461,27 @@ mod tests {
         coordinator.submit(UpstreamCommand::Request(request.clone()));
         assert!(matches!(
             wait_for_result(&coordinator).results[0].evidence,
-            RemoteRefEvidence::Contained { .. }
+            RemoteRefEvidence::ExactTip { .. }
         ));
-        let token_calls = git.token_calls.load(Ordering::Acquire);
-        let containment_calls = git.containment_calls.load(Ordering::Acquire);
+        assert_eq!(git.map_calls.load(Ordering::Acquire), 1);
         coordinator.submit(UpstreamCommand::Request(request));
         let _ = wait_for_result(&coordinator);
-        assert_eq!(git.token_calls.load(Ordering::Acquire), token_calls);
-        assert_eq!(
-            git.containment_calls.load(Ordering::Acquire),
-            containment_calls
-        );
+        assert_eq!(git.map_calls.load(Ordering::Acquire), 1);
+        assert_eq!(git.containment_calls.load(Ordering::Acquire), 0);
+        assert_eq!(git.patch_calls.load(Ordering::Acquire), 0);
     }
 
     #[test]
-    fn new_generation_reuses_oid_and_token_without_containment_checks() {
+    fn new_generation_takes_one_new_exact_tip_snapshot() {
         let git = Arc::new(FakeGit::new(7, Duration::ZERO));
         let coordinator =
             UpstreamCoordinator::start_with(git.clone(), Duration::from_millis(100)).unwrap();
         coordinator.submit(UpstreamCommand::Request(request(3, &["contained"])));
         let _ = wait_for_result(&coordinator);
-        let containment_calls = git.containment_calls.load(Ordering::Acquire);
         coordinator.submit(UpstreamCommand::Request(request(4, &["contained"])));
         let batch = wait_for_result(&coordinator);
         assert_eq!(batch.generation, 4);
-        assert_eq!(
-            git.containment_calls.load(Ordering::Acquire),
-            containment_calls
-        );
+        assert_eq!(git.map_calls.load(Ordering::Acquire), 2);
     }
 
     #[test]
@@ -560,7 +490,7 @@ mod tests {
         let coordinator =
             UpstreamCoordinator::start_with(git.clone(), Duration::from_millis(200)).unwrap();
         coordinator.submit(UpstreamCommand::Request(request(1, &["old"])));
-        wait_for_calls(&git.containment_calls, 1);
+        wait_for_calls(&git.map_calls, 1);
         coordinator.submit(UpstreamCommand::Cancel);
         thread::sleep(Duration::from_millis(100));
         assert!(coordinator.try_result().is_none());
@@ -572,7 +502,7 @@ mod tests {
         let coordinator =
             UpstreamCoordinator::start_with(git.clone(), Duration::from_millis(250)).unwrap();
         coordinator.submit(UpstreamCommand::Request(request(1, &["old"])));
-        wait_for_calls(&git.containment_calls, 1);
+        wait_for_calls(&git.map_calls, 1);
         coordinator.submit(UpstreamCommand::Request(request(2, &["new"])));
         let batch = wait_for_result(&coordinator);
         assert_eq!(batch.generation, 2);
@@ -580,38 +510,106 @@ mod tests {
     }
 
     #[test]
-    fn source_token_change_during_work_never_reports_local_only() {
-        let git = Arc::new(FakeGit::new(4, Duration::from_millis(50)));
+    fn only_exact_tip_equality_is_reported() {
+        let git = Arc::new(FakeGit::new(4, Duration::ZERO));
         let coordinator =
             UpstreamCoordinator::start_with(git.clone(), Duration::from_millis(250)).unwrap();
-        coordinator.submit(UpstreamCommand::Request(request(1, &["local"])));
-        wait_for_calls(&git.containment_calls, 1);
-        git.token.store(5, Ordering::Release);
+        coordinator.submit(UpstreamCommand::Request(request(1, &["exact", "ancestor"])));
+        let batch = wait_for_result(&coordinator);
+        assert!(matches!(
+            batch.results[0].evidence,
+            RemoteRefEvidence::ExactTip { .. }
+        ));
+        assert!(matches!(
+            batch.results[1].evidence,
+            RemoteRefEvidence::LocalOnly { .. }
+        ));
+    }
+
+    #[test]
+    fn expired_request_deadline_starts_no_git_work() {
+        let git = Arc::new(FakeGit::new(4, Duration::ZERO));
+        let coordinator = UpstreamCoordinator::start_with(git.clone(), Duration::ZERO).unwrap();
+        coordinator.submit(UpstreamCommand::Request(request(1, &["exact"])));
         let batch = wait_for_result(&coordinator);
         assert!(matches!(
             batch.results[0].evidence,
             RemoteRefEvidence::Unavailable { .. }
         ));
+        assert_eq!(git.map_calls.load(Ordering::Acquire), 0);
     }
 
     #[test]
-    fn working_set_and_deadline_bound_slow_checks() {
-        let git = Arc::new(FakeGit::new(2, Duration::from_millis(15)));
+    fn working_set_is_truncated_and_uses_one_map_call_at_scale() {
+        let git = Arc::new(FakeGit::new(2, Duration::ZERO));
         let coordinator =
-            UpstreamCoordinator::start_with(git.clone(), Duration::from_millis(40)).unwrap();
+            UpstreamCoordinator::start_with(git.clone(), Duration::from_millis(100)).unwrap();
         let request = UpstreamRequest {
             generation: 1,
-            targets: (0..100)
+            targets: (0..5_000)
                 .map(|index| UpstreamTarget {
                     branch: BranchId::new(format!("branch-{index}")),
                     oid: Arc::from(format!("oid-{index}")),
+                    configured_upstream: ConfiguredUpstream::None,
                 })
                 .collect(),
         };
         coordinator.submit(UpstreamCommand::Request(request));
         let batch = wait_for_result(&coordinator);
         assert_eq!(batch.results.len(), MAX_TARGETS);
-        assert!(git.containment_calls.load(Ordering::Acquire) <= 4);
+        assert_eq!(git.map_calls.load(Ordering::Acquire), 1);
+        assert_eq!(git.containment_calls.load(Ordering::Acquire), 0);
+        assert_eq!(git.patch_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn raw_two_sided_history_does_not_launch_patch_equivalence_work() {
+        let git = Arc::new(FakeGit::new(2, Duration::ZERO));
+        let coordinator =
+            UpstreamCoordinator::start_with(git.clone(), Duration::from_millis(100)).unwrap();
+        let request = UpstreamRequest {
+            generation: 1,
+            targets: Arc::from([UpstreamTarget {
+                branch: BranchId::new("feature"),
+                oid: Arc::from("local-tip"),
+                configured_upstream: ConfiguredUpstream::Diverged {
+                    reference: Arc::from("refs/remotes/origin/feature"),
+                    ahead: 156,
+                    behind: 7,
+                },
+            }]),
+        };
+        coordinator.submit(UpstreamCommand::Request(request));
+        let batch = wait_for_result(&coordinator);
+        assert!(batch.results[0].configured_upstream.is_none());
+        assert_eq!(git.map_calls.load(Ordering::Acquire), 1);
+        assert_eq!(git.containment_calls.load(Ordering::Acquire), 0);
+        assert_eq!(git.patch_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn configured_upstream_compatibility_field_is_always_none() {
+        let git = Arc::new(FakeGit::new(2, Duration::ZERO));
+        let coordinator =
+            UpstreamCoordinator::start_with(git.clone(), Duration::from_millis(100)).unwrap();
+        let target = UpstreamTarget {
+            branch: BranchId::new("feature"),
+            oid: Arc::from("local-tip"),
+            configured_upstream: ConfiguredUpstream::Rewritten {
+                reference: Arc::from("refs/remotes/origin/feature"),
+                ahead: 156,
+                behind: 7,
+            },
+        };
+
+        coordinator.submit(UpstreamCommand::Request(UpstreamRequest {
+            generation: 2,
+            targets: Arc::from([target]),
+        }));
+
+        let batch = wait_for_result(&coordinator);
+        assert!(batch.results[0].configured_upstream.is_none());
+        assert_eq!(git.patch_calls.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -622,7 +620,7 @@ mod tests {
         for generation in 1..=(RESULT_CAPACITY as u64 + 3) {
             let oid = format!("oid-{generation}");
             coordinator.submit(UpstreamCommand::Request(request(generation, &[&oid])));
-            wait_for_calls(&git.containment_calls, generation as usize);
+            wait_for_calls(&git.map_calls, generation as usize);
             thread::sleep(Duration::from_millis(2));
         }
         thread::sleep(Duration::from_millis(20));

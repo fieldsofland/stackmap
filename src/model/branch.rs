@@ -54,6 +54,11 @@ pub enum ConfiguredUpstream {
         ahead: u64,
         behind: u64,
     },
+    Rewritten {
+        reference: Arc<str>,
+        ahead: u64,
+        behind: u64,
+    },
     Gone {
         reference: Arc<str>,
     },
@@ -68,6 +73,11 @@ pub enum RemoteRefEvidence {
     #[default]
     NotRequested,
     Checking,
+    ExactTip {
+        reference: Arc<str>,
+        source_token: u64,
+        checked_at: SystemTime,
+    },
     Contained {
         reference: Arc<str>,
         source_token: u64,
@@ -90,6 +100,14 @@ pub struct PullRequest {
     pub title: Arc<str>,
     pub url: Arc<str>,
     pub status: PullRequestStatus,
+    pub head_oid: Option<Arc<str>>,
+    pub match_quality: PullRequestMatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PullRequestMatch {
+    ExactTip,
+    StaleTip,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,6 +116,16 @@ pub enum PullRequestStatus {
     Approved,
     Closed,
     Merged,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum PullRequestLookup {
+    #[default]
+    NotRequested,
+    Checking,
+    NoMatch,
+    Ready,
+    Unavailable(Arc<str>),
 }
 
 impl PullRequestStatus {
@@ -127,6 +155,19 @@ pub enum GraphiteProvenance {
     Degraded,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum GraphiteHealth {
+    #[default]
+    NotTracked,
+    NotRequested,
+    Checking,
+    Healthy,
+    NeedsRestack {
+        recorded_parent: BranchId,
+    },
+    Unavailable(Arc<str>),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Branch {
     pub id: BranchId,
@@ -136,6 +177,7 @@ pub struct Branch {
     pub stack_root: BranchId,
     pub trunk: Option<BranchId>,
     pub graphite: GraphiteProvenance,
+    pub graphite_health: GraphiteHealth,
     pub committed_at: i64,
     pub current: bool,
     pub dirty: bool,
@@ -144,6 +186,7 @@ pub struct Branch {
     pub remote_ref: RemoteRefEvidence,
     pub diff: DiffState,
     pub pr: Option<PullRequest>,
+    pub pr_lookup: PullRequestLookup,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

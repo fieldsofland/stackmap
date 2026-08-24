@@ -51,6 +51,11 @@ pub enum Key {
     Right,
     Home,
     End,
+    Tab,
+    ClearNameDraft,
+    CopyBranch,
+    CopySection,
+    CopyStack,
     Character(char),
     Quit,
     Ignored,
@@ -58,8 +63,27 @@ pub enum Key {
 
 impl Key {
     fn from_event(event: KeyEvent) -> Self {
+        if event.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(event.code, KeyCode::Char('u') | KeyCode::Char('U'))
+        {
+            return Self::ClearNameDraft;
+        }
         if event.modifiers.contains(KeyModifiers::CONTROL) && event.code == KeyCode::Char('c') {
             return Self::Quit;
+        }
+        if event.modifiers == KeyModifiers::SHIFT && event.code == KeyCode::Backspace {
+            return Self::ClearNameDraft;
+        }
+        if matches!(event.code, KeyCode::Char('c') | KeyCode::Char('C')) {
+            if event.modifiers == KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT {
+                return Self::CopyStack;
+            }
+            if event.modifiers == KeyModifiers::SUPER | KeyModifiers::SHIFT {
+                return Self::CopySection;
+            }
+            if event.modifiers == KeyModifiers::SUPER {
+                return Self::CopyBranch;
+            }
         }
         match event.code {
             KeyCode::Up if event.modifiers.contains(KeyModifiers::ALT) => Self::SectionUp,
@@ -88,6 +112,7 @@ impl Key {
             KeyCode::Right => Self::Right,
             KeyCode::Home => Self::Home,
             KeyCode::End => Self::End,
+            KeyCode::Tab => Self::Tab,
             KeyCode::Char(character) => Self::Character(character),
             _ => Self::Ignored,
         }

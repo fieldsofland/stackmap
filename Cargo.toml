@@ -29,6 +29,7 @@ benchmarking = []
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 crossterm = "0.29"
+libc = "0.2"
 notify = "8.2"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
 rusqlite = { version = "0.38", features = ["bundled"] }

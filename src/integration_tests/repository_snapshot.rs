@@ -158,16 +158,16 @@ fn local_remote_fixture_classifies_upstreams_and_containment_without_fetching() 
         repository.path(),
         &["update-ref", "refs/remotes/origin/zzz", &contained_oid],
     );
+    let containing = adapter
+        .containing_remote_refs(&[Arc::from(contained_oid), Arc::from(local_only_oid.clone())])
+        .unwrap();
+    assert_eq!(containing.get(local_only_oid.as_str()), None);
     assert_eq!(
-        adapter
-            .containing_remote_ref(&contained_oid)
-            .unwrap()
-            .as_deref(),
+        containing
+            .values()
+            .next()
+            .map(|reference| reference.as_ref()),
         Some("origin/aaa")
-    );
-    assert_eq!(
-        adapter.containing_remote_ref(&local_only_oid).unwrap(),
-        None
     );
     let multiple_refs_token = adapter.remote_ref_token().unwrap();
     assert_ne!(multiple_refs_token, token);

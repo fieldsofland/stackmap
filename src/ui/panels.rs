@@ -78,6 +78,17 @@ pub fn footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 "archive"
             }
         )
+    } else if let Overlay::MovePreview(preview) = &app.overlay {
+        format!(
+            " MOVE PREVIEW  {} → {}  {}  ↑↓ target  Tab mode  Enter confirm  Esc cancel",
+            preview.source,
+            preview.target,
+            if preview.only {
+                "branch only"
+            } else {
+                "subtree"
+            }
+        )
     } else {
         let order = match app.order_mode {
             OrderMode::Recent => "recent",
@@ -108,24 +119,19 @@ pub fn footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             "archive"
         };
-        let pull_request_keys = if matches!(app.archive_mode, ArchiveMode::Active)
-            && matches!(app.overlay, Overlay::None)
-            && matches!(app.mutation, MutationState::Idle)
-            && app
-                .selected_branch()
-                .is_some_and(|branch| branch.pr.is_some())
+        let pr_actions = if app
+            .selected_branch()
+            .is_some_and(|branch| branch.pr.is_some())
         {
             "  o/O/y PR"
         } else {
             ""
         };
         if has_supplementary {
-            format!(
-                " a View {archive_target}  x {archive_action}  X delete{pull_request_keys}  ? help"
-            )
+            format!(" a View {archive_target}  x {archive_action}  X delete{pr_actions}  ? help")
         } else {
             format!(
-                " {position}/{}  {order}  {}  {pitch}  a View {archive_target}  x {archive_action}  v range  X delete  ↑↓ {stack_navigation}{pull_request_keys}  ? help",
+                " {position}/{}  {order}  {}  {pitch}  s status  S spacing  ↑↓ {stack_navigation}  a View {archive_target}  x {archive_action}  r restack  m move  R refresh{pr_actions}  ? help",
                 app.projection.navigation.len(),
                 app.scope_label(),
             )
@@ -183,22 +189,8 @@ pub fn detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 pub fn help(frame: &mut Frame<'_>, app: &App) {
-    let text = help_contents(app);
-    let height = u16::try_from(text.lines().count())
-        .unwrap_or(u16::MAX)
-        .saturating_add(2);
-    let area = centered(frame.area(), 78, height);
+    let area = centered(frame.area(), 72, 41);
     frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .alignment(Alignment::Left)
-            .block(Block::default().title(" Help ").borders(Borders::ALL)),
-        area,
-    );
-}
-
-fn help_contents(app: &App) -> String {
     let graphite = app
         .snapshot
         .as_ref()
@@ -210,40 +202,33 @@ fn help_contents(app: &App) -> String {
         GitHubState::Ready => "loaded".to_owned(),
         GitHubState::Unavailable(error) => format!("unavailable: {error}"),
     };
-    let order = match app.order_mode {
-        OrderMode::Recent => "recent order",
-        OrderMode::Alphabetical => "alphabetical order",
-        OrderMode::Graphite => "Graphite order",
-        OrderMode::Chronological => "time order",
-    };
-    let separators = if app.separators {
-        "separators on"
-    } else {
-        "separators off"
-    };
-    format!(
-        "GitHub: {github}\nGraphite: {graphite}\n\n\
-o / O / y           open selected PR / all stack PRs / copy URL\n\
-Esc / ?             close this help\n\
-q or Ctrl-C         quit\n\n\
-Markers: › selected  ○ branch  ● current  ◉ trunk\n         ■ range  * dirty  ⎇ worktree\nRemote:  ✓ pushed  ↑ ahead  ↓ behind  ↕ diverged\n         × gone  ○ no remote  ? unknown\n\n\
-↑/↓ or j/k          previous/next branch\nShift/Cmd+↑/↓ J/K  adjacent stack head, otherwise ±10 rows\nAlt+↑/↓ g/G         top/bottom branch of current section\n\
-t / T               Recent/Graphite toggle / order picker\n+ / - / 0           adjust / reset lane pitch\n\
-h                   focus selected stack; repeat exits\nH                   focus trunk or all Untrunked; repeat exits\n\
-s                   toggle stack spacing\na                   toggle Active / Archive view\n\
-v + arrows          preview contiguous archive/restore range\n/                   filter branch names\n\
-Enter ×2 / Enter    git switch / edit selected label\nc / C               contextual color / color picker\n\
-d                   toggle wide detail sidebar\ni                   toggle visual section boundary\n\
-n                   create missing stack/section label\nx                   archive / restore selected local branch\n\
-X                   guarded delete exact local branch\nr                   full reconciliation\n\n\
-Lowercase x/v change local config only; uppercase X can delete one exact local ref after confirmation. No remote changes or fetch.\n\
-Archive view shows dim, nonselectable ancestry for stack context.\n\
-Focused sections pin their trunk/bottom row.\n\
-Remote evidence uses local remote-tracking refs only; no fetch.\n\
-Colors: stack identity; yellow PR; green/red diff\n\
-Active: {order} / {} / {separators}",
+    let text = format!(
+        "Markers: › selected  ○ branch  ● current  ◉ trunk\n         ■ range  * dirty  ⎇ worktree\nStatus:  local gray  pushed white  # open yellow\n         ✓ # approved/merged green  X # closed red\n         PR replaces pushed; pushed replaces local\n\n↑/↓ or j/k          previous/next branch\nShift/Cmd+↑/↓ J/K  adjacent stack head, otherwise ±10 rows\nAlt+↑/↓ g/G         top/bottom branch of current section\nt / T               Recent/Graphite toggle / order picker\n+ / - / 0           adjust / reset lane pitch\nh                   focus selected stack; repeat exits\nH                   focus trunk or all Untrunked; repeat exits\ns / S               toggle status / stack spacing\na                   toggle Active / Archive view\nv + arrows          preview contiguous archive/restore range\n/                   filter branch names\nEnter ×2 / Enter    switch or move clean worktree / edit label\nc / C               color active indent / color picker\nCmd+C / +Shift / +Opt+Shift  copy branch / section / stack\nd                   toggle wide detail sidebar\ni                   toggle visual section boundary\nn                   edit deepest section / real stack name\nShift+Backspace / Ctrl-U     clear complete name draft\nx                   archive / restore selected local branch\nX                   guarded delete exact local branch\nr / R               restack selected / full reconciliation\nm                   preview Graphite move; Tab toggles --only\no / O / y           open selected PR / stack PRs / copy URL\nEsc                 close/cancel\nq or Ctrl-C         quit\n\nGraphite actions require confirmation and never push or fetch.\nArchive view shows dim, nonselectable ancestry for stack context.\nFocused sections pin their trunk/bottom row.\nPushed evidence uses exact local-tip equality only; no fetch.\nGraphite and provider diagnostics remain in branch details.\nActive: {} / {} / {} / {}\n\nGraphite: {graphite}\nGitHub: {github}",
+        match app.order_mode {
+            OrderMode::Recent => "recent order",
+            OrderMode::Alphabetical => "alphabetical order",
+            OrderMode::Graphite => "Graphite order",
+            OrderMode::Chronological => "time order",
+        },
         app.scope_label(),
-    )
+        if app.separators {
+            "separators on"
+        } else {
+            "separators off"
+        },
+        if app.status_visible {
+            "status on"
+        } else {
+            "status off"
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .alignment(Alignment::Left)
+            .block(Block::default().title(" Help ").borders(Borders::ALL)),
+        area,
+    );
 }
 
 pub fn order_picker(frame: &mut Frame<'_>, app: &App) {
@@ -311,18 +296,39 @@ pub fn checkout_confirmation(frame: &mut Frame<'_>, app: &App) {
     let MutationState::ConfirmingCheckout(target) = &app.mutation else {
         return;
     };
-    let area = centered(frame.area(), 64, 9);
+    let linked_worktree = app.selected_branch().and_then(|branch| {
+        branch.worktree.as_ref().filter(|path| {
+            app.snapshot
+                .as_ref()
+                .is_some_and(|snapshot| *path != &snapshot.root)
+        })
+    });
+    let (title, prompt, action) = if let Some(path) = linked_worktree.as_ref() {
+        (
+            " Move worktree ",
+            format!(
+                "Move this branch to the primary checkout?\n\n{target}\nfrom {}\n\nThe linked worktree must be clean.",
+                path.display()
+            ),
+            "Enter move · Esc cancel",
+        )
+    } else {
+        (
+            " Confirm switch ",
+            format!("Switch to this branch?\n\n{target}"),
+            "Enter switch · Esc cancel",
+        )
+    };
+    let area = centered(
+        frame.area(),
+        64,
+        if linked_worktree.is_some() { 11 } else { 9 },
+    );
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(format!(
-            "Switch to this branch?\n\n{target}\n\nEnter switch · Esc cancel"
-        ))
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .title(" Confirm switch ")
-                .borders(Borders::ALL),
-        ),
+        Paragraph::new(format!("{prompt}\n\n{action}"))
+            .wrap(Wrap { trim: false })
+            .block(Block::default().title(title).borders(Borders::ALL)),
         area,
     );
 }
@@ -350,6 +356,55 @@ pub fn deletion_confirmation(frame: &mut Frame<'_>, app: &App) {
         Paragraph::new(text).wrap(Wrap { trim: false }).block(
             Block::default()
                 .title(" Confirm deletion ")
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
+}
+
+pub fn restack_confirmation(frame: &mut Frame<'_>, app: &App) {
+    let MutationState::ConfirmingRestack(request) = &app.mutation else {
+        return;
+    };
+    let descendants = request.affected.len().saturating_sub(1);
+    let area = centered(frame.area(), 76, 11);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Restack this Graphite upstack?\n\n{}\nonto {}\n{descendants} descendants may move\n\nEnter restack · Esc cancel",
+            request.source.branch, request.expected_parent
+        ))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title(" Confirm restack ")
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
+}
+
+pub fn move_confirmation(frame: &mut Frame<'_>, app: &App) {
+    let MutationState::ConfirmingMove(request) = &app.mutation else {
+        return;
+    };
+    let descendants = request.affected.len().saturating_sub(1);
+    let mode = if request.only {
+        "branch only"
+    } else {
+        "branch and descendants"
+    };
+    let area = centered(frame.area(), 76, 11);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Move {} onto {}?\n\nMode: {mode}\n{descendants} descendants follow\n\nEnter move · Esc cancel",
+            request.source.branch, request.target.branch
+        ))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title(" Confirm Graphite move ")
                 .borders(Borders::ALL),
         ),
         area,

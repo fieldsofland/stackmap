@@ -24,6 +24,8 @@ mod app;
 #[cfg(feature = "benchmarking")]
 mod benchmark_impl;
 #[allow(missing_docs)]
+mod commands;
+#[allow(missing_docs)]
 mod config;
 #[allow(missing_docs)]
 mod events;
@@ -40,20 +42,27 @@ mod ui;
 /// process/terminal shell to private implementation modules; they are not a
 /// general-purpose Git topology library.
 pub mod runtime {
-    pub use crate::app::{Action, App, ConfigWriteRequest};
+    pub use crate::app::{Action, App, ClipboardRequest, ClipboardScope, ConfigWriteRequest};
+    pub use crate::commands::archive::{
+        ArchiveDisposition, ArchiveRequest, ArchiveResult, execute as archive,
+    };
     pub use crate::config::{Config, ConfigMutation};
     pub use crate::events::{Input, Key};
     pub use crate::model::topology::ArchiveMode;
     pub use crate::model::{
-        Branch, BranchId, ConfiguredUpstream, DiffState, GraphiteProvenance, RemoteRefEvidence,
-        RepositorySnapshot, RepositoryState,
+        Branch, BranchId, ConfiguredUpstream, DiffState, GraphiteHealth, GraphiteProvenance,
+        PullRequestLookup, RemoteRefEvidence, RepositorySnapshot, RepositoryState,
     };
+    pub use crate::refresh::github::GithubCommand;
     pub use crate::refresh::{RefreshEvent, RefreshHandle};
     pub use crate::ui::render;
 
     /// Exact local Git operations used by the executable shell.
     pub mod git {
-        pub use crate::adapters::git::{DeleteOutcome, DeleteRequest, GitAdapter};
+        pub use crate::adapters::git::{
+            DeleteOutcome, DeleteRequest, GitAdapter, GraphiteBranchExpectation,
+            GraphiteEdgeExpectation, GraphiteMutationOutcome, MoveRequest, RestackRequest,
+        };
     }
 
     /// Optional GitHub pull-request enrichment.

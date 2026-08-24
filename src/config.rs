@@ -246,6 +246,33 @@ impl Config {
         Ok(())
     }
 
+    /// Applies one mutation to the latest valid on-disk config while holding
+    /// the cross-process config lock.
+    ///
+    /// Unlike [`Self::persist_mutation`], this path never falls back to an
+    /// in-memory config when the latest file cannot be loaded. `validate` runs
+    /// under the lock after that strict load and immediately before mutation
+    /// application and persistence. An empty mutation is validated and returns
+    /// the latest config without rewriting it.
+    pub fn persist_mutation_strict<F>(
+        common_dir: &Path,
+        mutation: &ConfigMutation,
+        validate: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(&Self) -> Result<()>,
+    {
+        let _lock = ConfigLock::acquire(common_dir)?;
+        let mut latest = Self::load(common_dir).context("load latest stackmap config")?;
+        validate(&latest)?;
+        if mutation.is_empty() {
+            return Ok(latest);
+        }
+        latest.apply_mutation_in_memory(mutation)?;
+        latest.save(common_dir)?;
+        Ok(latest)
+    }
+
     pub fn apply_mutation_in_memory(&mut self, mutation: &ConfigMutation) -> Result<()> {
         for color in mutation.color_updates.values().flatten() {
             validate_color(color)?;
@@ -456,6 +483,131 @@ mod tests {
         let config = Config::load(directory.path()).unwrap();
         assert_eq!(config.colors["colored"], "#7aa2f7");
         assert_eq!(config.archived, BTreeSet::from(["hidden".to_owned()]));
+    }
+
+    #[test]
+    fn legacy_persistence_replaces_malformed_latest_config_with_fallback() {
+        let directory = tempdir().unwrap();
+        let path = config_path(directory.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "this is not valid toml = [").unwrap();
+        let fallback = Config {
+            colors: BTreeMap::from([("kept".to_owned(), "#7aa2f7".to_owned())]),
+            ..Config::default()
+        };
+        let mut mutation = ConfigMutation::default();
+        mutation.set_archived(BranchId::new("hidden"), true);
+
+        Config::persist_mutation(directory.path(), &mutation, &fallback).unwrap();
+
+        let config = Config::load(directory.path()).unwrap();
+        assert_eq!(config.colors, fallback.colors);
+        assert!(config.is_archived(&BranchId::new("hidden")));
+    }
+
+    #[test]
+    fn strict_persistence_refuses_malformed_latest_config_without_replacing_it() {
+        let directory = tempdir().unwrap();
+        let path = config_path(directory.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let malformed = b"this is not valid toml = [";
+        fs::write(&path, malformed).unwrap();
+        let mut mutation = ConfigMutation::default();
+        mutation.set_archived(BranchId::new("hidden"), true);
+        let mut validated = false;
+
+        let result = Config::persist_mutation_strict(directory.path(), &mutation, |_| {
+            validated = true;
+            Ok(())
+        });
+
+        assert!(result.is_err());
+        assert!(
+            !validated,
+            "validation must not run after a strict load failure"
+        );
+        assert_eq!(fs::read(path).unwrap(), malformed);
+    }
+
+    #[test]
+    fn strict_persistence_validates_under_lock_and_aborts_without_writing() {
+        let directory = tempdir().unwrap();
+        let original = Config {
+            colors: BTreeMap::from([("kept".to_owned(), "#7aa2f7".to_owned())]),
+            ..Config::default()
+        };
+        original.save(directory.path()).unwrap();
+        let path = config_path(directory.path());
+        let before = fs::read(&path).unwrap();
+        let lock_path = path.with_extension("lock");
+        let mut mutation = ConfigMutation::default();
+        mutation.set_archived(BranchId::new("hidden"), true);
+
+        let result = Config::persist_mutation_strict(directory.path(), &mutation, |latest| {
+            assert_eq!(latest, &original);
+            assert!(lock_path.exists());
+            bail!("source token changed")
+        });
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("source token changed")
+        );
+        assert_eq!(fs::read(path).unwrap(), before);
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn strict_persistence_merges_a_concurrent_unrelated_legacy_mutation() {
+        let directory = tempdir().unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let strict_path = directory.path().to_owned();
+        let strict_barrier = barrier.clone();
+        let strict = thread::spawn(move || {
+            let mut mutation = ConfigMutation::default();
+            mutation.set_archived(BranchId::new("hidden"), true);
+            strict_barrier.wait();
+            Config::persist_mutation_strict(&strict_path, &mutation, |_| Ok(())).unwrap();
+        });
+        let legacy_path = directory.path().to_owned();
+        let legacy_barrier = barrier.clone();
+        let legacy = thread::spawn(move || {
+            let mut mutation = ConfigMutation::default();
+            mutation.set_stack_name(BranchId::new("named"), Some(Arc::from("Concurrent name")));
+            legacy_barrier.wait();
+            Config::persist_mutation(&legacy_path, &mutation, &Config::default()).unwrap();
+        });
+
+        barrier.wait();
+        strict.join().unwrap();
+        legacy.join().unwrap();
+
+        let config = Config::load(directory.path()).unwrap();
+        assert!(config.is_archived(&BranchId::new("hidden")));
+        assert_eq!(
+            config.stack_name(&BranchId::new("named")),
+            Some("Concurrent name")
+        );
+    }
+
+    #[test]
+    fn strict_empty_mutation_returns_latest_config_without_rewriting_it() {
+        let directory = tempdir().unwrap();
+        let path = config_path(directory.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let contents = "# retain this exact formatting\n[colors]\nkept='#7aa2f7'\n";
+        fs::write(&path, contents).unwrap();
+
+        let loaded =
+            Config::persist_mutation_strict(directory.path(), &ConfigMutation::default(), |_| {
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(loaded.color(&BranchId::new("kept")), Some("#7aa2f7"));
+        assert_eq!(fs::read_to_string(path).unwrap(), contents);
     }
 
     #[test]

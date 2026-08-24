@@ -376,6 +376,20 @@ mod tests {
     }
 
     #[test]
+    fn oversized_stdin_is_rejected_before_spawning() {
+        let error = run_bounded_with_stdin(
+            OsStr::new("/bin/sh"),
+            ["-c", "cat"],
+            Path::new("/"),
+            Duration::from_secs(1),
+            64,
+            &vec![b'x'; 64 * 1024 + 1],
+        )
+        .unwrap_err();
+        assert!(matches!(error, CommandError::InputTooLarge(65_537)));
+    }
+
+    #[test]
     fn descendants_cannot_hold_output_pipes_past_the_wall_clock_deadline() {
         let started = Instant::now();
         let error = run_bounded(

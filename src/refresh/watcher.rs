@@ -1,10 +1,10 @@
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-const QUIET_PERIOD: Duration = Duration::from_millis(200);
+const QUIET_PERIOD: Duration = Duration::from_millis(75);
 
 pub(super) struct RepositoryWatcher {
     watcher: Option<RecommendedWatcher>,
@@ -39,30 +39,47 @@ pub(super) fn watch_repository(
     }
     let worker = thread::Builder::new()
         .name("stackmap-watcher".into())
-        .spawn(move || {
-            loop {
-                if stop_receive.try_recv().is_ok() {
-                    break;
-                }
-                if events_receive
-                    .recv_timeout(Duration::from_millis(100))
-                    .is_err()
-                {
-                    continue;
-                }
-                while events_receive.recv_timeout(QUIET_PERIOD).is_ok() {}
-                if stop_receive.try_recv().is_ok() {
-                    break;
-                }
-                requester.request();
-            }
-        })
+        .spawn(move || run_worker(events_receive, stop_receive, requester))
         .map_err(notify::Error::io)?;
     Ok(RepositoryWatcher {
         watcher: Some(watcher),
         stop: stop_send,
         worker: Some(worker),
     })
+}
+
+fn run_worker(
+    events_receive: mpsc::Receiver<()>,
+    stop_receive: mpsc::Receiver<()>,
+    requester: super::RefreshRequester,
+) {
+    loop {
+        match stop_receive.try_recv() {
+            Ok(()) | Err(TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty) => {}
+        }
+        match events_receive.recv_timeout(Duration::from_millis(100)) {
+            Ok(()) => {}
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        // Refresh on the leading edge. Further events update the
+        // coalesced request epoch while this burst is settling.
+        requester.request();
+        loop {
+            match events_receive.recv_timeout(QUIET_PERIOD) {
+                Ok(()) => {
+                    requester.request();
+                }
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        match stop_receive.try_recv() {
+            Ok(()) | Err(TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty) => {}
+        }
+    }
 }
 
 fn relevant(path: &Path, git_dir: &Path, common_dir: &Path) -> bool {
@@ -116,7 +133,24 @@ impl Drop for RepositoryWatcher {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU64;
+
     use super::*;
+
+    fn requester() -> (
+        super::super::RefreshRequester,
+        mpsc::Receiver<super::super::Request>,
+    ) {
+        let (send, receive) = mpsc::sync_channel(1);
+        (
+            super::super::RefreshRequester {
+                requests: send,
+                next_epoch: std::sync::Arc::new(AtomicU64::new(0)),
+                pending_epoch: std::sync::Arc::new(AtomicU64::new(0)),
+            },
+            receive,
+        )
+    }
 
     #[test]
     fn ignores_transient_and_object_store_activity() {
@@ -129,5 +163,24 @@ mod tests {
             git,
             git
         ));
+    }
+
+    #[test]
+    fn worker_exits_when_the_filesystem_event_channel_disconnects() {
+        let (events_send, events_receive) = mpsc::sync_channel(1);
+        let (stop_send, stop_receive) = mpsc::sync_channel(1);
+        let (done_send, done_receive) = mpsc::sync_channel(1);
+        let (requester, _requests) = requester();
+        drop(events_send);
+
+        let worker = thread::spawn(move || {
+            run_worker(events_receive, stop_receive, requester);
+            let _ = done_send.send(());
+        });
+
+        let result = done_receive.recv_timeout(Duration::from_millis(250));
+        let _ = stop_send.send(());
+        worker.join().unwrap();
+        assert_eq!(result, Ok(()));
     }
 }

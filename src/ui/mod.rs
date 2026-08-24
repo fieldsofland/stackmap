@@ -26,6 +26,14 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, now: SystemTime) {
         panels::deletion_confirmation(frame, app);
         return;
     }
+    if matches!(app.mutation, MutationState::ConfirmingRestack(_)) {
+        panels::restack_confirmation(frame, app);
+        return;
+    }
+    if matches!(app.mutation, MutationState::ConfirmingMove(_)) {
+        panels::move_confirmation(frame, app);
+        return;
+    }
     match &app.overlay {
         Overlay::Help => panels::help(frame, app),
         Overlay::OrderPicker(_) => panels::order_picker(frame, app),
@@ -33,6 +41,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, now: SystemTime) {
         Overlay::None
         | Overlay::Search
         | Overlay::StackNameEditor(_)
-        | Overlay::ArchiveRange(_) => {}
+        | Overlay::ArchiveRange(_)
+        | Overlay::MovePreview(_) => {}
     }
 }

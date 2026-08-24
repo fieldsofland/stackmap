@@ -30,27 +30,38 @@ pub struct RenderGeometry {
     pub worktree: ColumnRange,
     pub remote: Option<ColumnRange>,
     pub pr: Option<ColumnRange>,
+    pub stack_health: Option<ColumnRange>,
 }
 
 impl RenderGeometry {
+    #[cfg(test)]
     pub fn new(width: u16, mode: WidthMode, requested: LanePitch, lane_count: usize) -> Self {
+        Self::new_with_status(width, mode, requested, lane_count, true)
+    }
+
+    pub fn new_with_status(
+        width: u16,
+        mode: WidthMode,
+        requested: LanePitch,
+        lane_count: usize,
+        status_visible: bool,
+    ) -> Self {
+        const COLUMN_GAP: usize = 2;
         let width = width as usize;
         let wide_worktree = mode != WidthMode::Narrow;
         let show_hash = width >= 100;
         let show_time = width >= 56;
-        let show_remote = width >= 72;
-        let show_pr = width >= 72;
+        let show_full_status = width >= 100;
         let hash_width = usize::from(show_hash) * 7;
-        let hash_time_gap = usize::from(show_hash);
+        let hash_time_gap = usize::from(show_hash) * COLUMN_GAP;
         let time_width = usize::from(show_time) * 6;
-        let time_diff_gap = usize::from(show_time);
+        let time_diff_gap = usize::from(show_time) * COLUMN_GAP;
         let diff_width = 10;
-        let diff_worktree_gap = 1;
+        let diff_worktree_gap = COLUMN_GAP;
         let worktree_width = if wide_worktree { 18 } else { 2 };
-        let remote_width = usize::from(show_remote) * 11;
-        let remote_pr_gap = usize::from(show_remote && show_pr);
-        let pr_width = usize::from(show_pr) * 8;
-        let pr_edge_gap = usize::from(show_pr);
+        let status_width = usize::from(status_visible) * if show_full_status { 12 } else { 8 };
+        let status_gap = usize::from(status_visible) * COLUMN_GAP;
+        let status_edge_gap = usize::from(status_visible);
         let metadata_width = hash_width
             + hash_time_gap
             + time_width
@@ -58,10 +69,9 @@ impl RenderGeometry {
             + diff_width
             + diff_worktree_gap
             + worktree_width
-            + remote_width
-            + remote_pr_gap
-            + pr_width
-            + pr_edge_gap;
+            + status_gap
+            + status_width
+            + status_edge_gap;
         let metadata_start = width.saturating_sub(metadata_width);
         let mut cursor = metadata_start;
         let hash = show_hash.then(|| {
@@ -90,18 +100,17 @@ impl RenderGeometry {
             width: worktree_width,
         };
         cursor += worktree_width;
-        let remote = show_remote.then(|| {
+        let pr = status_visible.then(|| {
+            cursor += COLUMN_GAP;
             let range = ColumnRange {
                 x: cursor,
-                width: remote_width,
+                width: status_width,
             };
-            cursor += remote_width + remote_pr_gap;
+            cursor += status_width;
             range
         });
-        let pr = show_pr.then_some(ColumnRange {
-            x: cursor,
-            width: pr_width,
-        });
+        let remote = None;
+        let stack_health = None;
 
         let automatic = match mode {
             WidthMode::TooNarrow | WidthMode::Narrow => 2,
@@ -139,6 +148,7 @@ impl RenderGeometry {
             worktree,
             remote,
             pr,
+            stack_health,
         }
     }
 

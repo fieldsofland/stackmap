@@ -25,6 +25,7 @@ fn branches(count: usize, stack_size: usize) -> Vec<Branch> {
             stack_root: root,
             trunk: None,
             graphite: GraphiteProvenance::DefinitelyUntracked,
+            graphite_health: crate::model::GraphiteHealth::NotTracked,
             committed_at: 1_700_000_000 + index as i64,
             current: index == 0,
             dirty: false,
@@ -33,6 +34,7 @@ fn branches(count: usize, stack_size: usize) -> Vec<Branch> {
             remote_ref: RemoteRefEvidence::NotRequested,
             diff: DiffState::Loading,
             pr: None,
+            pr_lookup: crate::model::PullRequestLookup::NotRequested,
         });
     }
     values
