@@ -2,6 +2,8 @@
 
 ## 2026-08-24
 
+- Added `stackmap stack rename [--repo PATH] [--dry-run] BRANCH NAME` for agents. Any member branch resolves to its canonical displayed stack ID, including fork child stacks. The command has deterministic output, idempotence, strict name validation, stable repository and topology revalidation, and locked atomic config persistence without Git, Graphite, worktree, remote, or PR mutation.
+- Passed 288 library tests, 21 CLI tests, 2 terminal-shutdown tests, responsiveness benchmarks, strict offline Clippy, and the locked offline release build. Installed and ad-hoc signed `/Users/matt/.cargo/bin/stackmap`; installed SHA-256 is `59eced4f2e12345daeda4392fe8636d20646230226a9d3f54b0944170ebf2bd5` and the unsigned release artifact is `0fd2bd38fb72569b18d33abfd8484b94b1c0b2a422baabf3592508e7ab81d0b4`. The installed CLI passed dry-run, write, idempotence, and unchanged-ref smoke tests in a disposable repository.
 - Collapsed the separate PR, pushed, and Graphite row fields into one right-hand status. Rows now show gray `local`, white `pushed`, yellow `#N`, green `✓ #N` for approved or merged PRs, or red `X #N` for closed PRs. PR state wins over pushed, and pushed wins over local.
 - Removed `not pushed`, checking, unavailable, stale-match, and restack tokens from branch rows. Their underlying evidence remains available in branch details. Semantic status colors remain intact on selected rows.
 - Passed 283 library tests, 15 binary tests, 2 terminal-shutdown tests, 2 doctests, strict offline Clippy, and the locked offline release build. Installed and ad-hoc signed `/Users/matt/.cargo/bin/stackmap`; SHA-256 is `5ea37628f40abcd7930cc0050592e7224ee220c4098a298813d02b62c54dff73`.

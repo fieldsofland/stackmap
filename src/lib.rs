@@ -46,6 +46,9 @@ pub mod runtime {
     pub use crate::commands::archive::{
         ArchiveDisposition, ArchiveRequest, ArchiveResult, execute as archive,
     };
+    pub use crate::commands::stack::{
+        StackRenameDisposition, StackRenameRequest, StackRenameResult, rename as rename_stack,
+    };
     pub use crate::config::{Config, ConfigMutation};
     pub use crate::events::{Input, Key};
     pub use crate::model::topology::ArchiveMode;
