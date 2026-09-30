@@ -1161,10 +1161,12 @@ fn forty_column_terminal_renders_branches() {
 #[test]
 fn metadata_columns_leave_time_diff_and_pr_edge_gutters() {
     let geometry = RenderGeometry::new(100, WidthMode::Medium, LanePitch::Auto, 2);
+    let hash = geometry.hash.expect("hash column");
     let time = geometry.time.expect("time column");
     let remote = geometry.remote.expect("remote column");
     let pr = geometry.pr.expect("PR column");
 
+    assert_eq!(time.x, hash.x + hash.width + 1);
     assert_eq!(geometry.diff.x, time.x + time.width + 1);
     assert_eq!(
         geometry.worktree.x,
@@ -1173,6 +1175,60 @@ fn metadata_columns_leave_time_diff_and_pr_edge_gutters() {
     assert_eq!(remote.x, geometry.worktree.x + geometry.worktree.width);
     assert_eq!(pr.x, remote.x + remote.width + 1);
     assert_eq!(pr.x + pr.width + 1, geometry.width);
+}
+
+const TRUNK_OID: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
+const FEATURE_OID: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f00fedcba9";
+
+fn render_trunk_and_feature(width: u16) -> Vec<String> {
+    let mut trunk = common::branch("main", None, "main", true);
+    trunk.trunk = Some(BranchId::new("main"));
+    trunk.graphite = crate::model::GraphiteProvenance::Tracked;
+    trunk.oid = Arc::from(TRUNK_OID);
+    let mut feature = common::branch("feature", None, "feature", false);
+    feature.oid = Arc::from(FEATURE_OID);
+    let mut snapshot = (*common::snapshot(vec![trunk, feature])).clone();
+    snapshot.configured_trunks = Arc::from([BranchId::new("main")]);
+    snapshot.trunks = snapshot.configured_trunks.clone();
+    let mut app = App::default();
+    app.apply_snapshot(Arc::new(snapshot));
+    let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+    terminal
+        .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
+        .unwrap();
+    rendered_lines(&terminal)
+}
+
+#[test]
+fn branch_and_trunk_rows_show_short_commit_hash() {
+    let lines = render_trunk_and_feature(100);
+    let hash = RenderGeometry::new(100, WidthMode::Medium, LanePitch::Auto, 1)
+        .hash
+        .expect("hash column");
+    for (name, oid) in [("main ", TRUNK_OID), ("feature ", FEATURE_OID)] {
+        let (_, row) = line_with(&lines, name);
+        assert_eq!(metadata_column_text(row, hash), oid[..7], "{name:?} row");
+        assert!(!row.contains(&oid[..8]), "{name:?} row shows only 7 chars");
+    }
+}
+
+#[test]
+fn commit_hash_is_the_first_metadata_column_to_drop() {
+    let narrow = RenderGeometry::new(99, WidthMode::Medium, LanePitch::Auto, 1);
+    assert!(narrow.hash.is_none());
+    assert!(narrow.time.is_some() && narrow.remote.is_some() && narrow.pr.is_some());
+    let lines = render_trunk_and_feature(99);
+    for (name, oid) in [("main ", TRUNK_OID), ("feature ", FEATURE_OID)] {
+        let (_, row) = line_with(&lines, name);
+        assert!(
+            !row.contains(&oid[..7]),
+            "{name:?} row hides hash at 99 columns"
+        );
+    }
+
+    let with_hash = RenderGeometry::new(100, WidthMode::Medium, LanePitch::Auto, 1);
+    let narrowest_medium = RenderGeometry::new(90, WidthMode::Medium, LanePitch::Auto, 1);
+    assert!(with_hash.name_width(1) >= narrowest_medium.name_width(1));
 }
 
 #[test]
