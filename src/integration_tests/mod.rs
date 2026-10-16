@@ -8,3 +8,5 @@ mod repository_snapshot;
 mod terminal_interaction;
 mod topology_layout;
 mod tui_rendering;
+
+mod ux_actions;

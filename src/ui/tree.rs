@@ -22,7 +22,7 @@ mod connectors;
 mod details;
 
 use connectors::{paint_bits, paint_overflow_cue};
-pub use details::{detail, evidence_source_footer, local_detail, relative_time};
+pub use details::{detail, relative_time};
 
 const UP: u8 = 1;
 const DOWN: u8 = 2;
@@ -584,7 +584,7 @@ fn branch_line(
             metadata_emphasis,
         );
         if let Some(range) = geometry.pr {
-            let (label, color) = branch_status(branch);
+            let (label, color) = branch_status(branch, geometry.width >= 140);
             put_right_preserved(
                 &mut cells,
                 range,
@@ -635,7 +635,7 @@ fn paint_archive_evidence(
             format!("⎇ {}", truncate(basename, 10))
         });
     }
-    let (status, color) = branch_status(branch);
+    let (status, color) = branch_status(branch, geometry.width >= 140);
     if status_visible {
         badges.push(status);
     }
@@ -679,31 +679,49 @@ fn pushed_state(branch: &Branch) -> PushedState {
     }
 }
 
-fn branch_status(branch: &Branch) -> (String, Color) {
+fn branch_status(branch: &Branch, expanded: bool) -> (String, Color) {
     if let Some(pr) = branch.pr.as_ref() {
-        return pr_status(pr);
-    }
-    match pushed_state(branch) {
-        PushedState::Pushed => ("pushed".into(), Color::White),
-        PushedState::NotPushed | PushedState::Checking | PushedState::Unavailable => {
-            ("local".into(), Color::Gray)
+        let (mut label, color) = pr_status(pr);
+        if expanded {
+            label.push_str(&format!(" {}", pr.status.label()));
         }
+        if pr.match_quality == crate::model::PullRequestMatch::StaleTip {
+            label.push('~');
+        }
+        match branch.pr_lookup {
+            crate::model::PullRequestLookup::Checking => label.push_str(" …"),
+            crate::model::PullRequestLookup::Unavailable(_) => label.push_str(" !"),
+            _ => {}
+        }
+        return (label, color);
     }
+    let (mut label, color) = match pushed_state(branch) {
+        PushedState::Pushed => ("pushed".to_owned(), Color::White),
+        PushedState::NotPushed | PushedState::Checking | PushedState::Unavailable => {
+            ("local".to_owned(), Color::Gray)
+        }
+    };
+    let suffix = match branch.pr_lookup {
+        crate::model::PullRequestLookup::NotRequested => " ?",
+        crate::model::PullRequestLookup::Checking => " …",
+        crate::model::PullRequestLookup::Unavailable(_) => " !",
+        _ => "",
+    };
+    label.push_str(suffix);
+    (label, color)
 }
 
 fn pr_status(pr: &crate::model::PullRequest) -> (String, Color) {
     let label = match pr.status {
         crate::model::PullRequestStatus::Open => format!("#{}", pr.number),
-        crate::model::PullRequestStatus::Approved | crate::model::PullRequestStatus::Merged => {
-            format!("✓ #{}", pr.number)
-        }
-        crate::model::PullRequestStatus::Closed => format!("X #{}", pr.number),
+        crate::model::PullRequestStatus::Approved => format!("✓ #{}", pr.number),
+        crate::model::PullRequestStatus::Merged => format!("⑂ #{}", pr.number),
+        crate::model::PullRequestStatus::Closed => format!("× #{}", pr.number),
     };
     let color = match pr.status {
         crate::model::PullRequestStatus::Open => Color::Yellow,
-        crate::model::PullRequestStatus::Approved | crate::model::PullRequestStatus::Merged => {
-            Color::Green
-        }
+        crate::model::PullRequestStatus::Approved => Color::Green,
+        crate::model::PullRequestStatus::Merged => Color::Rgb(187, 154, 247),
         crate::model::PullRequestStatus::Closed => Color::Red,
     };
     (label, color)

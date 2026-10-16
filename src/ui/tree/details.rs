@@ -41,7 +41,7 @@ pub fn exact_time(timestamp: i64) -> String {
 }
 
 pub fn detail(branch: &Branch) -> String {
-    let pr = branch
+    let mut pr = branch
         .pr
         .as_ref()
         .map(|pr| {
@@ -68,6 +68,15 @@ pub fn detail(branch: &Branch) -> String {
                 format!("PR lookup: unavailable ({reason})")
             }
         });
+    if branch.pr.is_some() {
+        match &branch.pr_lookup {
+            PullRequestLookup::Checking => pr.push_str(" · refreshing"),
+            PullRequestLookup::Unavailable(reason) => {
+                pr.push_str(&format!(" · lookup unavailable: {reason}"))
+            }
+            _ => {}
+        }
+    }
     let worktree = branch
         .worktree
         .as_ref()
@@ -107,58 +116,6 @@ fn graphite_health_detail(health: &GraphiteHealth) -> String {
         GraphiteHealth::Unavailable(reason) => {
             format!("Graphite stack health: unavailable ({reason})")
         }
-    }
-}
-
-pub fn local_detail(branch: &Branch) -> String {
-    let worktree = branch
-        .worktree
-        .as_ref()
-        .map(|path| format!("Worktree: {}", path.display()))
-        .unwrap_or_else(|| "Worktree: not checked out".into());
-    format!(
-        "{}\nLast edited: {}\n{}\n{}\n{}\nArchive view: local refs only · no fetch",
-        branch.id,
-        exact_time(branch.committed_at),
-        worktree,
-        upstream_detail(&branch.configured_upstream),
-        remote_detail(&branch.remote_ref),
-    )
-}
-
-pub fn evidence_source_footer(branch: &Branch) -> String {
-    match &branch.remote_ref {
-        RemoteRefEvidence::ExactTip {
-            source_token,
-            checked_at,
-            ..
-        }
-        | RemoteRefEvidence::Contained {
-            source_token,
-            checked_at,
-            ..
-        }
-        | RemoteRefEvidence::LocalOnly {
-            source_token,
-            checked_at,
-        } => format!(
-            "local-ref token {:016x} @ {}",
-            source_token,
-            system_time(*checked_at)
-        ),
-        RemoteRefEvidence::Unavailable {
-            source_token,
-            checked_at,
-            ..
-        } => format!(
-            "local-ref token {} @ {}",
-            source_token
-                .map(|token| format!("{token:016x}"))
-                .unwrap_or_else(|| "unknown".into()),
-            system_time(*checked_at)
-        ),
-        RemoteRefEvidence::Checking => "local-ref evidence checking…".into(),
-        RemoteRefEvidence::NotRequested => "local-ref evidence not checked".into(),
     }
 }
 

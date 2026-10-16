@@ -265,7 +265,7 @@ fn move_preview_is_explicit_and_tab_updates_its_mode() {
     assert!(
         rendered_lines(&terminal)
             .join("\n")
-            .contains("MOVE PREVIEW")
+            .contains("Move preview")
     );
     app.handle_key(Key::Tab);
     terminal
@@ -553,8 +553,12 @@ fn selected_rows_use_dark_content_and_current_rows_use_tinted_stack_fill() {
 fn pull_request_status_uses_compact_lifecycle_symbols_and_colors() {
     for (status, expected, color) in [
         (PullRequestStatus::Approved, "✓ #42", Color::Green),
-        (PullRequestStatus::Merged, "✓ #42", Color::Green),
-        (PullRequestStatus::Closed, "X #42", Color::Red),
+        (
+            PullRequestStatus::Merged,
+            "⑂ #42",
+            Color::Rgb(187, 154, 247),
+        ),
+        (PullRequestStatus::Closed, "× #42", Color::Red),
     ] {
         let mut branch = common::branch("feature", None, "feature", false);
         branch.pr = Some(PullRequest {
@@ -692,7 +696,7 @@ fn footer_labels_a_as_view_archive() {
     assert!(
         rendered_lines(&terminal)
             .iter()
-            .any(|line| line.contains("s status  S spacing"))
+            .any(|line| line.contains("? Actions"))
     );
 }
 
@@ -740,6 +744,7 @@ fn worktree_indicator_is_fixed_and_wide_detail_shows_path() {
         .collect();
     assert!(rendered.contains("/tmp/linked-worktree"));
 
+    app.detail_sidebar = false;
     let mut narrow = Terminal::new(TestBackend::new(40, 10)).unwrap();
     narrow
         .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
@@ -1125,10 +1130,10 @@ fn archive_mode_is_unmistakably_framed_and_empty_state_explains_return() {
         .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let rendered = rendered_lines(&terminal).join("\n");
-    assert!(rendered.contains("ARCHIVE · local refs only · no fetch"));
+    assert!(rendered.contains("Active | [Archive]"));
     assert!(rendered.contains("No archived branches · press a to return to Active"));
-    assert!(rendered.contains("x restore"));
-    assert!(rendered.contains("X delete"));
+    assert!(rendered.contains("x Restore"));
+    assert!(rendered.contains("? Actions"));
 }
 
 #[test]
@@ -1163,7 +1168,7 @@ fn archive_badge_stays_visible_at_minimum_width_with_a_long_repository_path() {
         .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let header = rendered_lines(&terminal)[0].clone();
-    assert!(header.contains("ARCHIVE · local refs only · no fetch"));
+    assert!(header.contains("Active | [Archive]"));
 }
 
 #[test]
@@ -1181,7 +1186,7 @@ fn archive_range_uses_a_non_color_marker_and_exposes_action_count_and_endpoints(
         .unwrap();
     let rendered = rendered_lines(&terminal).join("\n");
     assert!(rendered.contains("■"));
-    assert!(rendered.contains("RANGE ARCHIVE 1 branches"));
+    assert!(rendered.contains("Range Archive 1 branches"));
     assert!(rendered.contains("feature → feature"));
     assert!(rendered.contains("Enter archive"));
 }
@@ -1320,10 +1325,10 @@ fn right_status_column_ignores_graphite_health() {
     let (_, line) = line_with(&lines, "feature");
 
     let status = geometry.pr.expect("status column");
-    assert_eq!(status.width, 12);
+    assert_eq!(status.width, 22);
     assert_eq!(
         char_column(line, "local"),
-        Some(status.x + status.width - 5)
+        Some(status.x + status.width - 7)
     );
     assert!(!line.contains("restack"));
 }
@@ -1597,7 +1602,7 @@ fn stale_health_remains_visible_alongside_messages() {
         .map(|cell| cell.symbol())
         .collect();
     assert!(rendered.contains("stale"));
-    assert!(rendered.contains("STALE: refresh failed"));
+    assert!(rendered.contains("Stale: refresh failed"));
 }
 
 #[test]
@@ -1633,10 +1638,10 @@ fn footer_keeps_controls_progress_notices_and_stale_health_independent() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(progress.contains("? help"));
+    assert!(progress.contains("? Actions"));
     assert!(progress.contains("ordinary message"));
     assert!(progress.contains("verifying checkout of feature"));
-    assert!(progress.contains("STALE: refresh failed"));
+    assert!(progress.contains("Stale: refresh failed"));
 
     let mut matching = (*common::snapshot(vec![
         common::branch("main", None, "main", false),
@@ -1656,10 +1661,10 @@ fn footer_keeps_controls_progress_notices_and_stale_health_independent() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(reconciled.contains("? help"));
+    assert!(reconciled.contains("? Actions"));
     assert!(reconciled.contains("ordinary message"));
     assert!(reconciled.contains("checked out feature"));
-    assert!(reconciled.contains("STALE: later refresh failed"));
+    assert!(reconciled.contains("Stale: later refresh failed"));
     assert!(!reconciled.contains("verifying checkout"));
 }
 
@@ -1692,8 +1697,8 @@ fn verified_deletion_returns_to_controls_without_stuck_progress() {
         .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     let rendered = rendered_lines(&terminal).join("\n");
-    assert!(rendered.contains("X delete"));
-    assert!(rendered.contains("? help"));
+    assert!(rendered.contains("? Actions"));
+    assert!(rendered.contains("? Actions"));
     assert!(rendered.contains("deleted merged locally"));
     assert!(!rendered.contains("verifying deletion"));
 }
@@ -1834,8 +1839,8 @@ fn forty_column_archive_row_composes_worktree_and_unified_status() {
     assert!(rendered.contains('⎇'));
     assert!(rendered.contains("local"));
     assert!(!rendered.contains("!DIV"));
-    assert!(rendered.contains("ARCHIVE"));
-    assert!(rendered.contains("000000000000002c"));
+    assert!(rendered.contains("[Archive]"));
+    assert!(rendered.contains("PR ? Not checked"));
 
     let mut wide = Terminal::new(TestBackend::new(140, 10)).unwrap();
     wide.draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
@@ -1869,7 +1874,7 @@ fn wide_archive_detail_reports_canonical_upstream_source_token_time_and_no_fetch
         .set_archived_in_memory(&BranchId::new("hidden"), true);
     app.handle_key(crate::events::Key::Character('a'));
 
-    let mut terminal = Terminal::new(TestBackend::new(180, 12)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(180, 26)).unwrap();
     terminal
         .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
@@ -1928,22 +1933,18 @@ fn help_documents_archive_range_and_picker_keys() {
         .iter()
         .map(|cell| cell.symbol())
         .collect();
-    assert!(rendered.contains("archive / restore selected local branch"));
-    assert!(rendered.contains("guarded delete exact local branch"));
-    assert!(rendered.contains("preview contiguous archive/restore range"));
-    assert!(rendered.contains("order picker"));
-    assert!(rendered.contains("color picker"));
-    assert!(rendered.contains("› selected"));
-    assert!(rendered.contains("○ branch"));
-    assert!(rendered.contains("● current"));
-    assert!(rendered.contains("◉ trunk"));
-    assert!(rendered.contains("■ range"));
-    assert!(rendered.contains("* dirty"));
-    assert!(rendered.contains("⎇ worktree"));
-    assert!(rendered.contains("toggle status / stack spacing"));
-    assert!(rendered.contains("copy branch / section / stack"));
-    assert!(rendered.contains("edit deepest section / real stack name"));
-    assert!(rendered.contains("clear complete name draft"));
+    assert!(rendered.contains("Actions · type to search"));
+    assert!(rendered.contains("Enter run"));
+    assert!(
+        app.action_menu_entries()
+            .iter()
+            .any(|entry| entry.label.contains("Delete local Git branch"))
+    );
+    assert!(
+        app.action_menu_entries()
+            .iter()
+            .any(|entry| entry.label == "Copy stack branch names")
+    );
 }
 
 #[test]
@@ -2097,7 +2098,7 @@ fn short_focused_section_bottom_aligns_immediately_above_sticky_trunk() {
 }
 
 #[test]
-fn footer_describes_contextual_stack_or_ten_row_navigation() {
+fn footer_prioritizes_actions_and_keeps_navigation_in_searchable_menu() {
     let mut app = App::default();
     app.apply_snapshot(common::snapshot(vec![
         common::branch("one-off", None, "one-off", false),
@@ -2118,7 +2119,12 @@ fn footer_describes_contextual_stack_or_ten_row_navigation() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(one_off.contains("J/K ±10"));
+    assert!(one_off.contains("? Actions"));
+    assert!(
+        app.action_menu_entries()
+            .iter()
+            .any(|entry| entry.label == "Next stack or ten rows")
+    );
 
     app.selected = Some(crate::model::BranchId::new("stack-tip"));
     terminal
@@ -2131,7 +2137,7 @@ fn footer_describes_contextual_stack_or_ten_row_navigation() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(stack.contains("J/K stacks"));
+    assert!(stack.contains("? Actions"));
 }
 
 #[test]

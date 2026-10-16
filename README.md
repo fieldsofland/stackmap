@@ -96,7 +96,7 @@ Git refs, worktrees, remotes, Graphite metadata, or pull requests.
      └─┐
  ○ staging                     b6e4d20     1d   +?   -?
 
- 3/4 recent All pitch:auto s status S spacing a View Archive x archive ? help
+ ? Actions  a View Archive  x Archive  / Filter  d Details  R Refresh
 ```
 
 Each section grows upward from its trunk at the bottom. The first child stays
@@ -123,13 +123,16 @@ Markers are independent of color:
 
 Stack colors are deterministic. The single right-hand status field shows
 exactly one state: gray `local`, white `pushed`, yellow `#N` for an open PR,
-green `✓ #N` for an approved or merged PR, or red `X #N` for a closed PR.
+green `✓ #N` for approved, purple `⑂ #N` for merged, or red `× #N` for closed.
+At 140 columns, the map also shows the lifecycle label. A trailing `~` marks stale PR evidence.
+Lookup suffixes distinguish not checked `?`, checking `…`, and unavailable `!`.
 PR state replaces pushed state, and pushed replaces local. Provider lookup and
 Graphite-health diagnostics stay in branch details. Set `NO_COLOR=1` for
 non-color output. At 100 columns and wider, active branch rows show the first
-seven characters of the tip commit hash. At 120 columns and wider, press `d` to show or hide a detail pane for
+seven characters of the tip commit hash. Press `d` to show or hide details, in a sidebar at 120 columns or a popup below that, for
 the selected branch's exact local commit time, PR title, raw upstream state,
-and provider diagnostics. It starts hidden.
+and provider diagnostics. Opening details refreshes the selected PR. Press `p` to
+refresh it again, including in Archive or with the status column hidden.
 
 Visual feature sections split a real stack into repository-local presentation
 ranges without changing Git or Graphite. Press `i` on a branch to start or
@@ -163,7 +166,8 @@ that stack or section label.
 | `H` | Focus the selected trunk (or Untrunked); repeat to show all |
 | `s` | Hide/show the complete right status rail and reclaim its gutters (shown by default) |
 | `S` | Toggle blank rows between adjacent stacks (on by default) |
-| `d` | Show/hide the wide branch-detail sidebar (off by default) |
+| `d` | Show/hide branch details; opening refreshes the selected PR |
+| `p` | Refresh the selected PR, bypassing cached results |
 | `+` / `-` / `0` | Increase / decrease lane pitch; reset to automatic width |
 | `/` | Filter by branch name; ancestors remain as dimmed context |
 | `Enter`, `Enter` | Arm and confirm switching the selected branch; one `Enter` edits a selected label |
@@ -175,14 +179,18 @@ that stack or section label.
 | `Command-Option-Shift-C` | Copy the complete real stack, base-to-tip, excluding trunk and child/side stacks |
 | `x` | Archive/restore the selected branch and move focus to the nearest branch above |
 | `v`, arrows, `Enter` | Preview and apply a contiguous archive/restore range |
-| `a` | Toggle Active / Archive view |
+| `a` | Toggle the visible Active / Archive view |
+| `u` | Undo the last archive or restore, including a range |
 | `X`, then `y` / `n` | Confirm or cancel guarded deletion of one exact local branch |
 | `r` / `R` | Confirm Graphite restack for the selected branch / force reconciliation |
 | `m`, arrows, `Tab`, `Enter` | Preview a Graphite move, choose parent, toggle branch-only mode, and confirm |
 | `o` / `O` / `y` | Open the selected PR, open every PR in its stack, or copy the selected PR URL |
-| `?` | Show help and provider status |
-| `Esc` | Close help/message or cancel a filter edit |
+| `?` | Search actions, inspect shortcuts, and press Enter to run |
+| `Esc` | Close actions/details/message or cancel a filter edit |
 | `q`, `Ctrl-C` | Quit |
+
+The action menu also offers branch, section, and stack copy without Command-key
+chords. Archive keeps the Git branch; uppercase `X` remains guarded deletion.
 
 Checkout is intentionally conservative. The first `Enter` arms the selected branch and the
 second confirms it; `Esc` or navigation cancels. `stackmap` then runs an exact `git switch
@@ -252,7 +260,8 @@ Unknown evidence is never treated as safe deletion evidence.
   current/changed stacks, or explicit `R`/`r`/`m` demand.
 - Lowercase `s` cancels/suppresses remote, Graphite, and GitHub enrichment while
   preserving last-known evidence; showing status schedules bounded work again.
-  PR open/copy actions use retained evidence while status is hidden.
+  PR open/copy actions use retained evidence while status is hidden. Explicit
+  `p`, opening `d`, and `R` can still refresh the selected PR.
 
 Run the deterministic 500-branch projection benchmark with:
 

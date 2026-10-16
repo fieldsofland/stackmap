@@ -59,7 +59,14 @@ impl RenderGeometry {
         let diff_width = 10;
         let diff_worktree_gap = COLUMN_GAP;
         let worktree_width = if wide_worktree { 18 } else { 2 };
-        let status_width = usize::from(status_visible) * if show_full_status { 12 } else { 8 };
+        let status_width = usize::from(status_visible)
+            * if width >= 140 {
+                22
+            } else if show_full_status {
+                12
+            } else {
+                8
+            };
         let status_gap = usize::from(status_visible) * COLUMN_GAP;
         let status_edge_gap = usize::from(status_visible);
         let metadata_width = hash_width

@@ -31,7 +31,9 @@ Remote-tip evidence is derived from one bounded map of locally known remote
 branch tips and does not fetch. Configured-upstream equality and exact PR head
 OID can also prove pushed; containment, raw ahead/behind state, and stale PRs
 cannot. Hiding status cancels remote, Graphite, and GitHub enrichment but retains
-cached evidence. PR open/copy actions use that retained evidence.
+cached evidence. PR open/copy actions use that retained evidence. Press `p`,
+open details with `d`, or use `R` to refresh the selected PR, including in Archive
+or with status hidden. These explicit requests bypass its cached lookup.
 
 GitHub first performs a cached open-PR sweep, then serialized bounded exact-head
 and exact-commit lookups for unresolved local branches. PR matches prefer an

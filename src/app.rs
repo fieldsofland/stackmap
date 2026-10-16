@@ -136,6 +136,7 @@ fn best_pr_match(branch: &Branch, matches: &[PrMatch]) -> Option<crate::model::P
         .map(|candidate| candidate.pull_request.clone())
 }
 
+mod actions;
 mod archive;
 mod mutation;
 mod overlays;
@@ -162,6 +163,9 @@ pub struct App {
     pub viewport_height: usize,
     pub filter: String,
     pub overlay: Overlay,
+    pub action_query: String,
+    pub action_index: usize,
+    archive_undo: Option<Vec<(BranchId, bool)>>,
     pub mutation: MutationState,
     pub platform_running: bool,
     pub message: Option<Arc<str>>,
@@ -202,6 +206,8 @@ pub struct App {
     health_target_offset: usize,
     last_health_working_set: Option<HealthWorkingSet>,
     github_request_pending: bool,
+    github_explicit_pending: bool,
+    github_feedback_target: Option<(BranchId, Arc<str>)>,
     github_cancel_pending: bool,
     github_demand_targets: HashSet<BranchId>,
     last_github_working_set: Option<GithubWorkingSet>,
@@ -219,6 +225,9 @@ impl Default for App {
             viewport_height: 12,
             filter: String::new(),
             overlay: Overlay::None,
+            action_query: String::new(),
+            action_index: 0,
+            archive_undo: None,
             mutation: MutationState::Idle,
             platform_running: false,
             message: None,
@@ -259,6 +268,8 @@ impl Default for App {
             health_target_offset: 0,
             last_health_working_set: None,
             github_request_pending: false,
+            github_explicit_pending: false,
+            github_feedback_target: None,
             github_cancel_pending: false,
             github_demand_targets: HashSet::new(),
             last_github_working_set: None,
@@ -859,18 +870,48 @@ impl App {
         self.refresh_error = Some(error);
     }
 
+    fn clear_github_feedback(&mut self) {
+        self.github_feedback_target = None;
+        if self.message.as_deref() == Some("checking selected branch for a pull request") {
+            self.message = None;
+        }
+    }
+
+    fn reset_displaced_github_lookups(&mut self, targets: &[GithubTarget]) {
+        if let Some(snapshot) = self.snapshot.as_mut() {
+            for branch in Arc::make_mut(&mut Arc::make_mut(snapshot).branches) {
+                if branch.pr_lookup == PullRequestLookup::Checking
+                    && !targets
+                        .iter()
+                        .any(|target| target.branch == branch.id && target.oid == branch.oid)
+                {
+                    branch.pr_lookup = if branch.pr.is_some() {
+                        PullRequestLookup::Ready
+                    } else {
+                        PullRequestLookup::NotRequested
+                    };
+                }
+            }
+        }
+    }
+
     pub fn take_github_command(&mut self) -> Option<GithubCommand> {
         if self.github_cancel_pending {
             self.github_cancel_pending = false;
+            self.reset_displaced_github_lookups(&[]);
+            self.clear_github_feedback();
             return Some(GithubCommand::Cancel);
         }
-        if !self.status_visible || matches!(self.archive_mode, ArchiveMode::Archive) {
+        if !self.github_explicit_pending
+            && (!self.status_visible || matches!(self.archive_mode, ArchiveMode::Archive))
+        {
             return None;
         }
         if !self.github_request_pending {
             return None;
         }
         self.github_request_pending = false;
+        let explicit = std::mem::take(&mut self.github_explicit_pending);
         let snapshot = self.snapshot.as_ref()?;
         let selected = self.selected.as_ref();
         let selected_stack =
@@ -879,12 +920,19 @@ impl App {
             .branches
             .iter()
             .enumerate()
-            .filter(|(_, branch)| self.github_demand_targets.contains(&branch.id))
+            .filter(|(_, branch)| {
+                self.github_demand_targets.contains(&branch.id)
+                    && (!explicit
+                        || self
+                            .github_feedback_target
+                            .as_ref()
+                            .is_some_and(|(id, oid)| id == &branch.id && oid == &branch.oid))
+            })
             .collect::<Vec<_>>();
         indexed.sort_by_key(|(index, branch)| {
-            let priority = if branch.current {
+            let priority = if selected == Some(&branch.id) {
                 0
-            } else if selected == Some(&branch.id) {
+            } else if branch.current {
                 1
             } else if selected_stack.is_some_and(|stack| {
                 self.topology
@@ -906,7 +954,9 @@ impl App {
                 oid: branch.oid.clone(),
             })
             .collect::<Vec<_>>();
-        self.github_demand_targets.clear();
+        for target in &targets {
+            self.github_demand_targets.remove(&target.branch);
+        }
         let working_set = (
             snapshot.generation,
             targets
@@ -926,6 +976,18 @@ impl App {
                 oid: branch.oid.clone(),
             })
             .collect::<Vec<_>>();
+        self.reset_displaced_github_lookups(&targets);
+        if self
+            .github_feedback_target
+            .as_ref()
+            .is_some_and(|(id, oid)| {
+                !targets
+                    .iter()
+                    .any(|target| &target.branch == id && &target.oid == oid)
+            })
+        {
+            self.clear_github_feedback();
+        }
         let snapshot = Arc::make_mut(self.snapshot.as_mut()?);
         for target in &targets {
             if let Some(index) = snapshot.branch_index.get(&target.branch).copied()
@@ -936,6 +998,7 @@ impl App {
         }
         self.github_state = GitHubState::Loading;
         Some(GithubCommand::Request(GithubRequest {
+            refresh: explicit,
             generation: snapshot.generation,
             targets: Arc::from(targets),
             discovery: Arc::from(discovery),
@@ -954,6 +1017,7 @@ impl App {
             return;
         }
         let mut unavailable = None;
+        let mut feedback_finished = false;
         let snapshot = Arc::make_mut(snapshot);
         for result in batch.results.iter() {
             let Some(index) = snapshot.branch_index.get(&result.branch).copied() else {
@@ -965,6 +1029,8 @@ impl App {
             if branch.oid != result.oid {
                 continue;
             }
+            feedback_finished |= self.github_feedback_target.as_ref()
+                == Some(&(result.branch.clone(), result.oid.clone()));
             match &result.outcome {
                 GithubOutcome::Ready(matches) => {
                     if let Some(mut pull_request) = best_pr_match(branch, matches) {
@@ -989,6 +1055,12 @@ impl App {
                     unavailable.get_or_insert_with(|| error.clone());
                     branch.pr_lookup = PullRequestLookup::Unavailable(Arc::from(error.to_string()));
                 }
+            }
+        }
+        if feedback_finished {
+            self.github_feedback_target = None;
+            if self.message.as_deref() == Some("checking selected branch for a pull request") {
+                self.message = None;
             }
         }
         let has_retained_unavailable = snapshot
@@ -1120,6 +1192,12 @@ impl App {
         if matches!(self.overlay, Overlay::StackNameEditor(_)) {
             return self.handle_stack_name_editor_key(input.key);
         }
+        if matches!(self.overlay, Overlay::Help)
+            && matches!(self.mutation, MutationState::Idle)
+            && input.key != Key::Quit
+        {
+            return self.handle_actions_key(input);
+        }
         if input.phase == KeyPhase::Repeat && !input.key.allows_repeat() {
             return Action::None;
         }
@@ -1214,6 +1292,7 @@ impl App {
                 Action::None
             }
             Key::Character('R') => {
+                self.demand_selected_github();
                 self.demand_selected_graphite_health();
                 Action::Refresh
             }
@@ -1289,6 +1368,7 @@ impl App {
                     self.health_cancel_pending = true;
                     self.github_request_pending = false;
                     self.github_cancel_pending = true;
+                    self.github_explicit_pending = false;
                     self.github_demand_targets.clear();
                     if let Some(snapshot) = self.snapshot.as_mut() {
                         let snapshot = Arc::make_mut(snapshot);
@@ -1317,8 +1397,15 @@ impl App {
                 self.reproject();
                 Action::None
             }
+            Key::Character('p') => {
+                self.demand_selected_github();
+                Action::None
+            }
             Key::Character('d') => {
                 self.detail_sidebar = !self.detail_sidebar;
+                if self.detail_sidebar {
+                    self.demand_selected_github();
+                }
                 self.message = Some(Arc::from(if self.detail_sidebar {
                     "detail sidebar enabled"
                 } else {
@@ -1335,11 +1422,14 @@ impl App {
                 Action::None
             }
             Key::Character('x') => self.toggle_selected_archive(),
+            Key::Character('u') => self.undo_archive(),
             Key::Character('X') => {
                 self.begin_delete_confirmation();
                 Action::None
             }
             Key::Character('?') => {
+                self.action_query.clear();
+                self.action_index = 0;
                 self.overlay = Overlay::Help;
                 Action::None
             }
@@ -1402,6 +1492,7 @@ impl App {
                 }
             }
             Key::Escape => {
+                self.detail_sidebar = false;
                 self.message = None;
                 self.notice = None;
                 Action::None
@@ -2216,6 +2307,7 @@ impl App {
                 self.archive_mode = ArchiveMode::Archive;
                 self.github_request_pending = false;
                 self.github_cancel_pending = true;
+                self.github_explicit_pending = false;
                 self.github_demand_targets.clear();
                 self.selected = None;
                 self.scroll = 0;
@@ -2278,13 +2370,17 @@ impl App {
             self.message = Some(Arc::from("repository changed; branch was not archived"));
             return Action::None;
         };
+        self.archive_undo = Some(vec![(
+            branch_id.clone(),
+            self.config.is_archived(&branch_id),
+        )]);
         self.config.set_archived_in_memory(&branch_id, archived);
         let mut mutation = ConfigMutation::default();
         mutation.set_archived(branch_id.clone(), archived);
         self.message = Some(Arc::from(if archived {
-            format!("archived {branch_id} locally; saving")
+            format!("Archived {branch_id}. Git branch kept; saving. u Undo")
         } else {
-            format!("restored {branch_id}; saving")
+            format!("Restored {branch_id}; saving. u Undo")
         }));
         self.selected = selection_after;
         self.reproject();
@@ -2409,12 +2505,19 @@ impl App {
             return Action::None;
         };
         let mut mutation = ConfigMutation::default();
+        self.archive_undo = Some(
+            range
+                .branches()
+                .iter()
+                .map(|id| (id.clone(), self.config.is_archived(id)))
+                .collect(),
+        );
         for branch in range.branches() {
             self.config.set_archived_in_memory(branch, archived);
             mutation.set_archived(branch.clone(), archived);
         }
         self.message = Some(Arc::from(format!(
-            "{} {} branches; saving",
+            "{} {} branches. Git branches kept; saving. u Undo",
             if archived { "archived" } else { "restored" },
             range.branch_count()
         )));
@@ -2776,13 +2879,19 @@ impl App {
     }
 
     fn demand_selected_github(&mut self) {
-        if !self.status_visible || matches!(self.archive_mode, ArchiveMode::Archive) {
-            self.message = Some(Arc::from("show status before checking pull requests"));
-            return;
-        }
         let Some(selected) = self.selected.clone() else {
             return;
         };
+        let Some(branch) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.branch(&selected))
+        else {
+            return;
+        };
+        self.github_feedback_target = Some((selected.clone(), branch.oid.clone()));
+        self.github_cancel_pending = false;
+        self.github_explicit_pending = true;
         self.github_demand_targets.insert(selected);
         self.github_request_pending = true;
         self.last_github_working_set = None;

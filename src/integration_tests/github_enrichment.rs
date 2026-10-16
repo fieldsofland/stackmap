@@ -486,3 +486,117 @@ fn pull_request_working_set_is_bounded_for_large_current_stack() {
             .any(|target| target.branch == BranchId::new("stack-31"))
     );
 }
+
+#[test]
+fn explicit_pr_lookup_targets_selection_even_when_hidden_or_archived() {
+    use crate::events::Key;
+    use crate::model::topology::ArchiveMode;
+    use crate::refresh::github::GithubCommand;
+    for archived in [false, true] {
+        let mut app = App::default();
+        app.apply_snapshot(common::snapshot(vec![
+            common::branch("main", None, "main", true),
+            common::branch("old-feature", None, "old-feature", false),
+        ]));
+        app.selected = Some(BranchId::new("old-feature"));
+        app.status_visible = false;
+        if archived {
+            app.archive_mode = ArchiveMode::Archive;
+        }
+        app.handle_key(Key::Character('d'));
+        let Some(GithubCommand::Request(request)) = app.take_github_command() else {
+            panic!("details should explicitly request the selected PR");
+        };
+        assert!(request.refresh);
+        assert_eq!(request.targets.len(), 1);
+        assert_eq!(request.targets[0].branch, BranchId::new("old-feature"));
+        assert!(app.take_github_command().is_none());
+    }
+}
+
+#[test]
+fn explicit_pr_lookup_replacement_resets_displaced_hidden_lookup() {
+    use crate::refresh::github::GithubCommand;
+    let mut app = App::default();
+    app.apply_snapshot(common::snapshot(vec![
+        common::branch("a", None, "a", true),
+        common::branch("b", None, "b", false),
+    ]));
+    app.status_visible = false;
+    app.selected = Some(BranchId::new("a"));
+    app.handle_key(Key::Character('p'));
+    assert!(matches!(
+        app.take_github_command(),
+        Some(GithubCommand::Request(_))
+    ));
+    app.selected = Some(BranchId::new("b"));
+    app.handle_key(Key::Character('p'));
+    let Some(GithubCommand::Request(request)) = app.take_github_command() else {
+        panic!("request");
+    };
+    let snapshot = app.snapshot.as_ref().unwrap();
+    assert_eq!(
+        snapshot.branch(&BranchId::new("a")).unwrap().pr_lookup,
+        PullRequestLookup::NotRequested
+    );
+    assert_eq!(
+        snapshot.branch(&BranchId::new("b")).unwrap().pr_lookup,
+        PullRequestLookup::Checking
+    );
+    app.apply_github_batch(GithubBatch {
+        generation: request.generation,
+        results: Arc::from([GithubResult {
+            branch: request.targets[0].branch.clone(),
+            oid: request.targets[0].oid.clone(),
+            outcome: GithubOutcome::NoMatch,
+        }]),
+    });
+    assert!(app.message.is_none());
+    assert_eq!(app.github_state, GitHubState::Ready);
+}
+
+#[test]
+fn explicit_pr_lookup_feedback_follows_requested_branch_after_navigation() {
+    use crate::refresh::github::GithubCommand;
+    let mut app = App::default();
+    app.apply_snapshot(common::snapshot(vec![
+        common::branch("a", None, "a", true),
+        common::branch("b", None, "b", false),
+    ]));
+    app.status_visible = false;
+    app.selected = Some(BranchId::new("a"));
+    app.handle_key(Key::Character('p'));
+    app.selected = Some(BranchId::new("b"));
+    let Some(GithubCommand::Request(request)) = app.take_github_command() else {
+        panic!("request");
+    };
+    assert_eq!(request.targets[0].branch, BranchId::new("a"));
+    app.apply_github_batch(GithubBatch {
+        generation: request.generation,
+        results: Arc::from([GithubResult {
+            branch: request.targets[0].branch.clone(),
+            oid: request.targets[0].oid.clone(),
+            outcome: GithubOutcome::NoMatch,
+        }]),
+    });
+    assert!(app.message.is_none());
+    app.handle_key(Key::Character('p'));
+    assert!(matches!(
+        app.take_github_command(),
+        Some(GithubCommand::Request(_))
+    ));
+    app.handle_key(Key::Character('a'));
+    assert_eq!(app.take_github_command(), Some(GithubCommand::Cancel));
+    assert_ne!(
+        app.message.as_deref(),
+        Some("checking selected branch for a pull request")
+    );
+    assert!(
+        app.snapshot
+            .as_ref()
+            .unwrap()
+            .branches
+            .iter()
+            .all(|branch| branch.pr_lookup != PullRequestLookup::Checking)
+    );
+}

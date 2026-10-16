@@ -2,6 +2,11 @@
 
 ## 2026-10-16
 
+- Verified the TUI changes with 312 library tests, 21 CLI tests, two doctests, formatting, strict offline Clippy, and diff checks. See `docs/reviews/2026-10-16-tui-ux.md`; no app build or installation was performed.
+- Distinguished merged PRs with purple merge icons and closed PRs with red close icons. Added wide lifecycle labels, visible lookup states, stale markers, and narrow-terminal details.
+- Added selected-PR refresh through `p`, opening details, and `R`, including archived branches and hidden status, with explicit cache bypass.
+- Replaced static help with a searchable action menu. Added visible Active/Archive views, archive/restore undo, plain-key clipboard access, and a shorter footer while preserving existing shortcuts and deletion confirmation.
+
 - Rebased the newest local workflow/status and stack-rename commits onto main with Logan's short commit hashes, preserving the unified status field and two-cell metadata gutters in `codex/version-2026-10-16`.
 - Preserved full move previews across confirmation and required exact live Graphite subtree membership before mutation, preventing unconfirmed descendants from being rewritten.
 - Restored linked worktrees after checkout execution errors when live ownership permits it, while avoiding duplicate restoration after a completed switch.

@@ -34,6 +34,9 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, now: SystemTime) {
         panels::move_confirmation(frame, app);
         return;
     }
+    if app.detail_sidebar && areas.detail.is_none() && app.overlay == Overlay::None {
+        panels::compact_detail(frame, app);
+    }
     match &app.overlay {
         Overlay::Help => panels::help(frame, app),
         Overlay::OrderPicker(_) => panels::order_picker(frame, app),

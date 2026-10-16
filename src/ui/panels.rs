@@ -1,10 +1,10 @@
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::app::{App, COLOR_OPTIONS, GitHubState, LanePitch, MutationState, Overlay};
+use crate::app::{App, COLOR_OPTIONS, MutationState, Overlay};
 use crate::model::topology::{ArchiveMode, OrderMode};
 
 pub fn header(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -22,65 +22,55 @@ pub fn header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         "live"
     };
-    let mut spans = if matches!(app.archive_mode, ArchiveMode::Archive) {
-        vec![Span::styled(
-            " ARCHIVE · local refs only · no fetch ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )]
-    } else {
-        vec![Span::styled(
-            " stackmap ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )]
-    };
+    let archived = matches!(app.archive_mode, ArchiveMode::Archive);
+    let selected_view = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let mut spans = vec![
+        Span::raw(" stackmap  "),
+        Span::styled(
+            if archived { "Active" } else { "[Active]" },
+            if archived {
+                Style::default()
+            } else {
+                selected_view
+            },
+        ),
+        Span::raw(" | "),
+        Span::styled(
+            if archived { "[Archive]" } else { "Archive" },
+            if archived {
+                selected_view
+            } else {
+                Style::default()
+            },
+        ),
+    ];
     spans.push(Span::raw(format!(" {title}  ")));
     spans.push(Span::styled(status, Style::default().fg(Color::Cyan)));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 pub fn footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let position = app
-        .projection
-        .navigation_visual_rows
-        .iter()
-        .position(|row| Some(*row) == app.selected_visual_row_for_ui())
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let progress = app.mutation_progress();
-    let has_supplementary = app.message.is_some()
-        || app.notice().is_some()
-        || progress.is_some()
-        || app.refresh_error.is_some();
-    let mut state = if app.overlay == Overlay::Search {
-        format!(" /{}", app.filter)
-    } else if let Overlay::StackNameEditor(_) = &app.overlay {
-        " NAME  Enter save · empty clears · Esc cancel".to_owned()
-    } else if let Overlay::ArchiveRange(range) = &app.overlay {
-        format!(
-            " RANGE {} {} branches  {} → {}  ↑↓ resize  Enter {}  Esc cancel",
-            if matches!(range.mode, ArchiveMode::Archive) {
-                "RESTORE"
-            } else {
-                "ARCHIVE"
-            },
+    let archived = matches!(app.archive_mode, ArchiveMode::Archive);
+    let base = format!(
+        "? Actions  a View {}  x {}",
+        if archived { "Active" } else { "Archive" },
+        if archived { "Restore" } else { "Archive" }
+    );
+    let controls = match &app.overlay {
+        Overlay::Search => format!("/{}  Enter apply  Esc cancel", app.filter),
+        Overlay::StackNameEditor(_) => "Enter save  Ctrl-U clear  Esc cancel".into(),
+        Overlay::ArchiveRange(range) => format!(
+            "Range {} {} branches  {} → {}  ↑↓ select  Enter {}  Esc cancel",
+            if archived { "Restore" } else { "Archive" },
             range.branch_count(),
             range.anchor,
             range.endpoint,
-            if matches!(range.mode, ArchiveMode::Archive) {
-                "restore"
-            } else {
-                "archive"
-            }
-        )
-    } else if let Overlay::MovePreview(preview) = &app.overlay {
-        format!(
-            " MOVE PREVIEW  {} → {}  {}  ↑↓ target  Tab mode  Enter confirm  Esc cancel",
+            if archived { "restore" } else { "archive" }
+        ),
+        Overlay::MovePreview(preview) => format!(
+            "Move preview {} → {}  Tab {}  Enter confirm  Esc cancel",
             preview.source,
             preview.target,
             if preview.only {
@@ -88,95 +78,67 @@ pub fn footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
             } else {
                 "subtree"
             }
-        )
-    } else {
-        let order = match app.order_mode {
-            OrderMode::Recent => "recent",
-            OrderMode::Alphabetical => "alphabetical",
-            OrderMode::Graphite => "graphite",
-            OrderMode::Chronological => "time",
-        };
-        let pitch = match app.lane_pitch {
-            LanePitch::Auto => "pitch:auto".to_owned(),
-            LanePitch::Fixed(value) => format!("pitch:{value}"),
-        };
-        let stack_navigation = if app
-            .selected
-            .as_ref()
-            .is_some_and(|selected| app.projection.is_true_stack(selected))
-        {
-            "J/K stacks"
-        } else {
-            "J/K ±10"
-        };
-        let archive_target = if matches!(app.archive_mode, ArchiveMode::Archive) {
-            "Active"
-        } else {
-            "Archive"
-        };
-        let archive_action = if matches!(app.archive_mode, ArchiveMode::Archive) {
-            "restore"
-        } else {
-            "archive"
-        };
-        let pr_actions = if app
-            .selected_branch()
-            .is_some_and(|branch| branch.pr.is_some())
-        {
-            "  o/O/y PR"
-        } else {
-            ""
-        };
-        if has_supplementary {
-            format!(" a View {archive_target}  x {archive_action}  X delete{pr_actions}  ? help")
-        } else {
-            format!(
-                " {position}/{}  {order}  {}  {pitch}  s status  S spacing  ↑↓ {stack_navigation}  a View {archive_target}  x {archive_action}  r restack  m move  R refresh{pr_actions}  ? help",
-                app.projection.navigation.len(),
-                app.scope_label(),
-            )
-        }
+        ),
+        _ if area.width >= 80 => format!("{base}  / Filter  d Details  R Refresh"),
+        _ => base,
     };
+    let lookup_detail =
+        if let Some(error) = &app.refresh_error {
+            format!("Stale: {error}")
+        } else if let Some(progress) = app.mutation_progress() {
+            progress.to_string()
+        } else if let Some(message) = &app.message {
+            message.to_string()
+        } else if let Some(notice) = app.notice() {
+            notice.to_string()
+        } else if let Some(branch) = app.selected_branch() {
+            match &branch.pr_lookup {
+                crate::model::PullRequestLookup::NotRequested => {
+                    "PR ? Not checked · p Check selected".into()
+                }
+                crate::model::PullRequestLookup::Checking => "PR … Checking selected branch".into(),
+                crate::model::PullRequestLookup::Unavailable(_) => {
+                    "PR ! Unavailable · p Retry · d Details".into()
+                }
+                crate::model::PullRequestLookup::NoMatch => "PR: no match found".into(),
+                crate::model::PullRequestLookup::Ready => {
+                    if branch.pr.as_ref().is_some_and(|pr| {
+                        pr.match_quality == crate::model::PullRequestMatch::StaleTip
+                    }) {
+                        "PR ~ Head differs · d Details".into()
+                    } else {
+                        String::new()
+                    }
+                }
+            }
+        } else {
+            String::new()
+        };
+    let mut notices = Vec::new();
     if let Some(error) = &app.refresh_error {
-        state.push_str(&format!("  STALE: {error}"));
+        notices.push(format!("Stale: {error}"));
     }
-    if app.overlay != Overlay::Search {
-        if let Some(message) = &app.message
-            && !matches!(app.mutation, MutationState::DeletionBlocked(_))
-        {
-            state.push_str(&format!("  {message}"));
-        }
-        if let Some(notice) = app.notice() {
-            state.push_str(&format!("  {notice}"));
-        }
-        if let Some(progress) = progress {
-            state.push_str(&format!("  {progress}"));
-        }
+    if let Some(progress) = app.mutation_progress() {
+        notices.push(progress.to_string());
     }
-    if matches!(app.archive_mode, ArchiveMode::Archive)
-        && let Some(branch) = app.selected_branch()
-    {
-        state.push_str(&format!(
-            "\n {}",
-            super::tree::evidence_source_footer(branch)
-        ));
+    if let Some(notice) = app.notice() {
+        notices.push(notice.to_string());
     }
-    frame.render_widget(
-        Paragraph::new(state).style(Style::default().fg(Color::DarkGray)),
-        area,
-    );
+    if let Some(message) = &app.message {
+        notices.push(message.to_string());
+    }
+    let detail = if notices.is_empty() {
+        lookup_detail
+    } else {
+        notices.join(" · ")
+    };
+    frame.render_widget(Paragraph::new(format!("{controls}\n{detail}")), area);
 }
 
 pub fn detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let text = app
         .selected_branch()
-        .map(|branch| {
-            if matches!(app.archive_mode, ArchiveMode::Archive) {
-                super::tree::local_detail(branch)
-            } else {
-                super::tree::detail(branch)
-            }
-        })
+        .map(super::tree::detail)
         .unwrap_or_else(|| "No branch selected".into());
     frame.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: false }).block(
@@ -189,44 +151,73 @@ pub fn detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 pub fn help(frame: &mut Frame<'_>, app: &App) {
-    let area = centered(frame.area(), 72, 41);
+    let area = centered(frame.area(), 88, 30);
     frame.render_widget(Clear, area);
-    let graphite = app
-        .snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.graphite_status.as_ref())
-        .unwrap_or("loading");
-    let github = match &app.github_state {
-        GitHubState::Idle => "not requested".to_owned(),
-        GitHubState::Loading => "loading".to_owned(),
-        GitHubState::Ready => "loaded".to_owned(),
-        GitHubState::Unavailable(error) => format!("unavailable: {error}"),
-    };
-    let text = format!(
-        "Markers: › selected  ○ branch  ● current  ◉ trunk\n         ■ range  * dirty  ⎇ worktree\nStatus:  local gray  pushed white  # open yellow\n         ✓ # approved/merged green  X # closed red\n         PR replaces pushed; pushed replaces local\n\n↑/↓ or j/k          previous/next branch\nShift/Cmd+↑/↓ J/K  adjacent stack head, otherwise ±10 rows\nAlt+↑/↓ g/G         top/bottom branch of current section\nt / T               Recent/Graphite toggle / order picker\n+ / - / 0           adjust / reset lane pitch\nh                   focus selected stack; repeat exits\nH                   focus trunk or all Untrunked; repeat exits\ns / S               toggle status / stack spacing\na                   toggle Active / Archive view\nv + arrows          preview contiguous archive/restore range\n/                   filter branch names\nEnter ×2 / Enter    switch or move clean worktree / edit label\nc / C               color active indent / color picker\nCmd+C / +Shift / +Opt+Shift  copy branch / section / stack\nd                   toggle wide detail sidebar\ni                   toggle visual section boundary\nn                   edit deepest section / real stack name\nShift+Backspace / Ctrl-U     clear complete name draft\nx                   archive / restore selected local branch\nX                   guarded delete exact local branch\nr / R               restack selected / full reconciliation\nm                   preview Graphite move; Tab toggles --only\no / O / y           open selected PR / stack PRs / copy URL\nEsc                 close/cancel\nq or Ctrl-C         quit\n\nGraphite actions require confirmation and never push or fetch.\nArchive view shows dim, nonselectable ancestry for stack context.\nFocused sections pin their trunk/bottom row.\nPushed evidence uses exact local-tip equality only; no fetch.\nGraphite and provider diagnostics remain in branch details.\nActive: {} / {} / {} / {}\n\nGraphite: {graphite}\nGitHub: {github}",
-        match app.order_mode {
-            OrderMode::Recent => "recent order",
-            OrderMode::Alphabetical => "alphabetical order",
-            OrderMode::Graphite => "Graphite order",
-            OrderMode::Chronological => "time order",
-        },
-        app.scope_label(),
-        if app.separators {
-            "separators on"
-        } else {
-            "separators off"
-        },
-        if app.status_visible {
-            "status on"
-        } else {
-            "status off"
-        },
-    );
+    let block = Block::default()
+        .title(" Actions · type to search ")
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(if inner.height < 8 { 1 } else { 2 }),
+            Constraint::Min(1),
+            Constraint::Length(if inner.height < 8 { 1 } else { 4 }),
+        ])
+        .split(inner);
     frame.render_widget(
-        Paragraph::new(text)
+        Paragraph::new(format!("> {}", app.action_query)),
+        sections[0],
+    );
+    let entries = app.action_menu_entries();
+    let selected = app.action_index.min(entries.len().saturating_sub(1));
+    let items: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            ListItem::new(format!(
+                "{} · {}: {}",
+                entry.shortcut, entry.group, entry.label
+            ))
+        })
+        .collect();
+    if entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No matching actions. Backspace to edit."),
+            sections[1],
+        );
+    } else {
+        let list = List::new(items)
+            .highlight_symbol("> ")
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        frame.render_stateful_widget(
+            list,
+            sections[1],
+            &mut ListState::default().with_selected(Some(selected)),
+        );
+    }
+    let selected_label = entries
+        .get(selected)
+        .map(|entry| format!("{} [{}]", entry.label, entry.shortcut))
+        .unwrap_or_default();
+    frame.render_widget(Paragraph::new(format!("↑↓ choose · Enter run · Esc close\n{selected_label}\nPR: ⑂ merged · × closed · ✓ approved" )).wrap(Wrap { trim: false }), sections[2]);
+}
+
+pub fn compact_detail(frame: &mut Frame<'_>, app: &App) {
+    let area = centered(frame.area(), 88, 22);
+    frame.render_widget(Clear, area);
+    let text = app
+        .selected_branch()
+        .map(super::tree::detail)
+        .unwrap_or_else(|| "No branch selected".into());
+    frame.render_widget(
+        Paragraph::new(format!("p Refresh PR · d / Esc close\n{text}"))
             .wrap(Wrap { trim: false })
-            .alignment(Alignment::Left)
-            .block(Block::default().title(" Help ").borders(Borders::ALL)),
+            .block(
+                Block::default()
+                    .title(" Branch details ")
+                    .borders(Borders::ALL),
+            ),
         area,
     );
 }

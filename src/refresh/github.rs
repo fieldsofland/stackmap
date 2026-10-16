@@ -29,6 +29,7 @@ pub struct GithubTarget {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GithubRequest {
+    pub refresh: bool,
     pub generation: u64,
     pub targets: Arc<[GithubTarget]>,
     pub discovery: Arc<[GithubTarget]>,
@@ -263,6 +264,14 @@ fn process_cycle(
     revision: &AtomicU64,
     mut publish: impl FnMut(GithubBatch),
 ) -> Option<GithubRequest> {
+    if request.refresh {
+        cache.open = None;
+        for target in request.targets.iter() {
+            cache
+                .targets
+                .remove(&(target.branch.clone(), target.oid.clone()));
+        }
+    }
     let repository = match cache
         .repository
         .clone()
@@ -437,6 +446,7 @@ fn process_cycle(
         });
     }
     (!remaining.is_empty()).then(|| GithubRequest {
+        refresh: false,
         generation: request.generation,
         targets: Arc::from(remaining),
         discovery: Arc::from([]),
@@ -638,6 +648,7 @@ mod tests {
         let mut batches = Vec::new();
         process_cycle(
             GithubRequest {
+                refresh: false,
                 generation: 1,
                 targets: Arc::from([target(0)]),
                 discovery: Arc::from([GithubTarget {
@@ -670,6 +681,7 @@ mod tests {
         let mut batches = Vec::new();
         let first_continuation = process_cycle(
             GithubRequest {
+                refresh: false,
                 generation: 9,
                 targets: Arc::from(targets),
                 discovery: Arc::from([]),
@@ -756,6 +768,7 @@ mod tests {
         }
         let provider = MatchingProvider(AtomicUsize::new(0));
         let request = GithubRequest {
+            refresh: false,
             generation: 1,
             targets: Arc::from([GithubTarget {
                 branch: BranchId::new("topic"),
@@ -838,6 +851,7 @@ mod tests {
                 let mut batches = Vec::new();
                 let continuation = process_cycle(
                     GithubRequest {
+                        refresh: false,
                         generation: 1,
                         targets: Arc::from([target.clone()]),
                         discovery: Arc::from([target]),
@@ -874,6 +888,7 @@ mod tests {
         };
         let provider = FakeProvider::new();
         let request = GithubRequest {
+            refresh: false,
             generation: 1,
             targets: Arc::from([target.clone()]),
             discovery: Arc::from([target]),
@@ -975,6 +990,7 @@ mod tests {
         let mut cache = GithubCache::default();
         let started = Instant::now();
         let request = GithubRequest {
+            refresh: false,
             generation: 1,
             targets: Arc::from([target.clone()]),
             discovery: Arc::from([]),
@@ -1004,5 +1020,23 @@ mod tests {
             .is_none()
         );
         assert_eq!(provider.commit_calls.load(Ordering::Relaxed), 1);
+    }
+    #[test]
+    fn explicit_refresh_bypasses_negative_target_cache() {
+        let provider = FakeProvider::new();
+        let mut cache = GithubCache::default();
+        let mut request = GithubRequest {
+            refresh: false,
+            generation: 1,
+            targets: Arc::from([target(0)]),
+            discovery: Arc::from([]),
+        };
+        let revision = AtomicU64::new(1);
+        process_cycle(request.clone(), &provider, &mut cache, 1, &revision, |_| {});
+        process_cycle(request.clone(), &provider, &mut cache, 1, &revision, |_| {});
+        assert_eq!(provider.head_calls.load(Ordering::Relaxed), 1);
+        request.refresh = true;
+        process_cycle(request, &provider, &mut cache, 1, &revision, |_| {});
+        assert_eq!(provider.head_calls.load(Ordering::Relaxed), 2);
     }
 }

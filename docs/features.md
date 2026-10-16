@@ -21,8 +21,9 @@ explains which work belongs together or what is safe to clean up.
   commit age, parent-relative
   additions/deletions, and one status field are visible in each row.
 - The status field is mutually exclusive: gray `local`, white `pushed`, yellow
-  `#N` for open PRs, green `✓ #N` for approved or merged PRs, and red `X #N`
+  `#N` for open PRs, green `✓ #N` for approved, purple `⑂ #N` for merged, and red `× #N`
   for closed PRs. PR state replaces pushed state, and pushed replaces local.
+- Lookup suffixes show not checked `?`, checking `…`, unavailable `!`, and stale PRs `~`. Wide maps include lifecycle labels.
 - Raw upstream, PR lookup, stale-match, and Graphite-health evidence remains in
   details. `pushed` still requires an exact locally known remote or PR head tip.
 - Named stack titles show a direct net diff from the displayed stack's validated
@@ -142,7 +143,15 @@ explains which work belongs together or what is safe to clean up.
   health subprocesses.
 - Hiding status cancels/suppresses remote, Graphite, and GitHub work while
   retaining cached evidence; showing it schedules bounded work again.
-  PR open/copy actions use retained evidence while status is hidden.
+  PR open/copy actions use retained evidence while status is hidden. Explicit
+  `p`, opening `d`, or `R` refreshes the selected PR even with status hidden or in Archive.
+
+## Action discovery
+
+- `?` opens searchable actions with shortcuts and Enter execution through the existing guards.
+- The header names Active and Archive. `x` archives or restores without deleting Git branches; `u` undoes the last single or range change.
+- Branch, section, and stack copy are available through search without modifier chords.
+- Details use a popup below 120 columns.
 
 ## To-do
 
