@@ -17,9 +17,9 @@ explains which work belongs together or what is safe to clean up.
 
 ## Branch evidence
 
-- Current branch, dirty worktree, linked worktree, commit age, parent-relative
-  additions/deletions, and optional open pull request details are visible in one
-  row or the wide detail pane.
+- Current branch, dirty worktree, linked worktree, short tip commit hash,
+  commit age, parent-relative additions/deletions, and optional open pull
+  request details are visible in one row or the wide detail pane.
 - Named stack titles show a direct net diff from the displayed stack's validated
   base to its structural tip. Forked stacks use their own attachment parent;
   branch rows remain parent-relative.
@@ -39,9 +39,10 @@ explains which work belongs together or what is safe to clean up.
   inside a real stack. They move only branch-name text: Git circles,
   connectors, refs, and Graphite metadata remain unchanged. Labels are
   selectable and edited inline with exclusive keyboard input.
-- Fixed metadata gutters separate time from diff, diff from worktree, remote
-  safety state, and the PR column from the terminal edge whenever those columns
-  are present.
+- Fixed metadata gutters separate hash from time, time from diff, diff from
+  worktree, remote safety state, and the PR column from the terminal edge
+  whenever those columns are present. The hash column appears at 100 columns
+  and wider. It is the first column to hide on a narrower terminal.
 - The wide branch-detail sidebar starts hidden and toggles with `d`.
 - `--current` starts with only the current stack and shared ancestry in view.
 

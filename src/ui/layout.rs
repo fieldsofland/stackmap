@@ -24,6 +24,7 @@ pub struct RenderGeometry {
     pub last_visible_lane: usize,
     pub graph_max_x: usize,
     pub metadata_start: usize,
+    pub hash: Option<ColumnRange>,
     pub time: Option<ColumnRange>,
     pub diff: ColumnRange,
     pub worktree: ColumnRange,
@@ -35,9 +36,12 @@ impl RenderGeometry {
     pub fn new(width: u16, mode: WidthMode, requested: LanePitch, lane_count: usize) -> Self {
         let width = width as usize;
         let wide_worktree = mode != WidthMode::Narrow;
+        let show_hash = width >= 100;
         let show_time = width >= 56;
         let show_remote = width >= 72;
         let show_pr = width >= 72;
+        let hash_width = usize::from(show_hash) * 7;
+        let hash_time_gap = usize::from(show_hash);
         let time_width = usize::from(show_time) * 6;
         let time_diff_gap = usize::from(show_time);
         let diff_width = 10;
@@ -47,7 +51,9 @@ impl RenderGeometry {
         let remote_pr_gap = usize::from(show_remote && show_pr);
         let pr_width = usize::from(show_pr) * 8;
         let pr_edge_gap = usize::from(show_pr);
-        let metadata_width = time_width
+        let metadata_width = hash_width
+            + hash_time_gap
+            + time_width
             + time_diff_gap
             + diff_width
             + diff_worktree_gap
@@ -58,6 +64,14 @@ impl RenderGeometry {
             + pr_edge_gap;
         let metadata_start = width.saturating_sub(metadata_width);
         let mut cursor = metadata_start;
+        let hash = show_hash.then(|| {
+            let range = ColumnRange {
+                x: cursor,
+                width: hash_width,
+            };
+            cursor += hash_width + hash_time_gap;
+            range
+        });
         let time = show_time.then(|| {
             let range = ColumnRange {
                 x: cursor,
@@ -119,6 +133,7 @@ impl RenderGeometry {
             last_visible_lane,
             graph_max_x,
             metadata_start,
+            hash,
             time,
             diff,
             worktree,

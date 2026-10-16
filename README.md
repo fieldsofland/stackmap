@@ -52,13 +52,13 @@ trunk. Without it, every configured Graphite trunk and its stacks are visible.
 ```text
  stackmap  /repo                                      live
  [staging]
-       │ ○ child-stack-B                  11m   +6   -1
+       │ ○ child-stack-B       a9e5f2c    11m   +6   -1
        └─┐
-     │ ○ child-stack-A                    35m  +18   -3
+     │ ○ child-stack-A         f7b2c81    35m  +18   -3
      └─┐
- ● › │ ○ feature/stack-root                2h +120  -14 ⎇ repo
+ ● › │ ○ feature/stack-root    3d1a8c5     2h +120  -14 ⎇ repo
      └─┐
- ○ staging                                 1d   +?   -?
+ ○ staging                     b6e4d20     1d   +?   -?
 
  3/4 recent All pitch:auto a View Archive x archive v range X delete ? help
 ```
@@ -87,8 +87,10 @@ Markers are independent of color:
 
 Stack colors are deterministic. Yellow is reserved for PR data, while green
 and red represent insertions and deletions. Set `NO_COLOR=1` for non-color
-output. At 120 columns and wider, press `d` to show or hide a detail pane for
-the selected branch's exact local commit time and PR title. It starts hidden.
+output. At 100 columns and wider, each row also shows the short commit hash of
+the branch tip. At 120 columns and wider, press `d` to show or hide a detail
+pane for the selected branch's exact local commit time and PR title. It starts
+hidden.
 
 Visual feature sections split a real stack into repository-local presentation
 ranges without changing Git or Graphite. Press `i` on a branch to start or

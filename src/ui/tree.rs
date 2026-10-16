@@ -540,6 +540,15 @@ fn branch_line(
     if matches!(app.archive_mode, ArchiveMode::Archive) {
         paint_archive_evidence(&mut cells, branch, geometry, metadata_emphasis);
     } else {
+        if let Some(range) = geometry.hash {
+            let short_oid = branch.oid.chars().take(7).collect::<String>();
+            put_right(
+                &mut cells,
+                range,
+                &short_oid,
+                emphasized(Style::default().fg(Color::DarkGray), metadata_emphasis),
+            );
+        }
         if let Some(range) = geometry.time {
             put_right(
                 &mut cells,
