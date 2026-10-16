@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-10-16
+
+- Rebased the newest local workflow/status and stack-rename commits onto main with Logan's short commit hashes, preserving the unified status field and two-cell metadata gutters in `codex/version-2026-10-16`.
+- Preserved full move previews across confirmation and required exact live Graphite subtree membership before mutation, preventing unconfirmed descendants from being rewritten.
+- Restored linked worktrees after checkout execution errors when live ownership permits it, while avoiding duplicate restoration after a completed switch.
+- Kept fresh PR discovery visible alongside cached lookup results and applied timeout backoff after completed calls. Added regressions for stale-head cache reuse.
+- Reconciled status/cancellation documentation and recorded the review and comparison with main in `docs/reviews/2026-10-16-version-review.md`.
+- Passed formatting, strict offline all-target/all-feature Clippy, 301 library tests, 21 CLI unit tests, two doctests, and diff checks. No standalone app build, installation, live Graphite mutation, terminal-process integration test, or performance run was performed.
+
 ## 2026-08-24
 
 - Added `stackmap stack rename [--repo PATH] [--dry-run] BRANCH NAME` for agents. Any member branch resolves to its canonical displayed stack ID, including fork child stacks. The command has deterministic output, idempotence, strict name validation, stable repository and topology revalidation, and locked atomic config persistence without Git, Graphite, worktree, remote, or PR mutation.

@@ -242,16 +242,17 @@ Unknown evidence is never treated as safe deletion evidence.
 - Structural topology indexes and lane intervals remain linear in branches and
   edges. `t`, `h`, `H`, `S`, search, and navigation project entirely in memory
   without Git, SQLite, Graphite, or GitHub work.
-- The implementation contains no application `unsafe` blocks. Rust ownership,
+- Unix terminal attachment checks use two `unsafe` calls to `libc::tcgetpgrp`.
+  Rust ownership,
   bounded queues/caches, subprocess timeouts, and snapshot-release tests protect
   the long-running process from retained generations and unbounded growth.
 - Remote-ref checks read one bounded exact remote-tip map instead of running
   containment or patch-equivalence commands per branch. Graphite health is
   cached by immutable parent/tip pair and runs for bounded initial discovery,
   current/changed stacks, or explicit `R`/`r`/`m` demand.
-- Lowercase `s` cancels/suppresses remote and Graphite presentation work while
-  preserving last-known evidence; showing status schedules one bounded refresh.
-  PR enrichment remains active because `o` and `y` consume it.
+- Lowercase `s` cancels/suppresses remote, Graphite, and GitHub enrichment while
+  preserving last-known evidence; showing status schedules bounded work again.
+  PR open/copy actions use retained evidence while status is hidden.
 
 Run the deterministic 500-branch projection benchmark with:
 
@@ -291,10 +292,10 @@ GitHub enrichment is optional. A bounded staged coordinator first sweeps open
 PRs and attaches branch-name matches across every local branch, then serializes
 cached exact-head and exact-commit lookups for unresolved current,
 selected-stack, and remaining targets. Exact branch plus head OID wins;
-the deterministic newest same-name fallback is marked stale with `~` and cannot
-prove pushed. Open, approved, merged, and closed lifecycle states remain
-visible. Checking (`…`), confirmed no match (`—`), and unavailable (`?`) are
-distinct; partial or failed work preserves applicable last-known PRs. Missing
+the deterministic newest same-name fallback is identified as stale in details
+and cannot prove pushed. Open, approved, merged, and closed lifecycle states
+remain visible in rows. Details distinguish checking, confirmed no match, and
+unavailable; partial or failed work preserves applicable last-known PRs. Missing
 auth, offline operation, timeout, rate limiting, or malformed JSON never affects
 local navigation.
 
@@ -303,14 +304,14 @@ local navigation.
 | Symptom | Meaning / action |
 |---|---|
 | `topology unavailable` | Graphite metadata is missing or incompatible; Git branches are still complete |
-| PR status is `?` | Run `gh auth status`; GitHub enrichment is unavailable, but local behavior does not require it |
-| PR status is `—` | The exact staged lookup completed and confirmed no matching PR |
+| Details show PR lookup unavailable | Run `gh auth status`; GitHub enrichment is unavailable, but local behavior does not require it |
+| Details show PR lookup confirmed no match | The exact staged lookup completed and confirmed no matching PR |
 | Checkout is disabled | The branch is current, another worktree owns it, or Git has an operation in progress |
 | Git blocks checkout | Commit/move the conflicting work yourself; stackmap deliberately performs no cleanup |
 | Shift-arrow does not jump | This is terminal encoding, not Vim. Use `J` / `K`, or configure the terminal to send `ESC [ 1 ; 2 A` / `ESC [ 1 ; 2 B` for Shift+Up / Shift+Down. Stackmap enables complete modifier reporting when the terminal supports the enhanced keyboard protocol. |
 | Option-arrow does not jump | Use the terminal-compatible `g` / `G` fallback |
 | A branch vanished from Active view | Press `a`, find it in Archive, then press `x` to restore it |
-| Pushed status is `?` | Exact-tip evidence is unavailable or insufficient; fetch manually if you need current server evidence |
+| Details show pushed evidence unavailable | Exact-tip evidence is unavailable or insufficient; fetch manually if you need current server evidence |
 | Command copy does nothing | Terminal.app is the reference; a terminal may intercept Command chords before Stackmap receives them |
 | Shift-Backspace types text or deletes one character | The terminal did not report a distinct shifted Backspace; use Ctrl-U to clear the full name draft |
 | Footer still shows a completed checkout | Press `R`; reconciliation is target-aware and returns normal controls after success or a bounded timeout |

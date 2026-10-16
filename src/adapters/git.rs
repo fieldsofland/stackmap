@@ -460,8 +460,41 @@ impl GitAdapter {
                 OsStr::new(branch.0.as_ref()),
             ],
             OUTPUT_LIMIT,
-        )?;
-        if let Err(switch_error) = ensure_success(&switch, "switch branch") {
+        );
+        self.finish_worktree_transfer(branch, linked_path, switch)
+    }
+
+    fn finish_worktree_transfer(
+        &self,
+        branch: &BranchId,
+        linked_path: &Path,
+        switch: Result<CommandOutput>,
+    ) -> Result<()> {
+        if let Err(switch_error) =
+            switch.and_then(|output| ensure_success(&output, "switch branch"))
+        {
+            // A hook can fail or time out after HEAD has already switched.
+            // Inspect ownership before attempting to recreate the removed checkout.
+            let live = self.mutation_inventory().with_context(|| {
+                format!(
+                    "switch failed ({switch_error:#}); could not inspect ownership before restoring {}",
+                    linked_path.display()
+                )
+            })?;
+            if live.current.as_ref() == Some(branch) {
+                return Ok(());
+            }
+            if let Some(path) = live
+                .branches
+                .iter()
+                .find(|candidate| &candidate.id == branch)
+                .and_then(|candidate| candidate.worktree.as_ref())
+            {
+                return Err(switch_error.context(format!(
+                    "linked worktree {} was removed; {branch} is now checked out at {}; restoration skipped",
+                    linked_path.display(), path.display()
+                )));
+            }
             let restore = self.git_mutation(
                 &[
                     OsStr::new("worktree"),
@@ -479,7 +512,8 @@ impl GitAdapter {
                     "primary switch failed; the original linked worktree was restored",
                 )),
                 Err(restore_error) => Err(switch_error.context(format!(
-                    "primary switch failed and the linked worktree could not be restored: {restore_error}"
+                    "primary switch failed and the linked worktree at {} could not be restored: {restore_error:#}",
+                    linked_path.display()
                 ))),
             };
         }
@@ -521,6 +555,7 @@ impl GitAdapter {
             None,
             &request.affected,
             &request.topology,
+            false,
         )?;
         if before.parents.get(&request.source.branch) != Some(&request.expected_parent) {
             bail!("Graphite parent changed after restack confirmation");
@@ -556,6 +591,7 @@ impl GitAdapter {
             Some(&request.target),
             &request.affected,
             &request.topology,
+            request.only,
         )?;
         if before.parents.get(&request.source.branch) != request.expected_parent.as_ref() {
             bail!("Graphite parent changed after move confirmation");
@@ -592,6 +628,7 @@ impl GitAdapter {
         target: Option<&GraphiteBranchExpectation>,
         affected: &[GraphiteBranchExpectation],
         topology: &[GraphiteEdgeExpectation],
+        only: bool,
     ) -> Result<super::graphite::GraphiteTopology> {
         if source.branch.0.starts_with('-')
             || target.is_some_and(|target| target.branch.0.starts_with('-'))
@@ -617,6 +654,35 @@ impl GitAdapter {
             .map(|branch| branch.id.clone())
             .collect();
         let graphite = read_topology(&live.common_dir, &local);
+        let mut subtree = std::collections::HashSet::from([source.branch.clone()]);
+        let mut pending = vec![source.branch.clone()];
+        while let Some(parent) = pending.pop() {
+            for (child, candidate_parent) in &graphite.parents {
+                if candidate_parent == &parent && subtree.insert(child.clone()) {
+                    pending.push(child.clone());
+                }
+            }
+        }
+        let expected_subtree: std::collections::HashSet<_> =
+            topology.iter().map(|edge| edge.branch.clone()).collect();
+        if subtree != expected_subtree {
+            bail!("Graphite subtree changed after confirmation");
+        }
+        let rewritten: std::collections::HashSet<_> = subtree
+            .into_iter()
+            .filter(|branch| {
+                !only
+                    || branch == &source.branch
+                    || graphite.parents.get(branch) == Some(&source.branch)
+            })
+            .collect();
+        let expected_rewritten: std::collections::HashSet<_> = affected
+            .iter()
+            .map(|branch| branch.branch.clone())
+            .collect();
+        if rewritten != expected_rewritten {
+            bail!("Graphite affected branches changed after confirmation");
+        }
         let verify = |expectation: &GraphiteBranchExpectation, rewritten: bool| -> Result<()> {
             let branch = live
                 .branches
@@ -1711,6 +1777,217 @@ mod tests {
             Some("refs/remotes/origin/feature")
         );
         assert_eq!(exact_tips.len(), 1);
+    }
+
+    fn add_tracked_child(root: &Path, branch: &str, parent: &str) {
+        git(root, &["branch", branch]);
+        Connection::open(root.join(".git/.graphite_metadata.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO branch_metadata VALUES (?1, ?2)",
+                rusqlite::params![branch, parent],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn graphite_preflight_rejects_new_descendants_before_mutation() {
+        for (parent, existing) in [("feature", false), ("child", false), ("feature", true)] {
+            let (directory, adapter, request) = tracked_repository();
+            add_tracked_child(directory.path(), "child", "feature");
+            if existing {
+                add_tracked_child(directory.path(), "new-child", "main");
+            }
+            let live = adapter.inventory().unwrap();
+            let source = GraphiteBranchExpectation {
+                branch: request.branch.clone(),
+                oid: request.expected_oid.clone(),
+            };
+            let affected = vec![
+                source.clone(),
+                GraphiteBranchExpectation {
+                    branch: BranchId::new("child"),
+                    oid: source.oid.clone(),
+                },
+            ];
+            let topology = vec![
+                GraphiteEdgeExpectation {
+                    branch: source.branch.clone(),
+                    parent: Some(BranchId::new("main")),
+                },
+                GraphiteEdgeExpectation {
+                    branch: BranchId::new("child"),
+                    parent: Some(source.branch.clone()),
+                },
+            ];
+            adapter
+                .graphite_action_preflight(
+                    &live.repository_id,
+                    &source,
+                    None,
+                    &affected,
+                    &topology,
+                    false,
+                )
+                .unwrap();
+            if existing {
+                Connection::open(directory.path().join(".git/.graphite_metadata.db"))
+                    .unwrap()
+                    .execute(
+                        "UPDATE branch_metadata SET parent_branch_name = ?1 WHERE branch_name = 'new-child'",
+                        [parent],
+                    )
+                    .unwrap();
+            } else {
+                add_tracked_child(directory.path(), "new-child", parent);
+            }
+            let error = adapter
+                .graphite_action_preflight(
+                    &live.repository_id,
+                    &source,
+                    None,
+                    &affected,
+                    &topology,
+                    false,
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("subtree changed"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn graphite_preflight_requires_every_rewritten_branch_expectation() {
+        let (directory, adapter, request) = tracked_repository();
+        add_tracked_child(directory.path(), "child", "feature");
+        add_tracked_child(directory.path(), "grandchild", "child");
+        let live = adapter.inventory().unwrap();
+        let source = GraphiteBranchExpectation {
+            branch: request.branch.clone(),
+            oid: request.expected_oid.clone(),
+        };
+        let topology = [
+            ("feature", "main"),
+            ("child", "feature"),
+            ("grandchild", "child"),
+        ]
+        .map(|(branch, parent)| GraphiteEdgeExpectation {
+            branch: BranchId::new(branch),
+            parent: Some(BranchId::new(parent)),
+        });
+        let affected = topology.clone().map(|edge| GraphiteBranchExpectation {
+            branch: edge.branch,
+            oid: source.oid.clone(),
+        });
+        for only in [false, true] {
+            let count = if only { 2 } else { 3 };
+            adapter
+                .graphite_action_preflight(
+                    &live.repository_id,
+                    &source,
+                    None,
+                    &affected[..count],
+                    &topology,
+                    only,
+                )
+                .unwrap();
+            let error = adapter
+                .graphite_action_preflight(
+                    &live.repository_id,
+                    &source,
+                    None,
+                    &affected[..count - 1],
+                    &topology,
+                    only,
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("affected branches changed"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_transfer_restores_after_switch_execution_errors() {
+        for timeout in [false, true] {
+            let (directory, adapter, request) = tracked_repository();
+            let linked_parent = tempfile::tempdir().unwrap();
+            let linked = linked_parent.path().join("linked");
+            git(
+                directory.path(),
+                &["worktree", "add", linked.to_str().unwrap(), "feature"],
+            );
+            git(
+                directory.path(),
+                &["worktree", "remove", linked.to_str().unwrap()],
+            );
+            let cause = if timeout {
+                CommandError::Timeout(Duration::from_secs(30))
+            } else {
+                CommandError::Spawn(std::io::Error::other("injected spawn failure"))
+            };
+            let error = adapter
+                .finish_worktree_transfer(&request.branch, &linked, Err(anyhow!(cause)))
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("original linked worktree was restored")
+            );
+            assert_eq!(git(&linked, &["branch", "--show-current"]), "feature");
+            assert_eq!(git(directory.path(), &["branch", "--show-current"]), "main");
+        }
+    }
+
+    #[test]
+    fn worktree_transfer_does_not_restore_after_switch_completed() {
+        let (directory, adapter, request) = tracked_repository();
+        let linked_parent = tempfile::tempdir().unwrap();
+        let linked = linked_parent.path().join("linked");
+        git(
+            directory.path(),
+            &["worktree", "add", linked.to_str().unwrap(), "feature"],
+        );
+        git(
+            directory.path(),
+            &["worktree", "remove", linked.to_str().unwrap()],
+        );
+        git(directory.path(), &["switch", "feature"]);
+        adapter
+            .finish_worktree_transfer(
+                &request.branch,
+                &linked,
+                Err(anyhow!(CommandError::Timeout(Duration::from_secs(30)))),
+            )
+            .unwrap();
+        assert!(!linked.exists());
+        assert_eq!(
+            git(directory.path(), &["branch", "--show-current"]),
+            "feature"
+        );
+    }
+
+    #[test]
+    fn worktree_transfer_does_not_override_new_ownership() {
+        let (directory, adapter, request) = tracked_repository();
+        let linked_parent = tempfile::tempdir().unwrap();
+        let linked = linked_parent.path().join("linked");
+        let other = linked_parent.path().join("other");
+        git(
+            directory.path(),
+            &["worktree", "add", other.to_str().unwrap(), "feature"],
+        );
+        let error = adapter
+            .finish_worktree_transfer(
+                &request.branch,
+                &linked,
+                Err(anyhow!(CommandError::Timeout(Duration::from_secs(30)))),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("restoration skipped"));
+        assert!(error.to_string().contains(linked.to_str().unwrap()));
+        assert!(!linked.exists());
+        assert_eq!(git(&other, &["branch", "--show-current"]), "feature");
     }
 
     #[test]

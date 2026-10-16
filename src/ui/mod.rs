@@ -30,7 +30,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, now: SystemTime) {
         panels::restack_confirmation(frame, app);
         return;
     }
-    if matches!(app.mutation, MutationState::ConfirmingMove(_)) {
+    if matches!(app.mutation, MutationState::ConfirmingMove(..)) {
         panels::move_confirmation(frame, app);
         return;
     }

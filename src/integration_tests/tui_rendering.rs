@@ -1243,7 +1243,7 @@ fn metadata_columns_leave_time_diff_and_pr_edge_gutters() {
 const TRUNK_OID: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
 const FEATURE_OID: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f00fedcba9";
 
-fn render_trunk_and_feature(width: u16) -> Vec<String> {
+fn render_trunk_and_feature(width: u16, status_visible: bool) -> Vec<String> {
     let mut trunk = common::branch("main", None, "main", true);
     trunk.trunk = Some(BranchId::new("main"));
     trunk.graphite = crate::model::GraphiteProvenance::Tracked;
@@ -1254,6 +1254,7 @@ fn render_trunk_and_feature(width: u16) -> Vec<String> {
     snapshot.configured_trunks = Arc::from([BranchId::new("main")]);
     snapshot.trunks = snapshot.configured_trunks.clone();
     let mut app = App::default();
+    app.status_visible = status_visible;
     app.apply_snapshot(Arc::new(snapshot));
     let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
     terminal
@@ -1264,13 +1265,14 @@ fn render_trunk_and_feature(width: u16) -> Vec<String> {
 
 #[test]
 fn branch_and_trunk_rows_show_short_commit_hash() {
-    let lines = render_trunk_and_feature(100);
+    let lines = render_trunk_and_feature(100, true);
     let hash = RenderGeometry::new(100, WidthMode::Medium, LanePitch::Auto, 1)
         .hash
         .expect("hash column");
     for (name, oid) in [("main ", TRUNK_OID), ("feature ", FEATURE_OID)] {
         let (_, row) = line_with(&lines, name);
-        assert_eq!(metadata_column_text(row, hash), oid[..7], "{name:?} row");
+        let rendered_hash: String = row.chars().skip(hash.x).take(hash.width).collect();
+        assert_eq!(rendered_hash, oid[..7], "{name:?} row");
         assert!(!row.contains(&oid[..8]), "{name:?} row shows only 7 chars");
     }
 }
@@ -1280,7 +1282,7 @@ fn commit_hash_is_the_first_metadata_column_to_drop() {
     let narrow = RenderGeometry::new(99, WidthMode::Medium, LanePitch::Auto, 1);
     assert!(narrow.hash.is_none());
     assert!(narrow.time.is_some() && narrow.pr.is_some());
-    let lines = render_trunk_and_feature(99);
+    let lines = render_trunk_and_feature(99, true);
     for (name, oid) in [("main ", TRUNK_OID), ("feature ", FEATURE_OID)] {
         let (_, row) = line_with(&lines, name);
         assert!(
@@ -2150,4 +2152,19 @@ fn five_thousand_stack_projection_renders_only_the_visible_window() {
         .draw(|frame| crate::ui::render(frame, &mut app, UNIX_EPOCH))
         .unwrap();
     assert_eq!(terminal.backend().buffer().area.width, 40);
+}
+
+#[test]
+fn hiding_status_preserves_commit_hashes() {
+    let lines = render_trunk_and_feature(100, false);
+    let geometry =
+        RenderGeometry::new_with_status(100, WidthMode::Medium, LanePitch::Auto, 1, false);
+    let hash = geometry.hash.expect("hash remains visible");
+    assert!(geometry.pr.is_none());
+    for (name, oid) in [("main ", TRUNK_OID), ("feature ", FEATURE_OID)] {
+        let (_, row) = line_with(&lines, name);
+        let rendered_hash: String = row.chars().skip(hash.x).take(hash.width).collect();
+        assert_eq!(rendered_hash, oid[..7]);
+        assert!(!row.contains("local"));
+    }
 }

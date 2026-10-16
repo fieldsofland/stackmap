@@ -35,7 +35,7 @@ explains which work belongs together or what is safe to clean up.
 - GitHub lookup uses a cached open-PR sweep that attaches branch-name matches
   across every local branch, followed by serialized exact-head and exact-commit
   lookup for a bounded demand set. Exact-tip matches win; a
-  deterministic same-name historical fallback uses `~`. Partial/failing work
+  deterministic same-name historical fallback is identified as stale in details. Partial/failing work
   preserves applicable last-known PR evidence.
 
 ## Navigation and organization
@@ -140,9 +140,9 @@ explains which work belongs together or what is safe to clean up.
   initial discovery, current/changed stacks, or explicit `R`/`r`/`m` demand.
   Scrolling, filtering, archive toggles, and ordinary cursor movement launch no
   health subprocesses.
-- Hiding status cancels/suppresses remote and Graphite work while retaining
-  cached evidence; showing it schedules one bounded refresh. PR enrichment
-  remains active because PR open/copy actions use it.
+- Hiding status cancels/suppresses remote, Graphite, and GitHub work while
+  retaining cached evidence; showing it schedules bounded work again.
+  PR open/copy actions use retained evidence while status is hidden.
 
 ## To-do
 

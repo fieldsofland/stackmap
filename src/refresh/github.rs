@@ -328,32 +328,47 @@ fn process_cycle(
             return None;
         }
         let key = (target.branch.clone(), target.oid.clone());
-        let outcome = if let Some(entry) = cache
+        let open_matches = open
+            .as_ref()
+            .map(|open| {
+                open.matches
+                    .iter()
+                    .filter(|candidate| candidate.branch == target.branch)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        // Fresh discovery must not be overwritten by an older target result.
+        // Merge stale-tip evidence with cached history without bypassing its backoff.
+        let outcome = if open_matches
+            .iter()
+            .any(|candidate| candidate.head_oid.as_deref() == Some(target.oid.as_ref()))
+        {
+            GithubOutcome::Ready(Arc::from(open_matches))
+        } else if let Some(entry) = cache
             .targets
             .get(&key)
             .filter(|entry| entry.expires_at > now)
         {
-            entry.outcome.clone()
-        } else {
-            let open_matches = open
-                .as_ref()
-                .map(|open| {
-                    open.matches
-                        .iter()
-                        .filter(|candidate| candidate.branch == target.branch)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            if open_matches
-                .iter()
-                .any(|candidate| candidate.head_oid.as_deref() == Some(target.oid.as_ref()))
-            {
-                GithubOutcome::Ready(Arc::from(open_matches))
+            if open_matches.is_empty() {
+                entry.outcome.clone()
             } else {
-                targeted.push((target.clone(), open_matches));
-                continue;
+                let mut matches = open_matches;
+                if let GithubOutcome::Ready(cached) = &entry.outcome {
+                    for candidate in cached.iter() {
+                        if !matches
+                            .iter()
+                            .any(|fresh| fresh.pull_request.number == candidate.pull_request.number)
+                        {
+                            matches.push(candidate.clone());
+                        }
+                    }
+                }
+                GithubOutcome::Ready(Arc::from(matches))
             }
+        } else {
+            targeted.push((target.clone(), open_matches));
+            continue;
         };
         completed.push(GithubResult {
             branch: target.branch.clone(),
@@ -400,7 +415,7 @@ fn process_cycle(
             (target.branch.clone(), target.oid.clone()),
             CacheEntry {
                 outcome: outcome.clone(),
-                expires_at: now + ttl,
+                expires_at: Instant::now() + ttl,
             },
         );
         pending_results.push(GithubResult {
@@ -440,7 +455,8 @@ fn targeted_outcome(
     if remaining.is_zero() {
         return None;
     }
-    let head = provider.head(repository, owner, &target.branch, remaining);
+    let head_timeout = remaining;
+    let head = provider.head(repository, owner, &target.branch, head_timeout);
     if let Ok(matches) = &head {
         known.extend(matches.iter().cloned());
     }
@@ -452,7 +468,12 @@ fn targeted_outcome(
     }
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return None;
+        let outcome = if known.is_empty() {
+            GithubOutcome::Unavailable(head.err().unwrap_or(GitHubError::Timeout(head_timeout)))
+        } else {
+            GithubOutcome::Ready(Arc::from(known))
+        };
+        return Some((outcome, 1));
     }
     let commit = provider.commit(repository, &target.oid, remaining);
     if let Ok(matches) = &commit {
@@ -769,5 +790,219 @@ mod tests {
         let queue = queue.lock().unwrap();
         assert_eq!(queue.len(), cycles);
         assert_eq!(queue.front().unwrap().generation, 0);
+    }
+
+    fn open_match(target: &GithubTarget, oid: &str) -> PrMatch {
+        PrMatch {
+            branch: target.branch.clone(),
+            head_oid: Some(Arc::from(oid)),
+            updated_at: Arc::from("2026-10-16T00:00:00Z"),
+            pull_request: PullRequest {
+                number: 7,
+                title: Arc::from("New PR"),
+                url: Arc::from("https://example.invalid/7"),
+                status: PullRequestStatus::Open,
+                head_oid: Some(Arc::from(oid)),
+                match_quality: PullRequestMatch::StaleTip,
+            },
+        }
+    }
+
+    #[test]
+    fn fresh_open_discovery_survives_cached_negative_and_error_outcomes() {
+        for exact in [true, false] {
+            for cached in [
+                GithubOutcome::NoMatch,
+                GithubOutcome::Unavailable(GitHubError::Timeout(Duration::from_secs(1))),
+            ] {
+                let target = target(0);
+                let candidate = open_match(&target, if exact { &target.oid } else { "older-tip" });
+                let mut cache = GithubCache {
+                    open: Some((
+                        Instant::now() + OPEN_TTL,
+                        OpenPullRequests {
+                            matches: vec![candidate],
+                            saturated: false,
+                        },
+                    )),
+                    ..GithubCache::default()
+                };
+                cache.targets.insert(
+                    (target.branch.clone(), target.oid.clone()),
+                    CacheEntry {
+                        outcome: cached,
+                        expires_at: Instant::now() + NEGATIVE_TTL,
+                    },
+                );
+                let provider = FakeProvider::new();
+                let mut batches = Vec::new();
+                let continuation = process_cycle(
+                    GithubRequest {
+                        generation: 1,
+                        targets: Arc::from([target.clone()]),
+                        discovery: Arc::from([target]),
+                    },
+                    &provider,
+                    &mut cache,
+                    1,
+                    &AtomicU64::new(1),
+                    |batch| batches.push(batch),
+                );
+                assert!(continuation.is_none());
+                let final_result = batches.last().unwrap().results.last().unwrap();
+                assert!(
+                    matches!(&final_result.outcome, GithubOutcome::Ready(matches) if matches.iter().any(|candidate| candidate.pull_request.number == 7))
+                );
+                assert_eq!(provider.head_calls.load(Ordering::Relaxed), 0);
+                assert_eq!(provider.commit_calls.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_stale_open_matches_reuse_cached_history() {
+        let target = target(0);
+        let mut cache = GithubCache {
+            open: Some((
+                Instant::now() + OPEN_TTL,
+                OpenPullRequests {
+                    matches: vec![open_match(&target, "older-tip")],
+                    saturated: false,
+                },
+            )),
+            ..GithubCache::default()
+        };
+        let provider = FakeProvider::new();
+        let request = GithubRequest {
+            generation: 1,
+            targets: Arc::from([target.clone()]),
+            discovery: Arc::from([target]),
+        };
+        for _ in 0..2 {
+            let mut batches = Vec::new();
+            assert!(
+                process_cycle(
+                    request.clone(),
+                    &provider,
+                    &mut cache,
+                    1,
+                    &AtomicU64::new(1),
+                    |batch| batches.push(batch)
+                )
+                .is_none()
+            );
+            assert!(
+                matches!(&batches.last().unwrap().results.last().unwrap().outcome, GithubOutcome::Ready(matches) if matches.len() == 1 && matches[0].pull_request.number == 7)
+            );
+        }
+        assert_eq!(provider.head_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.commit_calls.load(Ordering::Relaxed), 1);
+    }
+
+    struct TimeoutProvider {
+        exhaust_deadline: bool,
+        commit_calls: AtomicUsize,
+    }
+
+    impl GithubProvider for TimeoutProvider {
+        fn repository_slug(&self) -> Result<Arc<str>, GitHubError> {
+            Ok(Arc::from("owner/repo"))
+        }
+        fn open(&self) -> Result<OpenPullRequests, GitHubError> {
+            Ok(OpenPullRequests {
+                matches: Vec::new(),
+                saturated: false,
+            })
+        }
+        fn head(
+            &self,
+            _: &str,
+            _: &str,
+            _: &BranchId,
+            timeout: Duration,
+        ) -> Result<Vec<PrMatch>, GitHubError> {
+            thread::sleep(if self.exhaust_deadline {
+                timeout
+            } else {
+                Duration::from_millis(20)
+            });
+            Err(GitHubError::Timeout(timeout))
+        }
+        fn commit(&self, _: &str, _: &str, timeout: Duration) -> Result<Vec<PrMatch>, GitHubError> {
+            self.commit_calls.fetch_add(1, Ordering::Relaxed);
+            Err(GitHubError::Timeout(timeout))
+        }
+    }
+
+    #[test]
+    fn exhausted_head_lookup_returns_an_outcome_instead_of_continuing() {
+        let provider = TimeoutProvider {
+            exhaust_deadline: true,
+            commit_calls: AtomicUsize::new(0),
+        };
+        let target = target(0);
+        for known in [Vec::new(), vec![open_match(&target, "older-tip")]] {
+            let had_matches = !known.is_empty();
+            let (outcome, used) = targeted_outcome(
+                &provider,
+                "owner/repo",
+                "owner",
+                &target,
+                known,
+                Instant::now() + Duration::from_millis(20),
+            )
+            .expect("started lookup must complete");
+            assert_eq!(used, 1);
+            if had_matches {
+                assert!(matches!(outcome, GithubOutcome::Ready(_)));
+            } else {
+                assert!(matches!(
+                    outcome,
+                    GithubOutcome::Unavailable(GitHubError::Timeout(_))
+                ));
+            }
+        }
+        assert_eq!(provider.commit_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn error_cache_ttl_starts_after_provider_work_completes() {
+        let provider = TimeoutProvider {
+            exhaust_deadline: false,
+            commit_calls: AtomicUsize::new(0),
+        };
+        let target = target(0);
+        let mut cache = GithubCache::default();
+        let started = Instant::now();
+        let request = GithubRequest {
+            generation: 1,
+            targets: Arc::from([target.clone()]),
+            discovery: Arc::from([]),
+        };
+        assert!(
+            process_cycle(
+                request.clone(),
+                &provider,
+                &mut cache,
+                1,
+                &AtomicU64::new(1),
+                |_| {}
+            )
+            .is_none()
+        );
+        let entry = cache.targets.get(&(target.branch, target.oid)).unwrap();
+        assert!(entry.expires_at >= started + Duration::from_millis(20) + ERROR_TTL);
+        assert!(
+            process_cycle(
+                request,
+                &provider,
+                &mut cache,
+                1,
+                &AtomicU64::new(1),
+                |_| {}
+            )
+            .is_none()
+        );
+        assert_eq!(provider.commit_calls.load(Ordering::Relaxed), 1);
     }
 }

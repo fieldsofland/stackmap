@@ -30,18 +30,18 @@ characterized Graphite boundary.
 Remote-tip evidence is derived from one bounded map of locally known remote
 branch tips and does not fetch. Configured-upstream equality and exact PR head
 OID can also prove pushed; containment, raw ahead/behind state, and stale PRs
-cannot. Hiding status cancels remote and Graphite presentation work but retains
-cached evidence. GitHub enrichment continues because PR open/copy consumes it.
+cannot. Hiding status cancels remote, Graphite, and GitHub enrichment but retains
+cached evidence. PR open/copy actions use that retained evidence.
 
 GitHub first performs a cached open-PR sweep, then serialized bounded exact-head
 and exact-commit lookups for unresolved local branches. PR matches prefer an
-exact branch-tip object ID; a same-name fallback is shown with `~` so stale or
-missing head-OID data is never presented as exact. Checking, confirmed no-match,
-and unavailable are separate states, and partial provider failure preserves
+exact branch-tip object ID; details identify a same-name fallback as stale when
+head-OID data differs or is missing. Details also distinguish checking, confirmed
+no-match, and unavailable states. Partial provider failure preserves
 applicable last-known PR evidence.
 
-Graphite row health is advisory read-only Git evidence. Only `needs restack` is
-shown in the row; all states remain in details. Checks are cached by immutable
+Graphite health is advisory read-only Git evidence shown in branch details.
+It does not add a row badge. Checks are cached by immutable
 parent/tip pair and limited to bounded initial discovery, current/changed stacks,
 and explicit `R`/`r`/`m` demand. Navigation and rendering never start them.
 Graphite restack and move are enabled only when the installed CLI help matches

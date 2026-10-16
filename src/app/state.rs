@@ -130,7 +130,7 @@ pub enum MutationState {
     Deleting(DeleteConfirmation),
     ConfirmingRestack(RestackRequest),
     Restacking(RestackRequest),
-    ConfirmingMove(MoveRequest),
+    ConfirmingMove(MoveRequest, Box<MovePreview>),
     Moving(MoveRequest),
     Reconciling {
         operation: ReconciliationOperation,

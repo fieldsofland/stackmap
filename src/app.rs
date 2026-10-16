@@ -1153,7 +1153,7 @@ impl App {
         if matches!(self.mutation, MutationState::ConfirmingRestack(_)) {
             return self.handle_restack_confirmation(key);
         }
-        if matches!(self.mutation, MutationState::ConfirmingMove(_)) {
+        if matches!(self.mutation, MutationState::ConfirmingMove(..)) {
             return self.handle_move_confirmation(key);
         }
         match &self.overlay {
@@ -2474,7 +2474,7 @@ impl App {
             | MutationState::DeletionBlocked(_)
             | MutationState::ConfirmingRestack(_)
             | MutationState::Restacking(_)
-            | MutationState::ConfirmingMove(_)
+            | MutationState::ConfirmingMove(..)
             | MutationState::Moving(_)
             | MutationState::GraphiteBlocked(_) => None,
         }
@@ -3152,15 +3152,19 @@ impl App {
                     .cloned()
                     .collect();
                 self.overlay = Overlay::None;
-                self.mutation = MutationState::ConfirmingMove(MoveRequest {
-                    repository_id: snapshot.repository_id.clone(),
-                    source: preview.source_expectation,
-                    target: preview.target_expectation,
-                    expected_parent: preview.original_parent,
-                    affected: Arc::from(affected),
-                    topology: preview.topology,
-                    only: preview.only,
-                });
+                let return_preview = Box::new(preview.clone());
+                self.mutation = MutationState::ConfirmingMove(
+                    MoveRequest {
+                        repository_id: snapshot.repository_id.clone(),
+                        source: preview.source_expectation,
+                        target: preview.target_expectation,
+                        expected_parent: preview.original_parent,
+                        affected: Arc::from(affected),
+                        topology: preview.topology,
+                        only: preview.only,
+                    },
+                    return_preview,
+                );
                 self.reproject();
             }
             Key::Escape => {
@@ -3174,7 +3178,7 @@ impl App {
     }
 
     fn handle_move_confirmation(&mut self, key: Key) -> Action {
-        let MutationState::ConfirmingMove(request) = &self.mutation else {
+        let MutationState::ConfirmingMove(request, preview) = &self.mutation else {
             return Action::None;
         };
         let request = request.clone();
@@ -3184,25 +3188,7 @@ impl App {
                 Action::Move(request)
             }
             Key::Escape => {
-                let affected: Arc<[BranchId]> = Arc::from(
-                    request
-                        .affected
-                        .iter()
-                        .filter(|item| item.branch != request.source.branch)
-                        .map(|item| item.branch.clone())
-                        .collect::<Vec<_>>(),
-                );
-                self.overlay = Overlay::MovePreview(MovePreview {
-                    source: request.source.branch.clone(),
-                    target: request.target.branch.clone(),
-                    only: request.only,
-                    affected,
-                    affected_expectations: request.affected.clone(),
-                    source_expectation: request.source.clone(),
-                    target_expectation: request.target.clone(),
-                    original_parent: request.expected_parent.clone(),
-                    topology: request.topology.clone(),
-                });
+                self.overlay = Overlay::MovePreview((**preview).clone());
                 self.mutation = MutationState::Idle;
                 self.message = Some(Arc::from("returned to move preview"));
                 self.reproject();
@@ -3417,7 +3403,7 @@ impl App {
             MutationState::Idle
             | MutationState::ConfirmingDeletion(_)
             | MutationState::ConfirmingRestack(_)
-            | MutationState::ConfirmingMove(_) => None,
+            | MutationState::ConfirmingMove(..) => None,
         }
     }
 

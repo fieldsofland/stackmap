@@ -385,7 +385,7 @@ pub fn restack_confirmation(frame: &mut Frame<'_>, app: &App) {
 }
 
 pub fn move_confirmation(frame: &mut Frame<'_>, app: &App) {
-    let MutationState::ConfirmingMove(request) = &app.mutation else {
+    let MutationState::ConfirmingMove(request, _) = &app.mutation else {
         return;
     };
     let descendants = request.affected.len().saturating_sub(1);

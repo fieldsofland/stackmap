@@ -1520,7 +1520,7 @@ fn move_preview_toggles_only_and_preserves_open_pr_key() {
         Overlay::MovePreview(crate::app::MovePreview { only: true, .. })
     ));
     assert_eq!(app.handle_key(Key::Enter), Action::None);
-    assert!(matches!(app.mutation, MutationState::ConfirmingMove(_)));
+    assert!(matches!(app.mutation, MutationState::ConfirmingMove(..)));
     assert_eq!(app.handle_key(Key::Escape), Action::None);
     assert!(matches!(app.overlay, Overlay::MovePreview(_)));
     assert_eq!(app.handle_key(Key::Enter), Action::None);
@@ -1725,4 +1725,51 @@ fn section_name_editor_closes_when_refresh_removes_its_anchor() {
             .as_deref()
             .is_some_and(|message| message.contains("name editor closed"))
     );
+}
+
+#[test]
+fn only_move_confirmation_round_trip_preserves_grandchildren() {
+    let mut snapshot = (*view_snapshot()).clone();
+    let mut branches = snapshot.branches.to_vec();
+    branches.push(tracked(
+        "alpha-grandchild",
+        Some("alpha-tip"),
+        "alpha",
+        "main",
+        false,
+        102,
+    ));
+    snapshot.branch_index = crate::model::RepositorySnapshot::index_branches(&branches);
+    snapshot.branches = Arc::from(branches);
+    let mut app = App::default();
+    app.apply_snapshot(Arc::new(snapshot));
+    app.selected = Some(BranchId::new("alpha"));
+    app.handle_key(Key::Character('m'));
+    app.handle_key(Key::Tab);
+    let original = app.overlay.clone();
+    app.handle_key(Key::Enter);
+    let MutationState::ConfirmingMove(request, _) = &app.mutation else {
+        panic!("move confirmation");
+    };
+    assert!(
+        !request
+            .affected
+            .iter()
+            .any(|item| item.branch == BranchId::new("alpha-grandchild"))
+    );
+    app.handle_key(Key::Escape);
+    assert_eq!(app.overlay, original);
+    app.handle_key(Key::Tab);
+    app.handle_key(Key::Enter);
+    let Action::Move(request) = app.handle_key(Key::Enter) else {
+        panic!("full move action");
+    };
+    assert!(!request.only);
+    assert!(
+        request
+            .affected
+            .iter()
+            .any(|item| item.branch == BranchId::new("alpha-grandchild"))
+    );
+    assert_eq!(request.target.branch, BranchId::new("beta"));
 }

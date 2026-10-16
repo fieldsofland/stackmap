@@ -8,7 +8,7 @@ Neither contract grants Stackmap permission to write Graphite metadata.
 | Capability | Graphite CLI 1.8.6 on macOS | Unknown/newer versions |
 |---|---|---|
 | Read topology | Characterized 2026-07-19 against sanitized SQLite fixtures | Enabled only when the required schema is proven; otherwise Git branches remain as independent roots |
-| Read-only needs-restack health | Git ancestry check over the validated recorded parent/tip pair; no Graphite command | Available whenever the topology pair is readable; unavailable/not-requested remains diagnostic detail rather than a row warning |
+| Read-only needs-restack health | Git ancestry check over the validated recorded parent/tip pair; no Graphite command | Available whenever the topology pair is readable; all health states remain diagnostic detail rather than row warnings |
 | Delete tracked leaf | Characterized exact noninteractive single-branch CLI contract | Disabled until the CLI help contract is deliberately characterized, even if output appears similar |
 | Restack selected upstack | Characterized 2026-07-30 with Graphite CLI 1.8.6: `--no-interactive restack --branch <source> --upstack` | Disabled unless the installed help contract exposes the characterized branch/upstack/only surface |
 | Move selected subtree / branch only | Characterized 2026-07-30 with Graphite CLI 1.8.6: `--no-interactive move --source <source> --onto <target> [--only]` | Disabled unless the installed help contract exposes the characterized source/onto/only surface |
@@ -20,8 +20,8 @@ cycles, unknown parents, busy/corrupt data, or metadata changing during a read
 degrade without hiding Git-local branches.
 
 Presentation health does not expand this SQLite contract. Stackmap caches the
-read-only Git ancestry result by immutable recorded-parent/tip OIDs and renders a
-row badge only when restacking is needed. It performs one bounded initial
+read-only Git ancestry result by immutable recorded-parent/tip OIDs and shows
+health states in branch details. It performs one bounded initial
 discovery, then checks current/changed stacks or explicit `R`/`r`/`m` demand.
 Scrolling, filtering, archive projection, and ordinary cursor movement do not
 invoke Git or Graphite. Hiding status cancels/suppresses presentation checks and
